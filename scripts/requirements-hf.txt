@@ -1,0 +1,5 @@
+# JsonTqdm.get_lock crashes come from passing a duck-typed tqdm class into
+# huggingface_hub.snapshot_download, not from these pins. Keep hub/tqdm on a
+# known-good range anyway; the helper never sets tqdm_class.
+huggingface_hub>=0.24.0,<1
+tqdm>=4.66.0,<5

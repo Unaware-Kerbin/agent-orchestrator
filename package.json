@@ -1,0 +1,35 @@
+{
+  "name": "agent-orchestrator",
+  "version": "0.1.0",
+  "description": "MCP orchestrator that routes work to Cursor agents and external LLM agents",
+  "type": "module",
+  "bin": {
+    "agent-orchestrator": "./dist/index.js"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "gui": "tsx src/gui.ts",
+    "gui:open": "tsx src/gui.ts --open",
+    "gui:stop": "tsx src/gui.ts --stop",
+    "gui:restart": "npm run gui:stop && npm run gui",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@cursor/sdk": "^1.0.29",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

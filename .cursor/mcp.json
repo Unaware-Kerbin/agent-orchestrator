@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "agent-orchestrator": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/node_modules/.bin/tsx",
+      "args": ["${workspaceFolder}/src/index.ts"],
+      "env": {
+        "AGENT_ORCHESTRATOR_CONFIG": "${workspaceFolder}/agents.config.yaml",
+        "WORKSPACE_CWD": "${workspaceFolder}",
+        "CURSOR_API_KEY": "${env:CURSOR_API_KEY}",
+        "OPENAI_API_KEY": "${env:OPENAI_API_KEY}",
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}",
+        "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}",
+        "GEMINI_API_KEY": "${env:GEMINI_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Orchestrator</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="gate" class="gate hidden">
+      <form id="gate-form" class="gate-card">
+        <p class="eyebrow">Local control plane</p>
+        <h1>Unlock orchestrator</h1>
+        <p class="lede">
+          Paste the session token printed by <code>npm run gui</code>. It never leaves this machine.
+        </p>
+        <label for="token-input">Session token</label>
+        <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" />
+        <button type="submit">Continue</button>
+        <p id="gate-error" class="error" hidden></p>
+      </form>
+    </div>
+
+    <div id="shell" class="shell hidden">
+      <aside class="rail">
+        <div class="brand">
+          <span class="mark"></span>
+          <div>
+            <strong>Orchestrator</strong>
+            <small>127.0.0.1 · chat</small>
+          </div>
+        </div>
+        <button type="button" id="new-chat" class="btn new-chat" data-new-chat>New chat</button>
+        <div id="thread-list" class="thread-list" role="list" aria-label="Chats"></div>
+        <nav id="nav">
+          <a href="#chat" data-page="chat">Chat</a>
+          <details id="settings-nav">
+            <summary>Settings</summary>
+            <a href="#overview" data-page="overview">Overview</a>
+            <a href="#backends" data-page="backends">Backends</a>
+            <a href="#local-models" data-page="local-models">Local models</a>
+            <a href="#allowlist" data-page="allowlist">Allowlist</a>
+            <a href="#specialists" data-page="specialists">Specialists</a>
+            <a href="#config" data-page="config">Config</a>
+            <a href="#dispatch" data-page="dispatch">Run workflow</a>
+            <a href="#runs" data-page="runs">Runs</a>
+          </details>
+        </nav>
+        <p class="rail-foot">Loopback only · token auth · Auto routes the team</p>
+      </aside>
+      <main id="main" class="main"></main>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

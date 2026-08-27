@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.orchestrator/
+# Hugging Face snapshots live under .orchestrator/models (covered above)
+# GUI pid/token: .orchestrator/gui.pid, .orchestrator/gui.secret (never commit)
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.venv/

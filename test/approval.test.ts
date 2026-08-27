@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { ChatService } from "../src/chat/service.js";
+import type { DispatchInput } from "../src/orchestrator.js";
+import type { Orchestrator } from "../src/orchestrator.js";
+
+const UNITY_MSG = "Are you guys able to install unity for me and set this all up?";
+const BUILD_MSG = "implement a README and scaffold the app in this workspace";
+
+function mockOrchestrator(cwd: string, dispatches: DispatchInput[]): Orchestrator {
+  const events = new EventEmitter();
+  return {
+    events,
+    defaultCwd: () => cwd,
+    allowlist: {
+      list: () => [cwd],
+      assertCwd: (path: string) => path,
+      tryCwd: (path: string) => path,
+      add: () => [cwd],
+    },
+    catalog: async () => ({
+      backends: [
+        {
+          id: "cursor-local",
+          type: "cursor",
+          ready: true,
+          writesLocalFiles: true,
+          runtime: "local",
+          model: "composer-2.5",
+        },
+        {
+          id: "gemini",
+          type: "openai",
+          ready: true,
+          writesLocalFiles: false,
+          model: "gemini-2.0-flash",
+        },
+      ],
+      specialists: [
+        { id: "builder", backend: "cursor-local" },
+        { id: "planner", backend: "anthropic" },
+        { id: "gemini-planner", backend: "gemini" },
+        { id: "vllm-chat", backend: "vllm-local" },
+      ],
+      localRuntime: { vllm: { running: false } },
+    }),
+    dispatch: async (input: DispatchInput) => {
+      dispatches.push(input);
+      return {
+        id: `run-${dispatches.length}`,
+        status: "finished" as const,
+        text: "Plan only: would install Unity Hub with apt. Do not run until Approve.",
+        specialist: input.specialist,
+        backend: input.backend ?? "cursor-local",
+        prompt: input.task,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        history: [],
+      };
+    },
+    followUp: async () => {
+      throw new Error("followUp should not run in these tests");
+    },
+    localModels: {
+      snapshot: () => ({
+        hardware: { accelerators: [], ramMiB: 8192, primaryBackend: "cpu" },
+        recommended: [],
+        vllm: { running: false },
+        models: [],
+      }),
+    },
+  } as unknown as Orchestrator;
+}
+
+test("install Unity stays pending plan-only; Approve then allows write closer (does not apt-install)", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "orch-approve-"));
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  const dispatches: DispatchInput[] = [];
+  try {
+    const chat = new ChatService(mockOrchestrator(cwd, dispatches));
+    const thread = await chat.send({ message: UNITY_MSG, pin: "single", wait: true });
+    assert.equal(thread.pendingApproval?.status, "pending");
+    assert.equal(thread.pendingApproval?.systemWideInstall, true);
+    assert.match(thread.pendingApproval?.systemWideNote ?? "", /Unity/i);
+    assert.equal(thread.pendingApproval?.specialist, "builder");
+    assert.ok(dispatches.length >= 1);
+    assert.ok(dispatches.every((d) => d.mode !== "agent"));
+    assert.ok(dispatches.some((d) => d.mode === "plan"));
+    assert.equal(
+      dispatches.some((d) => /apt-get|unityhub/i.test(d.task) && d.mode === "agent"),
+      false,
+    );
+
+    const before = dispatches.length;
+    const approved = await chat.resolveApproval({ threadId: thread.id, decision: "approve" });
+    assert.ok(dispatches.length > before);
+    const closer = dispatches[dispatches.length - 1];
+    assert.equal(closer?.mode, "agent");
+    assert.equal(closer?.cwd, cwd);
+    assert.match(closer?.task ?? "", /Approved plan/i);
+    assert.equal(approved.pendingApproval, undefined);
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});
+
+test("build intent is pending until mock approve; reject stays plan-only", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "orch-approve-"));
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  const dispatches: DispatchInput[] = [];
+  try {
+    const chat = new ChatService(mockOrchestrator(cwd, dispatches));
+    const thread = await chat.send({ message: BUILD_MSG, pin: "single", wait: true });
+    assert.equal(thread.pendingApproval?.status, "pending");
+    assert.ok(dispatches.every((d) => d.mode !== "agent"));
+
+    const rejected = await chat.resolveApproval({
+      threadId: thread.id,
+      decision: "reject",
+      comment: "testing only",
+    });
+    assert.equal(rejected.pendingApproval, undefined);
+    assert.ok(dispatches.every((d) => d.mode !== "agent"));
+    assert.match(rejected.messages.at(-1)?.content ?? "", /Rejected/);
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});
+
+test("chat emits a thinking row before the finished answer", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "orch-approve-"));
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  try {
+    const orch = mockOrchestrator(cwd, []);
+    const statuses: string[][] = [];
+    orch.events.on("chat", (thread: { messages: Array<{ role: string; status?: string; thinkingPhase?: string }> }) => {
+      statuses.push(thread.messages.filter((m) => m.role === "assistant").map((m) => m.status ?? ""));
+    });
+    const chat = new ChatService(orch);
+    const thread = await chat.send({ message: "what is 2+2 in one sentence?", pin: "gemini", wait: true });
+    const last = thread.messages.at(-1);
+    assert.equal(last?.status, "finished");
+    assert.equal(last?.thinkingPhase, undefined);
+    assert.ok(statuses.some((row) => row.includes("thinking")), `expected thinking status in ${JSON.stringify(statuses)}`);
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});

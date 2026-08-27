@@ -1,0 +1,146 @@
+# Defaults applied when a tool call omits wait/model.
+defaults:
+  wait: true
+  model: composer-2.5
+
+# Local Cursor agents run against this directory when dispatch does not pass cwd.
+# Cursor MCP interpolation can set WORKSPACE_CWD to ${workspaceFolder}.
+# That path is also the default write-allowlist entry until you grant more via
+# the GUI (npm run gui) or add_allowed_dir.
+workspace:
+  cwd: ${WORKSPACE_CWD}
+
+backends:
+  cursor-local:
+    type: cursor
+    runtime: local
+    model: composer-2.5
+
+  cursor-cloud:
+    type: cursor
+    runtime: cloud
+    model: composer-2.5
+
+  openai:
+    type: openai
+    baseUrl: https://api.openai.com/v1
+    model: gpt-4.1
+    apiKeyEnv: OPENAI_API_KEY
+
+  anthropic:
+    type: anthropic
+    model: claude-sonnet-4-5
+    apiKeyEnv: ANTHROPIC_API_KEY
+    maxTokens: 8192
+
+  openrouter:
+    type: openai
+    baseUrl: https://openrouter.ai/api/v1
+    model: anthropic/claude-sonnet-4
+    apiKeyEnv: OPENROUTER_API_KEY
+
+  gemini:
+    type: openai
+    baseUrl: https://generativelanguage.googleapis.com/v1beta/openai
+    # One current model id (not a list, not models/…). GUI lists live ids when the key works.
+    model: gemini-3.6-flash
+    apiKeyEnv: GEMINI_API_KEY
+
+  ollama:
+    type: openai
+    baseUrl: http://127.0.0.1:11434/v1
+    model: llama3.1
+    apiKey: ollama
+
+  vllm-local:
+    type: vllm
+    baseUrl: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen2.5-7B-Instruct
+    # apiKeyEnv: VLLM_API_KEY   # optional; local vLLM usually needs none
+    # probe: false              # skip /models check and treat configured URL as ready
+
+  # Extra local server (different port / served model):
+  # vllm-other:
+  #   type: vllm
+  #   baseUrl: http://127.0.0.1:8001/v1
+  #   model: mistralai/Mistral-7B-Instruct-v0.3
+
+  # Generic HTTP agent: POST { prompt, system, history, metadata } → { text | result | output }
+  # custom-http:
+  #   type: http
+  #   url: ${CUSTOM_AGENT_URL}
+  #   timeoutMs: 120000
+  #   headers:
+  #     Authorization: Bearer ${CUSTOM_AGENT_TOKEN}
+
+specialists:
+  planner:
+    description: Breaks a goal into a sequenced implementation plan
+    backend: anthropic
+    fallback: cursor-local
+    mode: plan
+
+  builder:
+    description: Implements features and writes code in the workspace
+    backend: cursor-local
+    fallback: cursor-cloud
+    mode: agent
+
+  reviewer:
+    description: Reviews code for bugs, security, and merge readiness
+    backend: openai
+    fallback: cursor-local
+
+  pr-triage:
+    description: Diagnoses failing PR checks and merge blockers
+    backend: cursor-local
+    fallback: cursor-cloud
+
+  gemini-planner:
+    description: Alternate planner that prefers Gemini when a Google API key is set
+    backend: gemini
+    fallback: cursor-local
+
+  vllm-chat:
+    description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
+    backend: vllm-local
+    fallback: cursor-local
+
+  cloud-builder:
+    description: Cursor cloud agent (cannot reach localhost vLLM; use extra_context or cloud-with-local-draft)
+    backend: cursor-cloud
+    fallback: cursor-local
+    mode: agent
+
+workflows:
+  ship-feature:
+    description: Plan, implement, then review a feature
+    steps:
+      - specialist: planner
+      - specialist: builder
+      - specialist: reviewer
+
+  troubleshoot-pr:
+    description: Diagnose a PR, apply a fix, then review
+    steps:
+      - specialist: pr-triage
+      - specialist: builder
+      - specialist: reviewer
+
+  review-only:
+    description: Review-only pass (no edits)
+    steps:
+      - specialist: reviewer
+
+  local-and-cloud:
+    description: Run the same prompt on local vLLM and a Cursor cloud agent in parallel. Orchestrator collects both. vLLM stays on 127.0.0.1; the cloud agent never calls it.
+    mode: parallel
+    steps:
+      - specialist: vllm-chat
+      - specialist: cloud-builder
+
+  cloud-with-local-draft:
+    description: Local vLLM drafts first; a Cursor cloud agent then reviews/implements using that draft as text context. Cloud still uses the Cursor runtime, not localhost.
+    steps:
+      - specialist: vllm-chat
+      - specialist: cloud-builder
