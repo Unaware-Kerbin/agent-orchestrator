@@ -2,8 +2,11 @@
   "mcpServers": {
     "agent-orchestrator": {
       "type": "stdio",
-      "command": "${workspaceFolder}/node_modules/.bin/tsx",
-      "args": ["${workspaceFolder}/src/index.ts"],
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/node_modules/tsx/dist/cli.mjs",
+        "${workspaceFolder}/src/index.ts"
+      ],
       "env": {
         "AGENT_ORCHESTRATOR_CONFIG": "${workspaceFolder}/agents.config.yaml",
         "WORKSPACE_CWD": "${workspaceFolder}",

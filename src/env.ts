@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { packageRoot } from "./config.js";
 
 export function parseEnvText(text: string): Record<string, string> {
@@ -38,8 +39,8 @@ export function loadEnvFile(path: string, overwrite = false): void {
 }
 
 export function envFilePaths(): string[] {
-  const root = `${packageRoot()}/.env`;
-  const cwd = `${process.cwd()}/.env`;
+  const root = join(packageRoot(), ".env");
+  const cwd = join(process.cwd(), ".env");
   return root === cwd ? [root] : [root, cwd];
 }
 

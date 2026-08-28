@@ -4,6 +4,8 @@ import type {
   BackendConfig,
   CursorBackendConfig,
   HttpBackendConfig,
+  LlamaCppBackendConfig,
+  OllamaBackendConfig,
   OpenAIBackendConfig,
   ProviderHealth,
   ProviderRunRequest,
@@ -34,7 +36,7 @@ export function secretFrom(
 type HealthExtra = Partial<
   Pick<
     ProviderHealth,
-    "runtime" | "writesLocalFiles" | "reason" | "secretNames" | "needsKey" | "baseUrl" | "model" | "modelChoices"
+    "runtime" | "writesLocalFiles" | "reason" | "secretNames" | "needsKey" | "baseUrl" | "model" | "modelChoices" | "nickname" | "hasLogo"
   >
 >;
 
@@ -138,6 +140,8 @@ export type {
   BackendConfig,
   CursorBackendConfig,
   HttpBackendConfig,
+  LlamaCppBackendConfig,
+  OllamaBackendConfig,
   OpenAIBackendConfig,
   ProviderHealth,
   ProviderRunRequest,

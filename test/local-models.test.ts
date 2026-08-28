@@ -10,7 +10,7 @@ import { LocalModelService } from "../src/local-models/service.js";
 import { assertModelDest } from "../src/local-models/paths.js";
 import { validateConfigYaml } from "../src/config.js";
 import { loadConfig } from "../src/config.js";
-import { assertVllmLoopbackHost, buildVllmArgv, detectVllmLaunch, findFreePort, instanceMatches, isVllmCmdline, partitionVllmInstances, resolveVllmPhase, vllmLaunchEnv, VllmManager } from "../src/vllm/manager.js";
+import { assertVllmLoopbackHost, buildVllmArgv, classifyVllmLog, detectVllmLaunch, findFreePort, instanceMatches, isVllmCmdline, partitionVllmInstances, probeVllmModels, resolveTensorParallel, resolveVllmGpuLaunch, resolveVllmGpuLaunchForFit, resolveVllmPhase, VLLM_HTTP_WAIT_MESSAGE, vllmLaunchEnv, VllmManager } from "../src/vllm/manager.js";
 import { patchVllmBackendYaml, patchVllmOrchestratorYaml, removeVllmOrchestratorYaml, vllmBackendIdForModel, vllmContainerNameForModel, vllmSpecialistIdForModel } from "../src/vllm/upsert.js";
 
 function tempProject(): string {
@@ -144,12 +144,113 @@ test("buildVllmArgv uses XPU flags, loopback host, and tensor parallel", () => {
   assert.equal(built.args[built.args.indexOf("--host") + 1], "127.0.0.1");
   assert.ok(built.args.includes("xpu"));
   assert.equal(built.args[built.args.indexOf("--tensor-parallel-size") + 1], "2");
+  assert.equal(built.args[built.args.indexOf("--gpu-memory-utilization") + 1], "0.9");
   assert.equal(built.args.includes("--quantization"), false);
+  assert.ok(built.args.includes("--trust-remote-code"));
   const env = vllmLaunchEnv("intel-xpu", 2, {});
-  assert.equal(env.ZE_AFFINITY_MASK, "0,1");
+  assert.equal(env.ZE_FLAT_DEVICE_HIERARCHY, "FLAT");
+  assert.equal(env.ZE_AFFINITY_MASK, undefined);
   assert.equal(env.VLLM_WORKER_MULTIPROC_METHOD, "spawn");
+  assert.equal(env.ONEAPI_DEVICE_SELECTOR, "level_zero:gpu");
+  assert.equal(vllmLaunchEnv("intel-xpu", 2, { ZE_AFFINITY_MASK: "1,2" }).ZE_AFFINITY_MASK, "1,2");
   assert.equal(vllmLaunchEnv("cuda", 1, {}).CUDA_VISIBLE_DEVICES, "0");
+  assert.equal(vllmLaunchEnv("cuda", 2, {}).CUDA_VISIBLE_DEVICES, "0,1");
+  assert.equal(vllmLaunchEnv("cuda", 2, {}).VLLM_WORKER_MULTIPROC_METHOD, "spawn");
   assert.equal(vllmLaunchEnv("rocm", 1, {}).HIP_VISIBLE_DEVICES, "0");
+  assert.equal(vllmLaunchEnv("rocm", 2, {}).HIP_VISIBLE_DEVICES, "0,1");
+  assert.equal(vllmLaunchEnv("rocm", 2, {}).ROCR_VISIBLE_DEVICES, "0,1");
+  assert.equal(resolveTensorParallel(2, 2), 2);
+  assert.equal(resolveTensorParallel(4, 2), 2);
+  assert.equal(resolveTensorParallel(undefined, 2), 1);
+  assert.deepEqual(resolveVllmGpuLaunch({ deviceCount: 2 }), { tensorParallel: 2, deviceCount: 2 });
+  assert.deepEqual(resolveVllmGpuLaunch({ deviceCount: 2, useAllGpus: true }), { tensorParallel: 2, deviceCount: 2 });
+  assert.deepEqual(resolveVllmGpuLaunch({ deviceCount: 2, useAllGpus: false }), {
+    tensorParallel: undefined,
+    deviceCount: 1,
+  });
+  assert.deepEqual(resolveVllmGpuLaunch({ deviceCount: 1 }), { tensorParallel: undefined, deviceCount: 1 });
+  assert.deepEqual(
+    resolveVllmGpuLaunchForFit({ deviceCount: 2, fitKind: "fits", fitParallel: 1 }),
+    { tensorParallel: undefined, deviceCount: 1 },
+  );
+  assert.deepEqual(
+    resolveVllmGpuLaunchForFit({ deviceCount: 2, fitKind: "needs_tp", fitParallel: 2 }),
+    { tensorParallel: 2, deviceCount: 2 },
+  );
+  assert.deepEqual(
+    resolveVllmGpuLaunchForFit({ deviceCount: 2, useAllGpus: false, fitKind: "needs_tp", fitParallel: 2 }),
+    { tensorParallel: undefined, deviceCount: 1 },
+  );
+  const dual = buildVllmArgv({
+    launch: { command: "vllm", args: ["serve"], backend: "cuda" },
+    modelPath: "/m",
+    port: 8000,
+    servedModelName: "m",
+    backend: "cuda",
+    tensorParallel: 2,
+    deviceCount: 2,
+  });
+  assert.equal(dual.args[dual.args.indexOf("--tensor-parallel-size") + 1], "2");
+  const single = buildVllmArgv({
+    launch: { command: "vllm", args: ["serve"], backend: "cuda" },
+    modelPath: "/m",
+    port: 8000,
+    servedModelName: "m",
+    backend: "cuda",
+    tensorParallel: undefined,
+    deviceCount: 1,
+  });
+  assert.equal(single.args.includes("--tensor-parallel-size"), false);
+});
+
+test("buildVllmArgv CUDA dual GPU passes tensor parallel and memory utilization", () => {
+  const built = buildVllmArgv({
+    launch: { command: "vllm", args: ["serve"], backend: "cuda" },
+    modelPath: "/models/qwen14",
+    port: 8002,
+    servedModelName: "Qwen/Qwen2.5-14B-Instruct",
+    backend: "cuda",
+    tensorParallel: 2,
+  });
+  assert.equal(built.args[built.args.indexOf("--host") + 1], "127.0.0.1");
+  assert.equal(built.args.includes("0.0.0.0"), false);
+  assert.equal(built.args[built.args.indexOf("--tensor-parallel-size") + 1], "2");
+  assert.equal(built.args[built.args.indexOf("--gpu-memory-utilization") + 1], "0.9");
+  assert.equal(built.args.includes("--device"), false);
+});
+
+test("probeVllmModels maps undici fetch failed / ECONNREFUSED to a wait message", async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => {
+      const error = new Error("fetch failed");
+      (error as Error & { cause: { code: string } }).cause = { code: "ECONNREFUSED" };
+      throw error;
+    }) as typeof fetch;
+    const down = await probeVllmModels("http://127.0.0.1:8001/v1", 50);
+    assert.equal(down.ok, false);
+    assert.equal(down.waiting, true);
+    assert.equal(down.error, VLLM_HTTP_WAIT_MESSAGE);
+    assert.doesNotMatch(down.error ?? "", /fetch failed/i);
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.match(
+    classifyVllmLog("ValueError: Model architecture Gemma4ForConditionalGeneration is not supported") ?? "",
+    /Gemma 4/,
+  );
+});
+
+test("buildVllmArgv adds Gemma 4 Intel recipe flags", () => {
+  const built = buildVllmArgv({
+    launch: { command: "vllm", args: ["serve"], backend: "intel-xpu" },
+    modelPath: "/models/google--gemma-4-E2B-it",
+    port: 8001,
+    servedModelName: "google/gemma-4-E2B-it",
+    backend: "intel-xpu",
+  });
+  assert.equal(built.args[built.args.indexOf("--mamba-ssm-cache-dtype") + 1], "float16");
+  assert.ok(built.args.includes("--trust-remote-code"));
 });
 
 test("patchVllmBackendYaml updates baseUrl and model without dropping comments", () => {
@@ -171,8 +272,8 @@ specialists:
   });
   assert.match(next, /# keep me/);
   assert.match(next, /# apiKeyEnv: VLLM_API_KEY/);
-  assert.match(next, /baseUrl: http:\/\/127\.0\.0\.1:8001\/v1/);
-  assert.match(next, /model: Qwen\/Qwen2\.5-7B-Instruct/);
+  assert.match(next, /baseUrl: "?http:\/\/127\.0\.0\.1:8001\/v1"?/);
+  assert.match(next, /model: "?Qwen\/Qwen2\.5-7B-Instruct"?/);
   assert.equal(next.includes("0.0.0.0"), false);
 });
 
@@ -192,8 +293,8 @@ specialists:
     baseUrl: "http://127.0.0.1:8002/v1",
     model: "Qwen/Qwen2.5-7B-Instruct",
   });
-  assert.match(next, /baseUrl: http:\/\/127\.0\.0\.1:8002\/v1/);
-  assert.match(next, /model: Qwen\/Qwen2\.5-7B-Instruct/);
+  assert.match(next, /baseUrl: "?http:\/\/127\.0\.0\.1:8002\/v1"?/);
+  assert.match(next, /model: "?Qwen\/Qwen2\.5-7B-Instruct"?/);
   assert.equal((next.match(/^\s{2}vllm-local:/gm) ?? []).length, 1);
   assert.match(next, /vllm-chat:\n    description: t\n    backend: vllm-local/);
   assert.equal(next.includes("0.0.0.0"), false);
@@ -254,8 +355,8 @@ specialists:
     backendId: "vllm-qwen25-14b-instruct",
     specialistId: "vllm-qwen25-14b-instruct",
   });
-  assert.match(yaml, /vllm-qwen25-7b-instruct:\n    type: vllm\n    baseUrl: http:\/\/127\.0\.0\.1:8000\/v1\n    model: Qwen\/Qwen2\.5-7B-Instruct/);
-  assert.match(yaml, /vllm-qwen25-14b-instruct:\n    type: vllm\n    baseUrl: http:\/\/127\.0\.0\.1:8001\/v1\n    model: Qwen\/Qwen2\.5-14B-Instruct/);
+  assert.match(yaml, /vllm-qwen25-7b-instruct:\n    type: vllm\n    baseUrl: "?http:\/\/127\.0\.0\.1:8000\/v1"?\n    model: "?Qwen\/Qwen2\.5-7B-Instruct"?/);
+  assert.match(yaml, /vllm-qwen25-14b-instruct:\n    type: vllm\n    baseUrl: "?http:\/\/127\.0\.0\.1:8001\/v1"?\n    model: "?Qwen\/Qwen2\.5-14B-Instruct"?/);
   assert.match(yaml, /specialists:[\s\S]*vllm-qwen25-7b-instruct:\n    description:/);
   assert.match(yaml, /specialists:[\s\S]*vllm-qwen25-14b-instruct:\n    description:/);
   const backendsOnly = yaml.split(/^specialists:/m)[0] ?? yaml;

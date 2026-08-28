@@ -3,6 +3,14 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import type { IntelDockerCatalog } from "./vllm/intel-docker.js";
+import {
+  isWindows,
+  probeWin32VideoControllers,
+  pythonDashArgs,
+  pythonInterpreterNames,
+  runCapture,
+  which,
+} from "./platform.js";
 
 export type AcceleratorVendor = "intel" | "nvidia" | "amd";
 export type LaunchBackend = "intel-xpu" | "cuda" | "rocm" | "cpu";
@@ -68,6 +76,8 @@ export interface HardwareProbes {
   amdSmi?: string | null;
   torchXpu?: string | null;
   sysfsCards?: SysfsCard[];
+  /** Win32_VideoController dump (`Name|AdapterRAM|PNPDeviceID` or WMI csv). */
+  win32Video?: string | null;
 }
 
 export interface PciDisplayDevice {
@@ -77,6 +87,7 @@ export interface PciDisplayDevice {
   vendorId: string;
   deviceId: string;
   discrete: boolean;
+  vramMiB?: number;
 }
 
 interface NamedMemory {
@@ -212,6 +223,69 @@ export function parseLspciDisplayDevices(text: string): PciDisplayDevice[] {
     if (!vendor) continue;
     const discrete = vendor === "intel" ? !isIntelIntegratedGpu(rest, deviceId) : true;
     devices.push({ slot, vendor, name: rest, vendorId, deviceId, discrete });
+  }
+  return devices;
+}
+
+const PNP_PCI_RE = /VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})/;
+
+function adapterRamToMib(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 256 * 1024 * 1024) return 0;
+  const mib = bytesToMib(n);
+  if (mib <= 0 || mib > 256 * 1024) return 0;
+  return mib;
+}
+
+/**
+ * Parse Win32_VideoController dumps from PowerShell (`Name|AdapterRAM|PNPDeviceID`)
+ * or `wmic ... /format:csv`. Used on Windows instead of lspci/sysfs.
+ */
+export function parseWin32VideoControllers(text: string): PciDisplayDevice[] {
+  const devices: PciDisplayDevice[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || /^node,/i.test(line) || /^name\s/i.test(line)) continue;
+    let name = "";
+    let ram = "";
+    let pnp = "";
+    const pipe = line.split("|");
+    if (pipe.length >= 3 && PNP_PCI_RE.test(pipe[2] ?? "")) {
+      name = (pipe[0] ?? "").trim();
+      ram = (pipe[1] ?? "").trim();
+      pnp = (pipe[2] ?? "").trim();
+    } else {
+      const csv = line.split(",");
+      if (csv.length >= 3) {
+        pnp = csv.find((part) => PNP_PCI_RE.test(part)) ?? "";
+        ram = csv.find((part, i) => i > 0 && /^\d+$/.test(part.trim())) ?? "";
+        name =
+          csv.find((part, i) => i > 0 && part !== ram && part !== pnp && /nvidia|amd|ati|radeon|intel|arc|geforce|quadro|rtx|radeon/i.test(part)) ??
+          csv.find((part, i) => i > 0 && part !== ram && part !== pnp && !/^[\d.]+$/.test(part.trim()) && !/^\\\\/.test(part) && part.trim() !== "") ??
+          "";
+      }
+    }
+    const pci = PNP_PCI_RE.exec(pnp);
+    if (!name || !pci) continue;
+    const vendorId = (pci[1] ?? "").toLowerCase();
+    const deviceId = (pci[2] ?? "").toLowerCase();
+    const vendor = vendorFromPci(vendorId, name);
+    if (!vendor) continue;
+    const key = `${vendorId}:${deviceId}:${name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const discrete = vendor === "intel" ? !isIntelIntegratedGpu(name, deviceId) : true;
+    const vramMiB = adapterRamToMib(ram);
+    devices.push({
+      slot: `win32-${devices.length}`,
+      vendor,
+      name,
+      vendorId,
+      deviceId,
+      discrete,
+      vramMiB: vramMiB > 0 ? vramMiB : undefined,
+    });
   }
   return devices;
 }
@@ -356,15 +430,17 @@ export function parseTorchXpu(text: string): NamedMemory[] {
 }
 
 export function readRamMiB(readFile: (path: string) => string = readUtf8): number {
-  try {
-    const text = readFile("/proc/meminfo");
-    const match = /^MemTotal:\s+(\d+)\s*kB/m.exec(text);
-    if (match?.[1]) {
-      const kb = Number(match[1]);
-      if (Number.isFinite(kb) && kb > 0) return Math.round(kb / 1024);
+  if (!isWindows()) {
+    try {
+      const text = readFile("/proc/meminfo");
+      const match = /^MemTotal:\s+(\d+)\s*kB/m.exec(text);
+      if (match?.[1]) {
+        const kb = Number(match[1]);
+        if (Number.isFinite(kb) && kb > 0) return Math.round(kb / 1024);
+      }
+    } catch {
+      // fall through to os.totalmem
     }
-  } catch {
-    // fall through to os.totalmem
   }
   return Math.max(1, Math.round(totalmem() / 1024 / 1024));
 }
@@ -529,21 +605,13 @@ function readSysfsVramBytes(deviceDir: string): number {
   return total;
 }
 
-function runCmd(command: string, args: string[], timeout = 4000): string | null {
-  const result = spawnSync(command, args, { encoding: "utf8", timeout });
-  if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") return null;
-  const out = `${result.stdout ?? ""}${result.status === 0 ? "" : ""}`;
-  if (result.stdout?.trim()) return result.stdout;
-  if (out.trim()) return out;
-  return null;
-}
-
 function liveProbe(name: string, args: string[], timeout?: number): string | null {
-  const fromPath = runCmd(name, args, timeout);
-  if (fromPath) return fromPath;
-  const abs = `/usr/bin/${name}`;
-  if (name !== abs && existsSync(abs)) return runCmd(abs, args, timeout);
-  return null;
+  const resolved = which(name);
+  if (resolved) {
+    const fromResolved = runCapture(resolved, args, timeout);
+    if (fromResolved) return fromResolved;
+  }
+  return runCapture(name, args, timeout);
 }
 
 function runNvidiaSmi(): string | null {
@@ -596,11 +664,25 @@ function probeTorchXpu(): string | null {
     " mem=getattr(p,'total_memory',0) or getattr(p,'total_mem',0) or 0\n" +
     " out.append(f'{i}|{getattr(p,\"name\", \"Intel XPU\")}|{int(mem)}')\n" +
     "print('\\n'.join(out))";
-  for (const py of ["python3", "python"]) {
-    const result = spawnSync(py, ["-c", script], { encoding: "utf8", timeout: 8_000 });
+  for (const py of pythonInterpreterNames()) {
+    const result = spawnSync(py, [...pythonDashArgs(py), "-c", script], { encoding: "utf8", timeout: 8_000, windowsHide: true });
     if (result.status === 0 && result.stdout?.trim()) return result.stdout;
   }
   return null;
+}
+
+function mergePciDevices(lspci: PciDisplayDevice[], win32: PciDisplayDevice[]): PciDisplayDevice[] {
+  const out = [...lspci];
+  for (const row of win32) {
+    const dup = out.some(
+      (existing) =>
+        existing.vendorId === row.vendorId &&
+        existing.deviceId === row.deviceId &&
+        existing.vendor === row.vendor,
+    );
+    if (!dup) out.push(row);
+  }
+  return out;
 }
 
 function acceleratorsFromPci(
@@ -612,7 +694,7 @@ function acceleratorsFromPci(
   for (const dev of pci) {
     if (!dev.discrete && dev.vendor === "intel") continue;
     let vramMiB = 0;
-    let source = "lspci";
+    let source = dev.slot.startsWith("win32") ? "win32" : "lspci";
     const idx = sysfs.findIndex((card, i) => {
       if (usedSysfs.has(i)) return false;
       return (
@@ -628,6 +710,10 @@ function acceleratorsFromPci(
       }
     }
     const skuName = dev.vendor === "intel" ? INTEL_DISCRETE_DEVICE_IDS[dev.deviceId]?.name : undefined;
+    if (!vramMiB && dev.vramMiB) {
+      vramMiB = dev.vramMiB;
+      source = joinSources(source, "AdapterRAM");
+    }
     result.push(
       toAccelerator({
         vendor: dev.vendor,
@@ -731,9 +817,13 @@ function detectHardwareUncached(options?: {
   }
   const hasNvidiaSmi = smiText !== null && smiText !== undefined;
 
-  const lspciText = probes ? (probes.lspci ?? null) : liveProbe("lspci", ["-nn"]);
-  const pci = lspciText ? parseLspciDisplayDevices(lspciText) : [];
-  const sysfs = probes?.sysfsCards ?? (live ? listSysfsCardsLive() : []);
+  const lspciText = probes ? (probes.lspci ?? null) : isWindows() ? null : liveProbe("lspci", ["-nn"]);
+  const win32Text = probes ? (probes.win32Video ?? null) : live ? probeWin32VideoControllers() : null;
+  const pci = mergePciDevices(
+    lspciText ? parseLspciDisplayDevices(lspciText) : [],
+    win32Text ? parseWin32VideoControllers(win32Text) : [],
+  );
+  const sysfs = probes?.sysfsCards ?? (live && !isWindows() ? listSysfsCardsLive() : []);
 
   const nvidiaFromSmi = smiText ? parseNvidiaSmiCsv(smiText) : [];
   if (smiText !== null && smiText !== undefined && nvidiaFromSmi.length === 0 && hasNvidiaSmi) {
@@ -837,6 +927,11 @@ function detectHardwareUncached(options?: {
 
   if (constrained) {
     notes.push("No discrete GPU accelerator found. CPU is last resort; tiny CPU-feasible models only.");
+    if (isWindows() && live) {
+      notes.push(
+        "On Windows, GPU detect uses nvidia-smi, AMD/Intel vendor CLIs when present, and Win32 video controllers — not Linux lspci/sysfs. If you have a discrete GPU, put nvidia-smi (or amd-smi / xpu-smi) on PATH.",
+      );
+    }
   } else {
     const estimated = primary.filter((row) => row.vramEstimated).length;
     if (estimated > 0) {

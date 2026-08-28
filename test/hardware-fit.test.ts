@@ -9,6 +9,7 @@ import {
   parseClinfoGpus,
   parseLspciDisplayDevices,
   parseNvidiaSmiCsv,
+  parseWin32VideoControllers,
 } from "../src/hardware.js";
 
 function acceleratorsFrom(
@@ -80,11 +81,15 @@ function model(partial: Partial<CatalogModel> & Pick<CatalogModel, "id" | "weigh
     name: partial.id,
     hfRepo: `org/${partial.id}`,
     family: partial.family ?? partial.id,
+    lineage: "test",
+    generation: 1,
     paramsB: partial.paramsB ?? 7,
     sizeClass: partial.sizeClass ?? "small",
     cpuFeasible: partial.cpuFeasible ?? false,
     gated: false,
     ...partial,
+    lineage: partial.lineage ?? "test",
+    generation: partial.generation ?? 1,
   };
 }
 
@@ -138,24 +143,59 @@ test("no GPU only tiny CPU-feasible models fit", () => {
   assert.match(fitModel(seven, cpuOnly()).reason, /No discrete accelerator/);
   assert.doesNotMatch(fitModel(seven, cpuOnly()).reason, /No NVIDIA GPU/);
   const rec = recommendModels(cpuOnly(), LOCAL_MODEL_CATALOG);
-  assert.ok(rec.length > 0);
-  assert.ok(rec.every((entry) => entry.model.cpuFeasible));
+  assert.equal(rec.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(rec.some((entry) => entry.model.id === "qwen2.5-0.5b-instruct" && entry.fit.fits && !entry.newest));
+  assert.ok(rec.some((entry) => entry.model.id === "qwen2.5-7b-instruct" && !entry.fit.fits));
+  assert.ok(rec.filter((entry) => entry.fit.fits).every((entry) => entry.model.cpuFeasible));
 });
 
 test("recommend prefers fp16 when it fits, else 4-bit of the same family", () => {
   const rec24 = recommendModels(gpu(24_576));
-  const llama8 = rec24.find((entry) => entry.model.family === "llama-3.1-8b");
-  assert.ok(llama8);
-  assert.equal(llama8.model.quantization, "fp16");
+  assert.equal(rec24.length, LOCAL_MODEL_CATALOG.length);
+  const llama = rec24.find((entry) => entry.model.lineage === "llama" && entry.fit.fits && entry.newest);
+  assert.ok(llama);
+  assert.equal(llama.model.quantization, "fp16");
+  assert.ok(llama.model.generation >= 3.1);
 
   const rec8 = recommendModels(gpu(8192));
-  const llama8q = rec8.find((entry) => entry.model.family === "llama-3.1-8b");
-  assert.ok(llama8q);
-  assert.equal(llama8q.model.quantization, "awq");
-  assert.equal(
-    rec8.some((entry) => entry.model.id === "llama-3.1-70b-instruct-awq"),
-    false,
+  assert.equal(rec8.length, LOCAL_MODEL_CATALOG.length);
+  const llama8 = rec8.find((entry) => entry.model.lineage === "llama" && entry.fit.fits);
+  assert.ok(llama8);
+  const seventyAwq = rec8.find((entry) => entry.model.id === "llama-3.1-70b-instruct-awq");
+  assert.ok(seventyAwq);
+  assert.equal(seventyAwq.fit.fits, false);
+});
+
+test("recommendations list the full catalog and mark newest Hub ids", () => {
+  const catalog: CatalogModel[] = [
+    model({ id: "old-s", family: "old-s", lineage: "demo", generation: 1, paramsB: 3, weightsMiB: 4_000, quantization: "fp16" }),
+    model({ id: "old-l", family: "old-l", lineage: "demo", generation: 1, paramsB: 22, weightsMiB: 40_000, quantization: "fp16" }),
+    model({ id: "new-s", family: "new-s", lineage: "demo", generation: 2, paramsB: 4, weightsMiB: 6_000, quantization: "fp16" }),
+    model({ id: "new-m", family: "new-m", lineage: "demo", generation: 2, paramsB: 24, weightsMiB: 16_000, quantization: "fp16" }),
+    model({ id: "other", family: "other", lineage: "other", generation: 1, paramsB: 7, weightsMiB: 14_000, quantization: "fp16" }),
+  ];
+  const rec = recommendModels(gpu(24_576), catalog);
+  assert.equal(rec.length, catalog.length);
+  assert.deepEqual(
+    rec.map((entry) => entry.model.id).sort(),
+    ["new-m", "new-s", "old-l", "old-s", "other"].sort(),
   );
+  assert.equal(rec.find((entry) => entry.model.id === "new-s")?.newest, true);
+  assert.equal(rec.find((entry) => entry.model.id === "old-s")?.newest, false);
+  assert.equal(rec.find((entry) => entry.model.id === "old-l")?.fit.fits, false);
+});
+
+test("if the newest generation does not fit, it stays listed as too big", () => {
+  const catalog: CatalogModel[] = [
+    model({ id: "v1", family: "v1", lineage: "demo", generation: 1, paramsB: 8, weightsMiB: 4_000, quantization: "fp16" }),
+    model({ id: "v2", family: "v2", lineage: "demo", generation: 2, paramsB: 9, weightsMiB: 80_000, quantization: "fp16" }),
+  ];
+  const rec = recommendModels(gpu(24_576), catalog);
+  assert.equal(rec.length, 2);
+  assert.equal(rec.find((entry) => entry.model.id === "v2")?.newest, true);
+  assert.equal(rec.find((entry) => entry.model.id === "v2")?.fit.fits, false);
+  assert.equal(rec.find((entry) => entry.model.id === "v1")?.fit.fits, true);
+  assert.equal(rec.find((entry) => entry.model.id === "v1")?.newest, false);
 });
 
 test("Intel-only dual Arc does not recommend tiny CPU-feasible models", () => {
@@ -171,33 +211,156 @@ test("Intel-only dual Arc does not recommend tiny CPU-feasible models", () => {
   assert.equal(fitModel(sevenAwq, b70).fits, false);
   assert.match(fitModel(sevenAwq, b70).reason, /Intel XPU|fp16/);
   const recB70 = recommendModels(b70);
-  assert.ok(recB70.length > 0);
-  assert.equal(recB70.every((entry) => entry.model.cpuFeasible), false);
-  assert.ok(recB70.some((entry) => entry.model.paramsB >= 7 && entry.model.quantization === "fp16"));
-  assert.equal(
-    recB70.some((entry) => entry.model.quantization === "awq"),
-    false,
-  );
+  assert.equal(recB70.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(recB70.some((entry) => entry.model.cpuFeasible));
+  assert.ok(recB70.some((entry) => entry.model.paramsB >= 7 && entry.model.quantization === "fp16" && entry.fit.fits));
+  assert.ok(recB70.some((entry) => entry.model.quantization === "awq" && !entry.fit.fits));
 
   const dual12 = intelDual(12_288);
   assert.equal(fitModel(seven, dual12).fits, true);
   assert.equal(fitModel(seven, dual12).parallel, 2);
   const rec12 = recommendModels(dual12);
-  assert.ok(rec12.length > 0);
-  assert.ok(rec12.every((entry) => !entry.model.cpuFeasible));
-  assert.ok((rec12[0]?.model.paramsB ?? 0) >= 7);
+  assert.equal(rec12.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(rec12.some((entry) => entry.fit.fits && !entry.model.cpuFeasible && entry.model.paramsB >= 4));
   assert.match(fitModel(tiny, dual12).reason, /optional|Fits on one/i);
 });
 
-test("14B fp16 on dual B70 uses tensor parallel; 32B fp16 still does not fit", () => {
+test("14B fp16 on dual B70 uses tensor parallel; 32B fp16 still does not fit; 27B Gemma 2 does", () => {
   const fourteen = findCatalogModel("qwen2.5-14b-instruct");
   const thirtyTwo = findCatalogModel("qwen2.5-32b-instruct");
-  assert.ok(fourteen && thirtyTwo);
+  const gemma27 = findCatalogModel("gemma-2-27b-it");
+  const gemma4_26 = findCatalogModel("gemma-4-26b-a4b-it");
+  const qwen38 = findCatalogModel("qwen3.8-27b");
+  assert.ok(fourteen && thirtyTwo && gemma27 && gemma4_26 && qwen38);
   const b70 = intelDual(31_023);
   const f14 = fitModel(fourteen, b70);
   assert.equal(f14.fits, true);
   assert.equal(f14.parallel, 2);
   assert.equal(fitModel(thirtyTwo, b70).fits, false);
+  const g27 = fitModel(gemma27, b70);
+  assert.equal(g27.fits, true);
+  assert.equal(g27.parallel, 2);
+  assert.equal(fitModel(gemma4_26, b70).fits, true);
+  assert.equal(fitModel(qwen38, b70).fits, true);
+  const rec = recommendModels(b70);
+  assert.equal(rec.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(LOCAL_MODEL_CATALOG.length > 40, "full catalog is not a 2-row slice");
+  assert.ok(rec.some((entry) => entry.model.family.startsWith("gemma-2") && !entry.newest));
+  assert.ok(rec.some((entry) => entry.model.family.startsWith("gemma-4") && entry.newest));
+  assert.ok(rec.some((entry) => entry.model.id === "qwen3.8-27b" && entry.newest && entry.fit.fits));
+  assert.equal(fitModel(gemma4_26, b70).kind, "needs_tp");
+  assert.ok(rec.some((entry) => entry.fit.fits && entry.model.paramsB >= 24));
+});
+
+test("catalog includes Gemma 4, Qwen3.8, Llama 4, and older gens remain downloadable", () => {
+  const gemma9 = findCatalogModel("gemma-2-9b-it");
+  const gemma27 = findCatalogModel("google/gemma-2-27b-it");
+  const gemma3 = findCatalogModel("google/gemma-3-4b-it");
+  const gemma4 = findCatalogModel("google/gemma-4-E4B-it");
+  const llama32 = findCatalogModel("llama-3.2-3b-instruct");
+  const qwen332 = findCatalogModel("qwen3-32b");
+  const qwen38 = findCatalogModel("Qwen/Qwen3.8-27B");
+  const qwen35 = findCatalogModel("qwen3.5-9b");
+  const qwen3 = findCatalogModel("qwen3-8b");
+  const phi4 = findCatalogModel("microsoft/phi-4");
+  const olmo = findCatalogModel("olmo-2-13b-instruct");
+  const olmo3 = findCatalogModel("olmo-3-7b-instruct");
+  const granite = findCatalogModel("granite-3.3-8b-instruct");
+  const granite42 = findCatalogModel("granite-4.2-8b");
+  const r1 = findCatalogModel("deepseek-r1-distill-qwen-14b");
+  const r10528 = findCatalogModel("deepseek-r1-0528-qwen3-8b");
+  const scout = findCatalogModel("llama-4-scout-instruct");
+  const llama33 = findCatalogModel("llama-3.3-70b-instruct");
+  const small32 = findCatalogModel("mistral-small-3.2-24b-instruct");
+  assert.ok(gemma9 && gemma27 && gemma3 && gemma4 && llama32 && qwen332 && qwen38 && qwen35 && qwen3 && phi4 && olmo && olmo3 && granite && granite42 && r1 && r10528 && scout && llama33 && small32);
+  assert.equal(gemma9.gated, true);
+  assert.equal(gemma4.gated, false);
+  assert.equal(gemma4.generation, 4);
+  assert.equal(qwen38.generation, 3.8);
+  assert.equal(qwen3.gated, false);
+  assert.equal(phi4.gated, false);
+  assert.equal(findCatalogModel("qwen3-8b-awq")?.quantization, "awq");
+  const llama8 = findCatalogModel("llama-3.1-8b-instruct");
+  const llama8awq = findCatalogModel("llama-3.1-8b-instruct-awq");
+  const mistral = findCatalogModel("mistral-7b-instruct");
+  assert.equal(llama8?.gated, true);
+  assert.match(llama8?.notes ?? "", /Llama Community License/);
+  assert.equal(llama8awq?.gated, false);
+  assert.match(llama8awq?.notes ?? "", /Llama Community License/);
+  assert.equal(mistral?.gated, true);
+  assert.equal(small32.gated, false);
+  assert.equal(scout.gated, true);
+  assert.match(gemma9.notes ?? "", /Gemma Terms of Use/);
+  assert.match(gemma4.notes ?? "", /Apache-2\.0/);
+  assert.equal(LOCAL_MODEL_CATALOG.every((row) => row.lineage.length > 0 && Number.isFinite(row.generation)), true);
+});
+
+test("Gemma 2 9B fp16 fits a 24GB NVIDIA card; 27B needs 80GB-class or two ~32GB GPUs", () => {
+  const nine = findCatalogModel("gemma-2-9b-it");
+  const twentySeven = findCatalogModel("gemma-2-27b-it");
+  const qwen3 = findCatalogModel("qwen3-8b");
+  const qwen3Awq = findCatalogModel("qwen3-8b-awq");
+  const phi4 = findCatalogModel("phi-4");
+  assert.ok(nine && twentySeven && qwen3 && qwen3Awq && phi4);
+  const rtx4090 = gpu(24_576);
+  const h100 = gpu(81_920);
+  const eightGb = gpu(8192);
+  assert.equal(fitModel(nine, rtx4090).fits, true);
+  assert.equal(fitModel(nine, rtx4090).parallel, 1);
+  assert.equal(fitModel(qwen3, rtx4090).fits, true);
+  assert.equal(fitModel(phi4, rtx4090).fits, false);
+  assert.equal(fitModel(twentySeven, rtx4090).fits, false);
+  assert.equal(fitModel(twentySeven, h100).fits, true);
+  assert.equal(fitModel(qwen3Awq, eightGb).fits, true);
+  assert.equal(fitModel(nine, eightGb).fits, false);
+  assert.equal(fitModel(twentySeven, intelDual(31_023)).parallel, 2);
+
+  const rec24 = recommendModels(rtx4090);
+  assert.equal(rec24.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(rec24.some((entry) => entry.model.family.startsWith("gemma-4") && entry.newest));
+  assert.ok(rec24.some((entry) => entry.model.family.startsWith("gemma-2") && !entry.newest));
+  assert.ok(rec24.some((entry) => (entry.model.family.startsWith("qwen3.5") || entry.model.family.startsWith("qwen3.8")) && entry.newest));
+});
+
+test("dual NVIDIA 24GB: models that miss one card but fit two use tensor parallel", () => {
+  const eight = findCatalogModel("llama-3.1-8b-instruct");
+  const fourteen = findCatalogModel("qwen2.5-14b-instruct");
+  const seventyAwq = findCatalogModel("llama-3.1-70b-instruct-awq");
+  const gemma27 = findCatalogModel("gemma-2-27b-it");
+  assert.ok(eight && fourteen && seventyAwq && gemma27);
+  const dual24 = snapshot({ vendor: "nvidia", backend: "cuda", vrams: [24_576, 24_576], name: "NVIDIA GeForce RTX 4090" });
+  assert.equal(fitModel(eight, dual24).fits, true);
+  assert.equal(fitModel(eight, dual24).parallel, 1);
+  assert.equal(fitModel(fourteen, dual24).fits, true);
+  assert.equal(fitModel(fourteen, dual24).parallel, 2);
+  assert.equal(fitModel(seventyAwq, dual24).fits, true);
+  assert.equal(fitModel(seventyAwq, dual24).parallel, 2);
+  assert.equal(fitModel(gemma27, dual24).fits, false);
+});
+
+test("dual AMD 24GB: 14B fp16 uses tensor parallel; 8B stays on one GPU", () => {
+  const eight = findCatalogModel("qwen2.5-7b-instruct");
+  const fourteen = findCatalogModel("qwen2.5-14b-instruct");
+  const awq = findCatalogModel("qwen2.5-7b-instruct-awq");
+  assert.ok(eight && fourteen && awq);
+  const dual = snapshot({ vendor: "amd", backend: "rocm", vrams: [24_576, 24_576], name: "Radeon RX 7900 XTX" });
+  assert.equal(fitModel(eight, dual).fits, true);
+  assert.equal(fitModel(eight, dual).parallel, 1);
+  assert.equal(fitModel(fourteen, dual).fits, true);
+  assert.equal(fitModel(fourteen, dual).parallel, 2);
+  assert.equal(fitModel(awq, dual).fits, true);
+  assert.equal(fitModel(awq, dual).parallel, 1);
+});
+
+test("AWQ Gemma/Qwen3 variants are CUDA/ROCm-only; fp16 is used on Intel XPU", () => {
+  const gemma9 = findCatalogModel("gemma-2-9b-it");
+  const qwen3Awq = findCatalogModel("qwen3-8b-awq");
+  assert.ok(gemma9 && qwen3Awq);
+  const xpu = intelDual(31_023);
+  const rocm = snapshot({ vendor: "amd", backend: "rocm", vrams: [24_576], name: "Radeon RX 7900 XTX" });
+  assert.equal(fitModel(gemma9, xpu).fits, true);
+  assert.equal(fitModel(qwen3Awq, xpu).fits, false);
+  assert.equal(fitModel(qwen3Awq, rocm).fits, true);
 });
 
 test("AMD-only uses ROCm VRAM and can take AWQ", () => {
@@ -208,8 +371,9 @@ test("AMD-only uses ROCm VRAM and can take AWQ", () => {
   assert.equal(fitModel(seven, amd).fits, true);
   assert.equal(fitModel(awq, amd).fits, true);
   const rec = recommendModels(amd);
-  assert.ok(rec.some((entry) => entry.model.paramsB >= 7));
-  assert.equal(rec.every((entry) => entry.model.cpuFeasible), false);
+  assert.equal(rec.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(rec.some((entry) => entry.model.paramsB >= 7 && entry.fit.fits));
+  assert.ok(rec.some((entry) => !entry.model.cpuFeasible));
 });
 
 test("NVIDIA-only mock lspci/nvidia-smi is cuda, not CPU", () => {
@@ -262,8 +426,12 @@ test("Intel-only mock lspci+clinfo detects two Arc GPUs and VRAM", () => {
   assert.equal(hw.accelerators[0]!.vramEstimated, false);
   assert.ok(hw.totalVramMiB > 40_000);
   const rec = recommendModels(hw);
-  assert.ok(rec.length > 0);
-  assert.equal(rec.every((entry) => entry.model.cpuFeasible), false);
+  assert.equal(rec.length, LOCAL_MODEL_CATALOG.length);
+  assert.ok(rec.some((entry) => entry.fit.fits && !entry.model.cpuFeasible));
+  const gemma27 = findCatalogModel("gemma-2-27b-it");
+  assert.ok(gemma27);
+  assert.equal(fitModel(gemma27, hw).fits, true);
+  assert.equal(fitModel(gemma27, hw).parallel, 2);
   assert.doesNotMatch(hw.notes.join(" "), /No NVIDIA GPU/);
 });
 
@@ -353,4 +521,51 @@ test("detectHardware reports RAM and CPU; accelerators when present", () => {
     assert.ok((hw.accelerators[0]?.name ?? "").length > 0);
     assert.doesNotMatch(hw.notes.join(" "), /No NVIDIA GPU/);
   }
+});
+
+test("parseWin32VideoControllers reads Name|AdapterRAM|PNPDeviceID and skips iGPU", () => {
+  const devices = parseWin32VideoControllers(
+    [
+      "NVIDIA GeForce RTX 4090|4293918720|PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000\\0",
+      "Intel(R) Arc(TM) Pro B70 Graphics|34359738368|PCI\\VEN_8086&DEV_E223&SUBSYS_00000000\\0",
+      "Intel(R) Graphics|1073741824|PCI\\VEN_8086&DEV_7D67&SUBSYS_00000000\\0",
+    ].join("\n"),
+  );
+  assert.equal(devices.filter((row) => row.discrete).length, 2);
+  assert.equal(devices.filter((row) => !row.discrete).length, 1);
+  assert.equal(devices.find((row) => row.vendor === "nvidia")?.deviceId, "2684");
+  assert.equal(devices.find((row) => row.vendor === "intel" && row.discrete)?.deviceId, "e223");
+});
+
+test("Windows Win32 + nvidia-smi detect CUDA without lspci/sysfs", () => {
+  const hw = detectHardware({
+    probes: {
+      nvidiaSmi: "NVIDIA GeForce RTX 4090, 24576, 560.35",
+      lspci: null,
+      sysfsCards: [],
+      win32Video:
+        "NVIDIA GeForce RTX 4090|4293918720|PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000\\0\nIntel(R) Graphics|1073741824|PCI\\VEN_8086&DEV_7D67&SUBSYS_00000000\\0\n",
+    },
+  });
+  assert.equal(hw.primaryBackend, "cuda");
+  assert.equal(hw.constrained, false);
+  assert.equal(hw.deviceCount, 1);
+  assert.equal(hw.accelerators[0]?.vendor, "nvidia");
+  assert.equal(hw.vramMiB, 24_576);
+  assert.ok(!hw.notes.join(" ").includes("lspci"));
+});
+
+test("Windows Win32 Intel Arc uses SKU VRAM without sysfs", () => {
+  const hw = detectHardware({
+    probes: {
+      nvidiaSmi: null,
+      lspci: null,
+      sysfsCards: [],
+      win32Video: "Intel(R) Arc(TM) Pro B70 Graphics|0|PCI\\VEN_8086&DEV_E223&SUBSYS_00000000\\0\n",
+    },
+  });
+  assert.equal(hw.primaryBackend, "intel-xpu");
+  assert.equal(hw.deviceCount, 1);
+  assert.equal(hw.vramMiB, 32_768);
+  assert.equal(hw.accelerators[0]?.vramEstimated, true);
 });

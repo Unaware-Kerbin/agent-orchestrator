@@ -1,7 +1,15 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { packageRoot } from "./config.js";
+import {
+  listenerPids,
+  normalizeCmdline,
+  pidAlive,
+  readProcessCmdline,
+  readProcessCwd,
+  stopProcess,
+  writeSecureFile,
+} from "./platform.js";
 import { stateDir } from "./state.js";
 
 const PID_FILE = "gui.pid";
@@ -12,7 +20,7 @@ export function guiPidPath(): string {
 }
 
 export function isGuiCmdline(cmdline: string): boolean {
-  const text = cmdline.replace(/\0/g, " ");
+  const text = normalizeCmdline(cmdline);
   return text.includes(GUI_SCRIPT) && !text.includes("gui-process") && !text.includes("--stop");
 }
 
@@ -38,7 +46,7 @@ export function readGuiPid(): number | undefined {
 }
 
 export function writeGuiPid(pid: number): void {
-  writeFileSync(guiPidPath(), `${pid}\n`, { encoding: "utf8", mode: 0o600 });
+  writeSecureFile(guiPidPath(), `${pid}\n`);
 }
 
 export function clearGuiPid(expectedPid?: number): void {
@@ -55,67 +63,19 @@ export function clearGuiPid(expectedPid?: number): void {
   }
 }
 
-export function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+export { listenerPids, pidAlive };
 
 export function readCmdline(pid: number): string {
-  try {
-    return readFileSync(`/proc/${pid}/cmdline`, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function readCwd(pid: number): string {
-  try {
-    return readlinkSync(`/proc/${pid}/cwd`);
-  } catch {
-    return "";
-  }
+  return readProcessCmdline(pid);
 }
 
 export function isOurGuiProcess(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0 || !pidAlive(pid)) return false;
   if (!isGuiCmdline(readCmdline(pid))) return false;
-  const cwd = readCwd(pid);
+  const cwd = readProcessCwd(pid);
   const root = packageRoot();
   if (cwd && cwd !== root) return false;
   return true;
-}
-
-function runStdout(command: string, args: string[]): string {
-  const result = spawnSync(command, args, { encoding: "utf8" });
-  return result.stdout ?? "";
-}
-
-function runText(command: string, args: string[]): string {
-  const result = spawnSync(command, args, { encoding: "utf8" });
-  return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-}
-
-export function listenerPids(port: number): number[] {
-  const found = new Set<number>();
-  const ss = runStdout("ss", ["-ltnp", `sport = :${port}`]);
-  for (const match of ss.matchAll(/pid=(\d+)/g)) found.add(Number(match[1]));
-  const lsof = runStdout("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"]);
-  for (const line of lsof.split(/\s+/)) {
-    const n = Number(line);
-    if (Number.isInteger(n) && n > 0) found.add(n);
-  }
-  if (found.size === 0) {
-    const fuser = runText("fuser", ["-n", "tcp", String(port)]);
-    for (const match of fuser.matchAll(/\b(\d+)\b/g)) {
-      const n = Number(match[1]);
-      if (n > 0 && n !== port) found.add(n);
-    }
-  }
-  return [...found].filter((pid) => Number.isInteger(pid) && pid > 0);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -154,11 +114,7 @@ export async function stopOurGui(options: { port: number }): Promise<{
   }
 
   for (const pid of ours) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // already gone
-    }
+    stopProcess(pid);
   }
 
   const until = Date.now() + 5000;
@@ -180,7 +136,7 @@ export async function stopOurGui(options: { port: number }): Promise<{
     foreign: [],
     message:
       still.length === 0
-        ? `Stopped GUI pid ${ours.join(", ")} (SIGTERM). 127.0.0.1:${options.port} is free.`
-        : `Sent SIGTERM to GUI pid ${ours.join(", ")}; still running: ${still.join(", ")}.`,
+        ? `Stopped GUI pid ${ours.join(", ")}. 127.0.0.1:${options.port} is free.`
+        : `Sent stop to GUI pid ${ours.join(", ")}; still running: ${still.join(", ")}.`,
   };
 }

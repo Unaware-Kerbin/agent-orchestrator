@@ -8,6 +8,7 @@ import {
   classifyIntelImage,
   compareIntelTags,
   hasVllmDeviceXpuFlag,
+  gemma4VllmExtraArgs,
   listIntelVllmImages,
   parseDockerImagesJson,
   selectPreferredIntelImage,
@@ -88,6 +89,13 @@ test("listIntelVllmImages reports docker group / daemon failures clearly", () =>
   );
   assert.equal(down.daemon, "down");
   assert.match(down.message, /daemon|docker group/i);
+
+  const npipe = classifyDockerError(
+    "error during connect: this error may indicate that the docker daemon is not running: Get \"http://%2F%2F.%2Fpipe%2Fdocker_engine/_ping\": open //./pipe/docker_engine: The system cannot find the file specified.",
+    1,
+  );
+  assert.equal(npipe.daemon, "down");
+  assert.match(npipe.message, /Docker Desktop/);
 });
 
 test("detectVllmLaunch on intel-xpu chooses Docker even when host vLLM is CUDA-only", () => {
@@ -171,9 +179,46 @@ test("buildIntelDockerRunArgs publishes 127.0.0.1 only and mounts models + DRI",
   assert.ok(plan.args.includes("--privileged"));
   assert.equal(plan.args.includes("--net=host"), false);
   assert.equal(plan.args[plan.args.indexOf("--tensor-parallel-size") + 1], "2");
+  assert.equal(plan.args[plan.args.indexOf("--gpu-memory-utilization") + 1], "0.9");
   assert.equal(plan.args[0], "run");
   const imageIdx = plan.args.lastIndexOf(PREFERRED_LLM_SCALER_REF);
   assert.equal(plan.args[imageIdx + 1], plan.containerModelPath);
+  assertIntelServeCli(plan);
+});
+
+test("Gemma 4 E2B Intel args stay TP=1 and include mamba cache dtype", () => {
+  assert.deepEqual(gemma4VllmExtraArgs("google/gemma-4-E2B-it", "/llm/models/google--gemma-4-E2B-it"), [
+    "--mamba-ssm-cache-dtype",
+    "float16",
+  ]);
+  assert.deepEqual(gemma4VllmExtraArgs("Qwen/Qwen2.5-7B-Instruct", "/llm/models/qwen"), []);
+  const plan = buildIntelDockerRunArgs({
+    image: PREFERRED_LLM_SCALER_REF,
+    hostPort: 8001,
+    modelsDir: "/home/user/.orchestrator/models",
+    modelPath: "/home/user/.orchestrator/models/google--gemma-4-E2B-it",
+    servedModelName: "google/gemma-4-E2B-it",
+    tensorParallel: 1,
+    driDir: "/dev/dri",
+  });
+  assert.equal(plan.args[plan.args.indexOf("--tensor-parallel-size") + 1], "1");
+  assert.equal(plan.args[plan.args.indexOf("--mamba-ssm-cache-dtype") + 1], "float16");
+  assert.ok(plan.args.includes("--trust-remote-code"));
+  assertIntelServeCli(plan);
+});
+
+test("Windows host model paths map into the Linux container mount", () => {
+  const plan = buildIntelDockerRunArgs({
+    image: PREFERRED_LLM_SCALER_REF,
+    hostPort: 8000,
+    modelsDir: "C:\\Users\\me\\.orchestrator\\models",
+    modelPath: "C:\\Users\\me\\.orchestrator\\models\\Qwen--Qwen2.5-7B-Instruct",
+    servedModelName: "Qwen/Qwen2.5-7B-Instruct",
+    driDir: "/dev/dri",
+  });
+  assert.equal(plan.containerModelPath, "/llm/models/Qwen--Qwen2.5-7B-Instruct");
+  assert.ok(plan.args.some((arg) => arg.includes("C:/Users/me/.orchestrator/models:/llm/models")));
+  assert.equal(plan.publish, "127.0.0.1:8000:8000");
   assertIntelServeCli(plan);
 });
 

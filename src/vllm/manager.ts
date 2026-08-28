@@ -1,12 +1,23 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { delimiter, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { EventEmitter } from "node:events";
 import { detectHardware, type LaunchBackend } from "../hardware.js";
+import { GPU_MEMORY_UTILIZATION, type FitKind } from "../local-models/fit.js";
+import { isUnreachableError } from "../providers/keys.js";
 import { readConfigYaml, writeConfigYaml } from "../config.js";
+import {
+  pidAlive,
+  pythonDashArgs,
+  pythonInterpreterNames,
+  readProcessCmdline,
+  stopProcessTree,
+  which,
+  writeSecureFile,
+} from "../platform.js";
 import { ensureLocalVllmDummyKey } from "../secrets.js";
 import { stateDir } from "../state.js";
 import {
@@ -25,6 +36,7 @@ import {
   dockerRmName,
   dockerRunDetached,
   dockerStopContainer,
+  gemma4VllmExtraArgs,
   intelDockerInstallHint,
   listIntelVllmImages,
   modelsDirFromPath,
@@ -36,7 +48,7 @@ export const VLLM_LOOPBACK_HOST = "127.0.0.1" as const;
 export const VLLM_PORT_START = 8000;
 export const VLLM_PORT_END = 8099;
 export const VLLM_INSTALL_HINT =
-  "vLLM is not installed. Install with: pip install vllm  (NVIDIA CUDA matching your driver). Then ensure `vllm` or `python3 -m vllm` is on PATH.";
+  "vLLM is not installed. Install with: pip install vllm  (NVIDIA CUDA matching your driver). Then ensure `vllm` or `python -m vllm` (python3 on Linux/macOS) is on PATH.";
 export const VLLM_XPU_INSTALL_HINT = `Intel Arc/XPU: stock \`pip install vllm\` is CUDA-only and will not run on Arc.
 
 Supported path when local images exist: Docker (intel/llm-scaler-vllm:0.21.0-b3 preferred for Arc Pro / Battlemage, then other intel/llm-scaler-vllm tags, then intel/vllm:0.17.0-xpu). Bind 127.0.0.1 only.
@@ -48,7 +60,7 @@ Host fallback if Docker is down or those images are missing:
 4. VLLM_TARGET_DEVICE=xpu pip install .     # or: VLLM_TARGET_DEVICE=xpu python setup.py install
 
 Then: vllm serve MODEL --host 127.0.0.1 --device xpu --dtype float16 --enforce-eager --gpu-memory-utilization 0.9
-Dual GPU: VLLM_WORKER_MULTIPROC_METHOD=spawn ZE_AFFINITY_MASK=0,1 vllm serve … --tensor-parallel-size 2
+Dual GPU: VLLM_WORKER_MULTIPROC_METHOD=spawn ZE_FLAT_DEVICE_HIERARCHY=FLAT vllm serve … --tensor-parallel-size 2
 FP16 is the default on Arc (BF16 is for Intel Data Center GPU, not Arc).`;
 export const VLLM_ROCM_INSTALL_HINT =
   "AMD ROCm: stock pip CUDA wheels will not use the GPU. Install a ROCm vLLM build (vLLM docs: build with HIP / use the ROCm Docker image). Then ensure `vllm` is on PATH. Launch uses HIP_VISIBLE_DEVICES.";
@@ -204,18 +216,69 @@ export function vllmInstallHint(backend: LaunchBackend = "cuda", docker?: IntelD
   return VLLM_INSTALL_HINT;
 }
 
+export function visibleDeviceMask(deviceCount: number): string {
+  return Array.from({ length: Math.max(1, deviceCount) }, (_, i) => String(i)).join(",");
+}
+
+/** Clamp catalog/fit tensor parallel to the number of visible primary-backend GPUs. */
+export function resolveTensorParallel(tensorParallel: number | undefined, deviceCount: number): number {
+  const devices = Math.max(1, deviceCount);
+  if (!tensorParallel || tensorParallel <= 1) return 1;
+  return Math.min(Math.floor(tensorParallel), devices);
+}
+
+/**
+ * Default: use every GPU on this computer (tensor parallel = device count).
+ * `useAllGpus: false` pins to one GPU (`CUDA_VISIBLE_DEVICES=0` / equivalent).
+ */
+export function resolveVllmGpuLaunch(input: {
+  useAllGpus?: boolean;
+  deviceCount: number;
+}): { tensorParallel: number | undefined; deviceCount: number } {
+  const n = Math.max(1, Math.floor(Number(input.deviceCount) || 1));
+  const useAll = input.useAllGpus !== false;
+  if (useAll && n > 1) {
+    return { tensorParallel: n, deviceCount: n };
+  }
+  return { tensorParallel: undefined, deviceCount: 1 };
+}
+
+/**
+ * Tensor-parallel only when the catalog fit needs more than one card.
+ * A model that already fits one GPU (e.g. Gemma 4 E2B on a 31 GiB Arc) stays TP=1
+ * even if the machine has two XPUs — dual-worker XPU TP is slower and more fragile.
+ */
+export function resolveVllmGpuLaunchForFit(input: {
+  useAllGpus?: boolean;
+  deviceCount: number;
+  fitKind: FitKind;
+  fitParallel?: number;
+}): { tensorParallel: number | undefined; deviceCount: number } {
+  const needsTp = input.fitKind === "needs_tp" || (input.fitParallel ?? 1) > 1;
+  return resolveVllmGpuLaunch({
+    useAllGpus: input.useAllGpus !== false && needsTp,
+    deviceCount: input.deviceCount,
+  });
+}
+
 export function vllmLaunchEnv(
   backend: LaunchBackend,
   deviceCount: number,
   extra: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...extra };
-  const mask = Array.from({ length: Math.max(1, deviceCount) }, (_, i) => String(i)).join(",");
+  const mask = visibleDeviceMask(deviceCount);
+  if (deviceCount > 1) {
+    env.VLLM_WORKER_MULTIPROC_METHOD = env.VLLM_WORKER_MULTIPROC_METHOD ?? "spawn";
+  }
   if (backend === "intel-xpu") {
     env.VLLM_TARGET_DEVICE = env.VLLM_TARGET_DEVICE ?? "xpu";
     env.VLLM_WORKER_MULTIPROC_METHOD = env.VLLM_WORKER_MULTIPROC_METHOD ?? "spawn";
-    env.ZE_AFFINITY_MASK = env.ZE_AFFINITY_MASK ?? mask;
+    env.ZE_FLAT_DEVICE_HIERARCHY = env.ZE_FLAT_DEVICE_HIERARCHY ?? "FLAT";
     env.ONEAPI_DEVICE_SELECTOR = env.ONEAPI_DEVICE_SELECTOR ?? "level_zero:gpu";
+    // Do not inject ZE_AFFINITY_MASK. With an iGPU present, 0,1 can select the
+    // integrated GPU plus one discrete card. Docker and host both rely on FLAT
+    // hierarchy + all /dev/dri nodes so discrete XPUs enumerate as 0,1.
   } else if (backend === "cuda") {
     env.CUDA_VISIBLE_DEVICES = env.CUDA_VISIBLE_DEVICES ?? mask;
   } else if (backend === "rocm") {
@@ -233,7 +296,7 @@ export function classifyVllmLog(text: string): string | undefined {
     return "This vLLM build is CUDA-only and did not see an NVIDIA GPU. On Intel Arc install vLLM with VLLM_TARGET_DEVICE=xpu; on AMD use a ROCm build.";
   }
   if (/xpu.*not available|No XPU|Level Zero|zeInit|oneAPI/i.test(text)) {
-    return "vLLM XPU did not see an Intel GPU. Source oneAPI (`source /opt/intel/oneapi/setvars.sh`), check `sycl-ls` / `clinfo`, and rebuild with VLLM_TARGET_DEVICE=xpu.";
+    return "vLLM XPU did not see an Intel GPU. On Linux, source oneAPI (`source /opt/intel/oneapi/setvars.sh`), check `sycl-ls` / `clinfo`, and rebuild with VLLM_TARGET_DEVICE=xpu. Native Windows XPU Docker is not supported; use WSL2 or a Linux host for Intel Docker images.";
   }
   if (/HIP.*not available|No HIP GPUs|rocm/i.test(text) && /not available|no gpu/i.test(text)) {
     return "This vLLM build did not see a ROCm GPU. Install a ROCm vLLM wheel/image and check `rocm-smi`.";
@@ -241,19 +304,12 @@ export function classifyVllmLog(text: string): string | undefined {
   if (/ModuleNotFoundError: No module named 'vllm'|No module named vllm/i.test(text)) {
     return VLLM_INSTALL_HINT;
   }
-  return undefined;
-}
-
-function which(cmd: string): string | undefined {
-  const pathEnv = process.env.PATH ?? "";
-  for (const dir of pathEnv.split(delimiter)) {
-    const candidate = join(dir, cmd);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // next
-    }
+  if (
+    /unknown architecture|not a valid model|is not supported|ModelRegistry|architecture .* not (found|supported)|does not support this model/i.test(
+      text,
+    )
+  ) {
+    return "This vLLM image rejected the model architecture. intel/llm-scaler-vllm:0.21.0-b1+ supports Gemma 4 12B/31B/26B-A4B (`Gemma4ForConditionalGeneration`, --trust-remote-code). E2B/E4B are the same family but not on Intel’s verified list.";
   }
   return undefined;
 }
@@ -301,9 +357,10 @@ export function detectVllmLaunch(options?: {
   const importOk =
     options?.pythonImportOk ??
     ((python: string) => {
-      const result = spawnSync(python, ["-c", "import vllm; print('ok')"], {
+      const result = spawnSync(python, [...pythonDashArgs(python), "-c", "import vllm; print('ok')"], {
         encoding: "utf8",
         timeout: 8_000,
+        windowsHide: true,
       });
       return result.status === 0 && (result.stdout ?? "").includes("ok");
     });
@@ -312,7 +369,7 @@ export function detectVllmLaunch(options?: {
   const wanted: VllmDeviceProbe =
     backend === "intel-xpu" ? "xpu" : backend === "rocm" ? "rocm" : backend === "cpu" ? "unknown" : "cuda";
 
-  const pythonCandidates = ["python3", "python"].filter((py) => Boolean(whichFn(py)) || py === "python3");
+  const pythonCandidates = pythonInterpreterNames().filter((py) => Boolean(whichFn(py)) || py === pythonInterpreterNames()[0]);
   let probed: VllmDeviceProbe = "missing";
   let pythonWithVllm: string | undefined;
   for (const py of pythonCandidates) {
@@ -361,7 +418,7 @@ export function detectVllmLaunch(options?: {
     return {
       launch: {
         command: pythonWithVllm,
-        args: ["-m", "vllm.entrypoints.openai.api_server"],
+        args: [...pythonDashArgs(pythonWithVllm), "-m", "vllm.entrypoints.openai.api_server"],
         backend,
         runtime: "host",
       },
@@ -377,7 +434,7 @@ export function detectVllmLaunch(options?: {
         return {
           launch: {
             command: py,
-            args: ["-m", "vllm.entrypoints.openai.api_server"],
+            args: [...pythonDashArgs(py), "-m", "vllm.entrypoints.openai.api_server"],
             backend,
             runtime: "host",
           },
@@ -421,7 +478,7 @@ if out["device"] == "unknown":
         pass
 print(json.dumps(out))
 `;
-  const result = spawnSync(python, ["-c", script], { encoding: "utf8", timeout: 10_000 });
+  const result = spawnSync(python, [...pythonDashArgs(python), "-c", script], { encoding: "utf8", timeout: 10_000, windowsHide: true });
   try {
     const parsed = JSON.parse((result.stdout ?? "").trim().split(/\n/).pop() ?? "{}") as { device?: string };
     if (parsed.device === "xpu" || parsed.device === "cuda" || parsed.device === "rocm" || parsed.device === "unknown") {
@@ -442,6 +499,7 @@ export function buildVllmArgv(input: {
   quantization?: string;
   backend?: LaunchBackend;
   tensorParallel?: number;
+  deviceCount?: number;
 }): { command: string; args: string[] } {
   const host = VLLM_LOOPBACK_HOST;
   const backend = input.backend ?? input.launch.backend ?? "cuda";
@@ -455,11 +513,15 @@ export function buildVllmArgv(input: {
     args.push("--quantization", input.quantization);
   }
   if (backend === "intel-xpu") {
-    args.push("--device", "xpu", "--dtype", "float16", "--enforce-eager", "--gpu-memory-utilization", "0.9");
+    args.push("--device", "xpu", "--dtype", "float16", "--enforce-eager");
   }
-  if (input.tensorParallel && input.tensorParallel > 1) {
-    args.push("--tensor-parallel-size", String(input.tensorParallel));
+  args.push("--gpu-memory-utilization", String(GPU_MEMORY_UTILIZATION));
+  const tp = resolveTensorParallel(input.tensorParallel, input.deviceCount ?? input.tensorParallel ?? 1);
+  if (tp > 1) {
+    args.push("--tensor-parallel-size", String(tp));
   }
+  args.push("--trust-remote-code");
+  args.push(...gemma4VllmExtraArgs(input.servedModelName, input.modelPath));
   if (args.includes("0.0.0.0")) {
     throw new Error("Internal error: refused to pass 0.0.0.0 to vLLM");
   }
@@ -528,20 +590,7 @@ export function partitionVllmInstances<T extends { modelId?: string; hfRepo?: st
 }
 
 function readCmdline(pid: number): string {
-  try {
-    return readFileSync(`/proc/${pid}/cmdline`, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return readProcessCmdline(pid);
 }
 
 function parseStateInstance(raw: Record<string, unknown>, legacySingle = false): VllmStateFile | undefined {
@@ -598,10 +647,9 @@ function readInstances(): VllmStateFile[] {
 }
 
 function writeInstances(instances: VllmStateFile[]): void {
-  writeFileSync(
+  writeSecureFile(
     statePath(),
     `${JSON.stringify({ version: 2, running: instances.length > 0, instances }, null, 2)}\n`,
-    { encoding: "utf8", mode: 0o600 },
   );
 }
 
@@ -630,21 +678,23 @@ function lastLogLines(backendId?: string, maxChars = 4000): string {
 }
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal);
-  } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // already gone
-    }
-  }
+  stopProcessTree(pid, signal === "SIGKILL");
+}
+
+/** Shown while the process/container is alive but GET /v1/models is not listening yet. */
+export const VLLM_HTTP_WAIT_MESSAGE =
+  "Waiting for GET /v1/models… the server is still loading weights. Connection refused is expected until the API binds.";
+
+export function isTransientVllmProbeError(error: unknown): boolean {
+  if (isUnreachableError(error)) return true;
+  const text = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return /fetch failed|Failed to fetch|TimeoutError|Timeout|aborted|AbortError|UND_ERR/i.test(text);
 }
 
 export async function probeVllmModels(
   baseUrl: string,
   timeoutMs = 800,
-): Promise<{ ok: boolean; modelIds: string[]; error?: string }> {
+): Promise<{ ok: boolean; modelIds: string[]; error?: string; waiting?: boolean }> {
   const url = `${baseUrl.replace(/\/$/, "")}/models`;
   try {
     const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(timeoutMs) });
@@ -654,7 +704,13 @@ export async function probeVllmModels(
       : [];
     return { ok: response.ok || response.status < 500, modelIds };
   } catch (error) {
-    return { ok: false, modelIds: [], error: error instanceof Error ? error.message : String(error) };
+    const waiting = isTransientVllmProbeError(error);
+    return {
+      ok: false,
+      modelIds: [],
+      waiting,
+      error: waiting ? VLLM_HTTP_WAIT_MESSAGE : error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -930,6 +986,7 @@ export class VllmManager {
     const hardware = detectHardware();
     const backend = input.backend ?? hardware.primaryBackend;
     const deviceCount = input.deviceCount ?? (hardware.deviceCount || 1);
+    const tensorParallel = resolveTensorParallel(input.tensorParallel, deviceCount);
     if (backend === "cpu") {
       throw new Error(VLLM_CPU_INSTALL_HINT);
     }
@@ -988,6 +1045,7 @@ export class VllmManager {
           specialistId,
           containerName,
           deviceCount,
+          tensorParallel,
         });
       }
 
@@ -998,7 +1056,8 @@ export class VllmManager {
         servedModelName,
         quantization: input.quantization,
         backend,
-        tensorParallel: input.tensorParallel,
+        tensorParallel,
+        deviceCount,
       });
       if (args.includes("0.0.0.0") || command.includes("0.0.0.0")) {
         throw new Error("Refusing to start vLLM with a public bind address");
@@ -1012,6 +1071,7 @@ export class VllmManager {
           env: vllmLaunchEnv(backend, deviceCount),
           detached: true,
           stdio: ["ignore", fd, fd],
+          windowsHide: true,
         });
         if (child.pid == null) {
           throw new Error("Failed to spawn vLLM (no pid)");
@@ -1060,8 +1120,10 @@ export class VllmManager {
     specialistId: string;
     containerName: string;
     deviceCount: number;
+    tensorParallel: number;
   }): Promise<VllmRuntimeState> {
-    const { input, image, port, servedModelName, backendId, specialistId, containerName, deviceCount } = params;
+    const { input, image, port, servedModelName, backendId, specialistId, containerName, deviceCount, tensorParallel } =
+      params;
     const groups = resolveDockerGroups();
     const plan = buildIntelDockerRunArgs({
       image,
@@ -1069,7 +1131,7 @@ export class VllmManager {
       modelsDir: modelsDirFromPath(input.modelPath),
       modelPath: input.modelPath,
       servedModelName,
-      tensorParallel: input.tensorParallel,
+      tensorParallel,
       deviceCount,
       renderGid: groups.renderGid,
       videoGid: groups.videoGid,
@@ -1164,7 +1226,8 @@ export class VllmManager {
       lastProbe = probe.error ?? "";
       if (Date.now() - lastEmit > 4000) {
         const log = containerId ? dockerLogs(containerId) : lastLogLines(backendId);
-        patchJob({ lastLog: log.slice(-2000) || lastProbe, command: commandLine });
+        const waitNote = probe.waiting ? VLLM_HTTP_WAIT_MESSAGE : lastProbe;
+        patchJob({ lastLog: log.slice(-2000) || waitNote, command: commandLine });
         this.events.emit("vllm", this.status());
         lastEmit = Date.now();
       }

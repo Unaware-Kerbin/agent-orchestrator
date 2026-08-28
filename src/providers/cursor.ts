@@ -1,5 +1,6 @@
 import { Agent, CursorAgentError } from "@cursor/sdk";
 import type { WriteAllowlist } from "../allowlist.js";
+import { awaitOrTimeout } from "../chat/timeout.js";
 import type { AgentProvider, CursorBackendConfig, ProviderHealth, ProviderRunRequest, ProviderRunResult } from "../types.js";
 import { missingKeyHealth, readyHealth } from "./util.js";
 
@@ -20,7 +21,14 @@ export class CursorProvider implements AgentProvider {
     private readonly config: CursorBackendConfig,
     private readonly allowlist?: WriteAllowlist,
   ) {
-    setInterval(() => this.reap(), 60_000);
+    const timer = setInterval(() => {
+      try {
+        this.reap();
+      } catch {
+        /* isolate SDK close failures from the HTTP process */
+      }
+    }, 60_000);
+    timer.unref?.();
   }
 
   health(): ProviderHealth {
@@ -47,9 +55,11 @@ export class CursorProvider implements AgentProvider {
     if (!apiKey) {
       return { status: "error", text: "", error: "CURSOR_API_KEY is not set", durationMs: 0 };
     }
+    const timeoutMs = request.timeoutMs ?? 30_000;
 
+    let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
     try {
-      const agent = request.resumeAgentId
+      agent = request.resumeAgentId
         ? await this.resume(request.resumeAgentId, apiKey)
         : await this.create(request, apiKey);
 
@@ -58,7 +68,11 @@ export class CursorProvider implements AgentProvider {
         : request.prompt;
 
       const run = await agent.send(prompt, request.mode ? { mode: request.mode } : undefined);
-      const result = await run.wait();
+      const result = await awaitOrTimeout(
+        run.wait(),
+        timeoutMs,
+        `Cursor timed out after ${Math.round(timeoutMs / 1000)}s`,
+      );
       this.live.set(agent.agentId, { agent, lastUsed: Date.now() });
 
       if (result.status === "error") {
@@ -80,6 +94,7 @@ export class CursorProvider implements AgentProvider {
         durationMs: Date.now() - started,
       };
     } catch (error) {
+      this.safeClose(agent);
       const message =
         error instanceof CursorAgentError
           ? `Cursor startup failed: ${error.message} (retryable=${error.isRetryable})`
@@ -132,8 +147,23 @@ export class CursorProvider implements AgentProvider {
     const now = Date.now();
     for (const [id, session] of this.live) {
       if (now - session.lastUsed < LIVE_TTL_MS) continue;
-      session.agent.close();
       this.live.delete(id);
+      this.safeClose(session.agent);
+    }
+  }
+
+  private safeClose(agent: { close?: () => unknown } | undefined): void {
+    if (!agent?.close) return;
+    try {
+      const closed = agent.close();
+      if (closed && typeof (closed as Promise<unknown>).then === "function") {
+        void (closed as Promise<unknown>).then(
+          () => undefined,
+          () => undefined,
+        );
+      }
+    } catch {
+      /* isolate SDK close failures */
     }
   }
 }

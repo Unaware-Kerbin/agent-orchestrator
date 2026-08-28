@@ -1,9 +1,25 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="grove">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agent Orchestrator</title>
+    <script>
+      (function () {
+        var KEY = "orchestrator.gui.theme";
+        var ALLOWED = ["grove", "noir", "linen", "harbor", "ember", "paper"];
+        var theme = "grove";
+        try {
+          var stored = localStorage.getItem(KEY);
+          if (ALLOWED.indexOf(stored) !== -1) theme = stored;
+        } catch (e) {}
+        document.documentElement.setAttribute("data-theme", theme);
+        document.addEventListener("DOMContentLoaded", function () {
+          var el = document.getElementById("theme-select-rail");
+          if (el) el.value = theme;
+        });
+      })();
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -46,6 +62,17 @@
             <a href="#runs" data-page="runs">Runs</a>
           </details>
         </nav>
+        <label class="theme-field" for="theme-select-rail">
+          Theme
+          <select id="theme-select-rail" class="theme-select" aria-label="Theme">
+            <option value="grove">Grove</option>
+            <option value="noir">Noir</option>
+            <option value="linen">Linen</option>
+            <option value="harbor">Harbor</option>
+            <option value="ember">Ember</option>
+            <option value="paper">Paper</option>
+          </select>
+        </label>
         <p class="rail-foot">Loopback only · token auth · Auto routes the team</p>
       </aside>
       <main id="main" class="main"></main>

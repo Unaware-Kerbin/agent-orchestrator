@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import { test } from "node:test";
 import { WriteAllowlist, canonicalizeDirectory, isPathInside, resolveContainedPath } from "../src/allowlist.js";
 
@@ -46,4 +46,17 @@ test("add/remove persist and isPathInside handles exact root", () => {
   allow.remove(extra);
   assert.equal(allow.list().includes(resolveContainedPath(extra)), false);
   assert.equal(allow.tryCwd(extra), undefined);
+});
+
+test("Windows drive-letter paths stay inside the allowlist; other drives and parent dirs do not", () => {
+  const win = path.win32;
+  const root = "C:\\Users\\me\\proj";
+  assert.equal(isPathInside("C:\\Users\\me\\proj", root, win), true);
+  assert.equal(isPathInside("C:\\Users\\me\\proj\\src\\index.ts", root, win), true);
+  assert.equal(isPathInside("c:\\users\\me\\proj\\src", root, win), true);
+  assert.equal(isPathInside("C:/Users/me/proj/gui", root, win), true);
+  assert.equal(isPathInside("C:\\Users\\me\\secret", root, win), false);
+  assert.equal(isPathInside("C:\\Users\\me\\project-other", root, win), false);
+  assert.equal(isPathInside("D:\\other", root, win), false);
+  assert.equal(isPathInside("\\\\server\\share\\file", "C:\\Users\\me\\proj", win), false);
 });

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any, Callable
@@ -128,6 +129,37 @@ def download_snapshot(
     return path
 
 
+def hf_token_present() -> bool:
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    return bool(token)
+
+
+def redact_text(text: str) -> str:
+    out = text
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = (os.environ.get(name) or "").strip()
+        if len(value) > 3:
+            out = out.replace(value, "***")
+    return re.sub(r"\bhf_[A-Za-z0-9]{8,}\b", "hf_***", out)
+
+
+def gated_auth_message(message: str, token_present: bool) -> str:
+    lowered = message.lower()
+    if not any(token in lowered for token in ("401", "gated", "restricted", "authentication", "403")):
+        return message
+    if token_present:
+        return (
+            f"{message}. Token is set but Hugging Face still denied access. "
+            "Accept the model license on the model card while logged into the same Hugging Face account, then retry. "
+            "Do not commit the token."
+        )
+    return (
+        f"{message}. If this repo is gated: accept the license on the model card while logged into Hugging Face, "
+        "then paste a read token in Settings → Local models (or set HF_TOKEN / HUGGING_FACE_HUB_TOKEN). "
+        "Create a token at https://huggingface.co/settings/tokens. Do not commit the token."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download a Hugging Face model snapshot")
     parser.add_argument("--repo", required=True)
@@ -151,14 +183,8 @@ def main() -> int:
         emit({"event": "done", "path": path, "percent": 100})
         return 0
     except Exception as exc:  # noqa: BLE001 — surface HF/auth errors to the orchestrator
-        msg = str(exc)
-        lowered = msg.lower()
-        if any(token in lowered for token in ("401", "gated", "restricted", "authentication", "403")):
-            msg = (
-                f"{msg}. If this repo is gated, set HF_TOKEN or HUGGING_FACE_HUB_TOKEN "
-                "(GUI secrets or env). Do not commit the token."
-            )
-        emit({"event": "error", "message": msg})
+        msg = gated_auth_message(str(exc), hf_token_present())
+        emit({"event": "error", "message": redact_text(msg)})
         return 1
 
 

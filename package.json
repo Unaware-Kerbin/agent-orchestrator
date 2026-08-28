@@ -8,11 +8,12 @@
   },
   "scripts": {
     "start": "tsx src/index.ts",
+    "mcp:http": "tsx src/mcp-http.ts",
     "dev": "tsx watch src/index.ts",
     "gui": "tsx src/gui.ts",
     "gui:open": "tsx src/gui.ts --open",
     "gui:stop": "tsx src/gui.ts --stop",
-    "gui:restart": "npm run gui:stop && npm run gui",
+    "gui:restart": "tsx src/gui.ts --restart",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"

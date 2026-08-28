@@ -1,9 +1,12 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { EventEmitter } from "node:events";
 import type { WriteAllowlist } from "../allowlist.js";
 import { packageRoot } from "../config.js";
+import { ensureSecureDir, pythonDashArgs, pythonInterpreterNames, which, writeSecureFile } from "../platform.js";
+import { redactSecretText } from "../redact.js";
+import { loadSecretsIntoEnv, resolveHfToken } from "../secrets.js";
 import { stateDir } from "../state.js";
 import type { CatalogModel } from "./catalog.js";
 import { findCatalogModel } from "./catalog.js";
@@ -80,12 +83,9 @@ function loadJobs(): Record<string, DownloadJob> {
 }
 
 function persistJobs(jobs: Record<string, DownloadJob>): void {
-  mkdirSync(dirname(jobsPath()), { recursive: true, mode: 0o700 });
+  ensureSecureDir(dirname(jobsPath()));
   const payload: JobsFile = { version: 1, jobs };
-  writeFileSync(jobsPath(), `${JSON.stringify(payload, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
+  writeSecureFile(jobsPath(), `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 export function snapshotLooksDownloaded(dest: string): boolean {
@@ -103,46 +103,46 @@ export function snapshotLooksDownloaded(dest: string): boolean {
   }
 }
 
-export function redactSecretText(text: string): string {
-  let out = text;
-  for (const name of ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]) {
-    const value = process.env[name]?.trim();
-    if (value && value.length > 3) out = out.split(value).join("***");
-  }
-  return out;
+export function hfTokenPresent(): boolean {
+  return Boolean(resolveHfToken());
 }
 
-export function hfTokenPresent(): boolean {
-  return Boolean(process.env.HF_TOKEN?.trim() || process.env.HUGGING_FACE_HUB_TOKEN?.trim());
+/** Child env for huggingface_hub / the Hub CLI. Loads GUI secrets so gated downloads work. */
+export function hfDownloadChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  loadSecretsIntoEnv(true);
+  const env: NodeJS.ProcessEnv = { ...base, PYTHONUNBUFFERED: "1" };
+  const token = resolveHfToken();
+  if (token && !env.HF_TOKEN?.trim()) env.HF_TOKEN = token;
+  return env;
+}
+
+export function gatedRepoHint(gated: boolean): string {
+  if (!gated) return "";
+  if (hfTokenPresent()) {
+    return " Token is set but Hugging Face still denied access. Accept the model license on the model card while logged into the same Hugging Face account, then retry. Do not commit the token.";
+  }
+  return " Repo is gated. Accept the license on the Hugging Face model card while logged in, then paste a read token in Settings → Local models (or set HF_TOKEN / HUGGING_FACE_HUB_TOKEN). Create a token at https://huggingface.co/settings/tokens. Do not commit the token.";
 }
 
 function helperScript(): string {
   return join(packageRoot(), "scripts", "hf_download.py");
 }
 
-function which(cmd: string): string | undefined {
-  const pathEnv = process.env.PATH ?? "";
-  for (const dir of pathEnv.split(delimiter)) {
-    const candidate = join(dir, cmd);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // try next
-    }
-  }
-  return undefined;
-}
-
 function findPython(): string | undefined {
-  for (const cmd of ["python3", "python"]) {
-    const result = spawnSync(cmd, ["-c", "import sys; print(sys.executable)"], {
+  for (const cmd of pythonInterpreterNames()) {
+    const prefix = pythonDashArgs(cmd);
+    const result = spawnSync(cmd, [...prefix, "-c", "import sys; print(sys.executable)"], {
       encoding: "utf8",
       timeout: 5000,
+      windowsHide: true,
     });
     if (result.status === 0 && result.stdout?.trim()) return cmd;
   }
-  return which("python3") ?? which("python");
+  for (const cmd of pythonInterpreterNames()) {
+    const found = which(cmd);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 export class DownloadManager {
@@ -239,13 +239,14 @@ export class DownloadManager {
   private spawnDownload(job: DownloadJob, model: CatalogModel): void {
     const script = helperScript();
     const python = findPython();
-    const env = { ...process.env, PYTHONUNBUFFERED: "1" };
+    const env = hfDownloadChildEnv();
     let child: ChildProcess;
 
     if (python && existsSync(script)) {
-      child = spawn(python, [script, "--repo", model.hfRepo, "--dest", job.dest], {
+      child = spawn(python, [...pythonDashArgs(python), script, "--repo", model.hfRepo, "--dest", job.dest], {
         env,
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
       });
     } else {
       const cli = which("hf") ?? which("huggingface-cli");
@@ -253,7 +254,7 @@ export class DownloadManager {
         this.fail(
           job,
           [
-            python ? `Download helper missing at ${script}.` : "python3 not found on PATH.",
+            python ? `Download helper missing at ${script}.` : "Python not found on PATH (tried python3, python, and the Windows py launcher).",
             "Install Hugging Face tools: pip install huggingface_hub",
             "Then retry download_local_model.",
           ].join(" "),
@@ -261,7 +262,7 @@ export class DownloadManager {
         return;
       }
       const args = ["download", model.hfRepo, "--local-dir", job.dest];
-      child = spawn(cli, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(cli, args, { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     }
 
     this.children.set(job.id, child);
@@ -290,12 +291,11 @@ export class DownloadManager {
         });
         return;
       }
-      const hint = !hfTokenPresent() && model.gated
-        ? " Repo is gated: set HF_TOKEN or HUGGING_FACE_HUB_TOKEN."
-        : "";
       this.fail(
         current,
-        redactSecretText((stderr.trim() || `Download exited with code ${code ?? "unknown"}.`) + hint),
+        redactSecretText(
+          (stderr.trim() || `Download exited with code ${code ?? "unknown"}.`) + gatedRepoHint(model.gated),
+        ),
       );
     });
   }
@@ -362,6 +362,8 @@ export function resolveDownloadModel(modelId?: string, hfRepo?: string): Catalog
     name: repo,
     hfRepo: repo,
     family: repo,
+    lineage: "custom",
+    generation: 0,
     paramsB: 0,
     quantization: "fp16",
     weightsMiB: 0,

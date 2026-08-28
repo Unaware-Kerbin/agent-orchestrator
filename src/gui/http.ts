@@ -1,18 +1,30 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join, relative, resolve, sep } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
-import { parseConfigYaml, packageRoot, patchBackendModelYaml, readConfigYaml, validateConfigYaml, writeConfigYaml } from "../config.js";
+import { isPathInside } from "../allowlist.js";
+import { parseConfigYaml, packageRoot, patchBackendModelYaml, patchBackendNicknameYaml, readConfigYaml, validateConfigYaml, writeConfigYaml } from "../config.js";
 import { isGeminiOpenAiConfig, normalizeGeminiConfigModel } from "../providers/gemini.js";
 import { extractBearerToken, tokensEqual } from "../gui-auth.js";
 import type { ChatService } from "../chat/service.js";
 import type { ChatSuggestedAction } from "../chat/types.js";
 import type { Orchestrator } from "../orchestrator.js";
+import { decodeLogoDataUrl, hasLogo, parseModelId, parseNickname, readLogo, removeLogo, saveLogo } from "../identity.js";
 import { envNamesForBackend, isEnvVarName } from "../providers/keys.js";
-import { redactConfigValue, restoreMaskedSecrets } from "../redact.js";
-import { KNOWN_SECRET_NAMES, refreshRuntimeEnv, secretStatus, upsertSecrets } from "../secrets.js";
+import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, normalizeLoopbackOpenAiUrl } from "../local-servers/loopback.js";
+import { llamaServerOnPath, ollamaOnPath, probeLlamaCpp, probeOllama } from "../local-servers/status.js";
+import {
+  DEFAULT_OLLAMA_BACKEND_ID,
+  DEFAULT_OLLAMA_SPECIALIST_ID,
+  assertLocalBackendPatch,
+  ollamaSpecialistDescription,
+  patchLocalOrchestratorYaml,
+} from "../local-servers/upsert.js";
+import { redactConfigValue, redactSecretText, restoreMaskedSecrets } from "../redact.js";
+import { KNOWN_SECRET_NAMES, deleteSecrets, refreshRuntimeEnv, secretStatus, upsertSecrets } from "../secrets.js";
 import { toRunView } from "../views.js";
 import type { OrchestratedRun } from "../types.js";
+import { handleTempAnalyzeApi, TEMP_ANALYZE_PATH } from "../temp-analyze-http.js";
 
 const HOST = "127.0.0.1";
 const MAX_BODY = 1_000_000;
@@ -103,10 +115,7 @@ function safePublicFile(urlPath: string): string | undefined {
   const root = resolve(publicDir());
   const trimmed = urlPath === "/" ? "/index.html" : urlPath;
   const candidate = resolve(root, `.${trimmed}`);
-  const rel = relative(root, candidate);
-  if (rel.startsWith(`..${sep}`) || rel === ".." || rel.startsWith("..") || rel.includes(`..${sep}`)) {
-    return undefined;
-  }
+  if (!isPathInside(candidate, root)) return undefined;
   if (!existsSync(candidate) || !statSync(candidate).isFile()) return undefined;
   return candidate;
 }
@@ -170,7 +179,7 @@ export function startGuiServer(options: {
         res.end();
         return;
       }
-      send(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      send(res, 500, { error: redactSecretText(error instanceof Error ? error.message : String(error)) });
     }
   });
 
@@ -267,7 +276,7 @@ export function startGuiServer(options: {
     try {
       await routeApi(method, url, body, res);
     } catch (error) {
-      send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      send(res, 400, { error: redactSecretText(error instanceof Error ? error.message : String(error)) });
     }
   }
 
@@ -276,6 +285,17 @@ export function startGuiServer(options: {
 
     if (path === "/api/session" && method === "GET") {
       send(res, 200, { ok: true, bind: `${HOST}:${port}` });
+      return;
+    }
+
+    if (path === TEMP_ANALYZE_PATH) {
+      handleTempAnalyzeApi({
+        method,
+        pathname: path,
+        body,
+        res,
+        allowlist: orchestrator.tempAnalyze,
+      });
       return;
     }
 
@@ -543,31 +563,56 @@ export function startGuiServer(options: {
       return;
     }
 
-    if (path === "/api/secrets" && (method === "PUT" || method === "POST")) {
+    if (path === "/api/secrets" && method === "DELETE") {
       if (!isRecord(body)) {
         send(res, 400, { error: "JSON object required" });
         return;
       }
-      const updates: Record<string, string> = {};
-      if (typeof body.name === "string" && typeof body.value === "string") {
-        updates[body.name] = body.value;
-      } else if (isRecord(body.secrets)) {
-        for (const [name, value] of Object.entries(body.secrets)) {
-          if (typeof value === "string") updates[name] = value;
-        }
-      } else {
-        for (const [name, value] of Object.entries(body)) {
-          if (typeof value === "string" && isEnvVarName(name)) updates[name] = value;
+      const names: string[] = [];
+      if (typeof body.name === "string") names.push(body.name);
+      if (Array.isArray(body.names)) {
+        for (const name of body.names) {
+          if (typeof name === "string") names.push(name);
         }
       }
+      if (!names.length) {
+        send(res, 400, { error: "name string required" });
+        return;
+      }
       const allowed = new Set(secretNamesForConfig(orchestrator));
-      for (const name of Object.keys(updates)) {
+      for (const name of names) {
         if (!allowed.has(name)) {
           send(res, 400, { error: `Unknown secret "${name}". Use a backend env name such as GEMINI_API_KEY.` });
           return;
         }
       }
-      const changed = upsertSecrets(updates);
+      const changed = deleteSecrets(names);
+      send(res, 200, {
+        ok: true,
+        cleared: changed,
+        secrets: secretStatus(secretNamesForConfig(orchestrator)),
+        catalog: await orchestrator.catalog(),
+      });
+      return;
+    }
+
+    if (path === "/api/secrets" && (method === "PUT" || method === "POST")) {
+      if (!isRecord(body)) {
+        send(res, 400, { error: "JSON object required" });
+        return;
+      }
+      const { updates, clears } = collectSecretMutations(body);
+      const allowed = new Set(secretNamesForConfig(orchestrator));
+      for (const name of [...Object.keys(updates), ...clears]) {
+        if (!allowed.has(name)) {
+          send(res, 400, { error: `Unknown secret "${name}". Use a backend env name such as GEMINI_API_KEY.` });
+          return;
+        }
+      }
+      const changed = [
+        ...(clears.length ? deleteSecrets(clears) : []),
+        ...(Object.keys(updates).length ? upsertSecrets(updates) : []),
+      ];
       send(res, 200, {
         ok: true,
         updated: changed,
@@ -579,8 +624,8 @@ export function startGuiServer(options: {
 
     const backendPatch = /^\/api\/backends\/([^/]+)$/.exec(path);
     if (backendPatch && method === "PATCH") {
-      if (!isRecord(body) || typeof body.model !== "string") {
-        send(res, 400, { error: "model string required" });
+      if (!isRecord(body)) {
+        send(res, 400, { error: "JSON object required" });
         return;
       }
       const id = decodeURIComponent(backendPatch[1] ?? "").trim();
@@ -590,24 +635,100 @@ export function startGuiServer(options: {
         send(res, 404, { error: `Unknown backend "${id}"` });
         return;
       }
-      const existing = currentParsed.backends[id];
-      const type = typeof existing.type === "string" ? existing.type : "";
-      const baseUrl = typeof existing.baseUrl === "string" ? existing.baseUrl : undefined;
-      const apiKeyEnv = typeof existing.apiKeyEnv === "string" ? existing.apiKeyEnv : undefined;
-      let model = body.model.trim();
-      if (isGeminiOpenAiConfig(id, { type, baseUrl, apiKeyEnv, model })) {
-        try {
-          model = normalizeGeminiConfigModel(model);
-        } catch (error) {
-          send(res, 400, { error: error instanceof Error ? error.message : String(error) });
-          return;
+      const hasModel = typeof body.model === "string";
+      const hasNick = "nickname" in body;
+      if (!hasModel && !hasNick) {
+        send(res, 400, { error: "model or nickname required" });
+        return;
+      }
+      let yaml = currentYaml;
+      let nickname: string | undefined;
+      if (hasNick) {
+        nickname =
+          body.nickname === null || body.nickname === ""
+            ? undefined
+            : parseNickname(body.nickname);
+        yaml = patchBackendNicknameYaml(yaml, id, nickname);
+      }
+      let model: string | undefined;
+      if (hasModel) {
+        const existing = currentParsed.backends[id];
+        const type = typeof existing.type === "string" ? existing.type : "";
+        const baseUrl = typeof existing.baseUrl === "string" ? existing.baseUrl : undefined;
+        const apiKeyEnv = typeof existing.apiKeyEnv === "string" ? existing.apiKeyEnv : undefined;
+        model = parseModelId(body.model);
+        if (isGeminiOpenAiConfig(id, { type, baseUrl, apiKeyEnv, model })) {
+          try {
+            model = normalizeGeminiConfigModel(model);
+          } catch (error) {
+            send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+            return;
+          }
+        }
+        yaml = patchBackendModelYaml(yaml, id, model);
+        if (type === "ollama" || type === "llamacpp") {
+          assertLocalBackendPatch(yaml, {
+            backendId: id,
+            type,
+            baseUrl:
+              typeof baseUrl === "string" && baseUrl.trim()
+                ? baseUrl
+                : type === "ollama"
+                  ? DEFAULT_OLLAMA_BASE
+                  : DEFAULT_LLAMACPP_BASE,
+            model,
+          });
         }
       }
-      const yaml = patchBackendModelYaml(currentYaml, id, model);
       const parsed = writeConfigYaml(yaml, orchestrator.configPath);
       orchestrator.reloadConfig(parsed);
-      send(res, 200, { ok: true, id, model, catalog: await orchestrator.catalog() });
+      send(res, 200, {
+        ok: true,
+        id,
+        ...(hasModel ? { model } : {}),
+        ...(hasNick ? { nickname: nickname ?? "" } : {}),
+        catalog: await orchestrator.catalog(),
+      });
       return;
+    }
+
+    const logoMatch = /^\/api\/backends\/([^/]+)\/logo$/.exec(path);
+    if (logoMatch) {
+      const id = decodeURIComponent(logoMatch[1] ?? "").trim();
+      if (method === "GET") {
+        const logo = readLogo(id);
+        if (!logo) {
+          send(res, 404, { error: "No logo" });
+          return;
+        }
+        res.writeHead(200, {
+          "content-type": logo.mime,
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-frame-options": "DENY",
+          "referrer-policy": "no-referrer",
+          "content-security-policy":
+            "default-src 'none'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+          "content-length": String(logo.bytes.length),
+        });
+        res.end(logo.bytes);
+        return;
+      }
+      if (method === "DELETE") {
+        removeLogo(id);
+        send(res, 200, { ok: true, id, hasLogo: false, catalog: await orchestrator.catalog() });
+        return;
+      }
+      if (method === "PUT" || method === "POST") {
+        if (!isRecord(body) || typeof body.data !== "string") {
+          send(res, 400, { error: "data URL required (PNG, JPEG, or WebP)" });
+          return;
+        }
+        const decoded = decodeLogoDataUrl(body.data);
+        saveLogo(id, decoded.buffer, decoded.mime);
+        send(res, 200, { ok: true, id, hasLogo: hasLogo(id), catalog: await orchestrator.catalog() });
+        return;
+      }
     }
 
     if (path === "/api/backends" && method === "POST") {
@@ -621,21 +742,30 @@ export function startGuiServer(options: {
         return;
       }
       const type = typeof body.type === "string" ? body.type : "vllm";
-      if (type !== "vllm" && type !== "openai") {
-        send(res, 400, { error: "GUI add-backend supports type vllm or openai" });
+      if (type !== "vllm" && type !== "openai" && type !== "ollama" && type !== "llamacpp") {
+        send(res, 400, { error: "GUI add-backend supports type vllm, openai, ollama, or llamacpp" });
         return;
       }
-      let model = typeof body.model === "string" ? body.model.trim() : "";
-      if (!model) {
-        send(res, 400, { error: "model string required" });
-        return;
+      let model = parseModelId(typeof body.model === "string" ? body.model : "");
+      const defaultBase =
+        type === "vllm"
+          ? "http://127.0.0.1:8000/v1"
+          : type === "ollama"
+            ? DEFAULT_OLLAMA_BASE
+            : type === "llamacpp"
+              ? DEFAULT_LLAMACPP_BASE
+              : "https://api.openai.com/v1";
+      let baseUrl =
+        typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : defaultBase;
+      if (type === "vllm" || type === "ollama" || type === "llamacpp") {
+        const label = type === "vllm" ? "vLLM" : type === "ollama" ? "Ollama" : "llama.cpp";
+        try {
+          baseUrl = normalizeLoopbackOpenAiUrl(baseUrl, label);
+        } catch (error) {
+          send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          return;
+        }
       }
-      const baseUrl =
-        typeof body.baseUrl === "string" && body.baseUrl.trim()
-          ? body.baseUrl.trim()
-          : type === "vllm"
-            ? "http://127.0.0.1:8000/v1"
-            : "https://api.openai.com/v1";
       const apiKeyEnv =
         typeof body.apiKeyEnv === "string" && body.apiKeyEnv.trim()
           ? body.apiKeyEnv.trim()
@@ -667,7 +797,17 @@ export function startGuiServer(options: {
         model,
       };
       if (apiKeyEnv) record.apiKeyEnv = apiKeyEnv;
-      if (type === "vllm" && body.probe === false) record.probe = false;
+      if ((type === "vllm" || type === "ollama" || type === "llamacpp") && body.probe === false) {
+        record.probe = false;
+      }
+      if (type === "ollama") record.apiKey = "ollama";
+      if ("nickname" in body) {
+        const nickname =
+          body.nickname === null || body.nickname === ""
+            ? undefined
+            : parseNickname(body.nickname);
+        if (nickname) record.nickname = nickname;
+      }
       backends[id] = record;
       currentParsed.backends = backends;
       if (isRecord(body.specialist) && typeof body.specialist.id === "string") {
@@ -691,7 +831,18 @@ export function startGuiServer(options: {
         currentParsed.specialists = specialists;
       }
       const yaml = stringifyYaml(currentParsed, { indent: 2, lineWidth: 0 });
+      if (type === "ollama" || type === "llamacpp") {
+        assertLocalBackendPatch(yaml, { backendId: id, type, baseUrl, model });
+      }
       const parsed = writeConfigYaml(yaml, orchestrator.configPath);
+      if (type === "ollama" || type === "llamacpp") {
+        const written = parsed.backends[id];
+        if (!written || written.type !== type) {
+          throw new Error(`Refusing config write: backend "${id}" type must remain ${type}`);
+        }
+        const label = type === "ollama" ? "Ollama" : "llama.cpp";
+        normalizeLoopbackOpenAiUrl(written.baseUrl ?? "", label);
+      }
       orchestrator.reloadConfig(parsed);
       const keyName =
         typeof body.apiKeyEnv === "string" && isEnvVarName(body.apiKeyEnv.trim())
@@ -731,6 +882,7 @@ export function startGuiServer(options: {
         send(res, 400, { error: "modelId string required" });
         return;
       }
+      refreshRuntimeEnv();
       const job = orchestrator.localModels.download({
         modelId: body.modelId,
         hfRepo: typeof body.hfRepo === "string" ? body.hfRepo : undefined,
@@ -760,6 +912,7 @@ export function startGuiServer(options: {
         image: typeof body.image === "string" ? body.image : undefined,
         runtime: body.runtime === "docker" || body.runtime === "host" ? body.runtime : undefined,
         replace: body.replace === true,
+        useAllGpus: body.useAllGpus !== false && body.use_all_gpus !== false,
       });
       send(res, started.status === "starting" ? 202 : 200, {
         status: started.status,
@@ -815,6 +968,122 @@ export function startGuiServer(options: {
       return;
     }
 
+    if (path === "/api/local-servers" && method === "GET") {
+      try {
+        send(res, 200, await localServersSnapshot(orchestrator));
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/ollama" && method === "GET") {
+      try {
+        const configured = Object.values(orchestrator.config.backends).find((b) => b.type === "ollama");
+        const baseUrl = configured?.type === "ollama" ? configured.baseUrl : DEFAULT_OLLAMA_BASE;
+        const apiKey = configured?.type === "ollama" ? configured.apiKey : undefined;
+        send(res, 200, await probeOllama({ baseUrl, apiKey }));
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/ollama/connect" && method === "POST") {
+      try {
+        const configured = Object.values(orchestrator.config.backends).find((b) => b.type === "ollama");
+        const requestedUrl =
+          isRecord(body) && typeof body.baseUrl === "string" && body.baseUrl.trim()
+            ? normalizeLoopbackOpenAiUrl(body.baseUrl.trim(), "Ollama")
+            : configured?.type === "ollama"
+              ? configured.baseUrl
+              : DEFAULT_OLLAMA_BASE;
+        const probe = await probeOllama({
+          baseUrl: requestedUrl,
+          apiKey: configured?.type === "ollama" ? configured.apiKey : undefined,
+        });
+        if (!probe.running) {
+          send(res, 400, { error: probe.reason, ollama: probe });
+          return;
+        }
+        const backendId =
+          isRecord(body) && typeof body.id === "string" && body.id.trim()
+            ? body.id.trim()
+            : DEFAULT_OLLAMA_BACKEND_ID;
+        if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(backendId)) {
+          send(res, 400, { error: "Backend id must match [a-zA-Z][a-zA-Z0-9_-]*" });
+          return;
+        }
+        const model = parseModelId(
+          isRecord(body) && typeof body.model === "string" && body.model.trim()
+            ? body.model
+            : probe.models[0] ||
+              (configured?.type === "ollama" ? configured.model : undefined) ||
+              "llama3.1",
+        );
+        const yaml = readConfigYaml(orchestrator.configPath);
+        const next = patchLocalOrchestratorYaml(yaml, {
+          backendId,
+          type: "ollama",
+          baseUrl: probe.baseUrl,
+          model,
+          apiKey: "ollama",
+          specialistId: DEFAULT_OLLAMA_SPECIALIST_ID,
+          description: ollamaSpecialistDescription(),
+        });
+        assertLocalBackendPatch(next, {
+          backendId,
+          type: "ollama",
+          baseUrl: probe.baseUrl,
+          model,
+        });
+        const parsed = writeConfigYaml(next, orchestrator.configPath);
+        const written = parsed.backends[backendId];
+        if (!written || written.type !== "ollama") {
+          throw new Error(`Refusing config write: backend "${backendId}" type must remain ollama`);
+        }
+        normalizeLoopbackOpenAiUrl(written.baseUrl ?? DEFAULT_OLLAMA_BASE, "Ollama");
+        orchestrator.reloadConfig(parsed);
+        send(res, 200, {
+          ok: true,
+          id: backendId,
+          model,
+          ollama: probe,
+          catalog: await orchestrator.catalog(),
+        });
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/llamacpp" && method === "GET") {
+      try {
+        const q = url.searchParams.get("baseUrl");
+        const configured = Object.entries(orchestrator.config.backends).filter(([, b]) => b.type === "llamacpp");
+        if (q) {
+          send(res, 200, await probeLlamaCpp({ baseUrl: normalizeLoopbackOpenAiUrl(q, "llama.cpp") }));
+          return;
+        }
+        if (configured.length === 0) {
+          send(res, 200, { endpoints: [] });
+          return;
+        }
+        const endpoints = await Promise.all(
+          configured.map(([, b]) =>
+            probeLlamaCpp({
+              baseUrl: b.type === "llamacpp" ? b.baseUrl : DEFAULT_LLAMACPP_BASE,
+              apiKey: b.type === "llamacpp" ? b.apiKey : undefined,
+            }),
+          ),
+        );
+        send(res, 200, { endpoints });
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
     send(res, 404, { error: "Not found" });
   }
 
@@ -839,6 +1108,56 @@ export function bindLoopbackOnly(requestedHost: string | undefined): typeof HOST
     );
   }
   return HOST;
+}
+
+async function localServersSnapshot(orchestrator: Orchestrator) {
+  const ollamaCfg = Object.values(orchestrator.config.backends).find((b) => b.type === "ollama");
+  const llamaCfgs = Object.entries(orchestrator.config.backends).filter(([, b]) => b.type === "llamacpp");
+  const ollama = await probeOllama({
+    baseUrl: ollamaCfg?.type === "ollama" ? ollamaCfg.baseUrl : DEFAULT_OLLAMA_BASE,
+    apiKey: ollamaCfg?.type === "ollama" ? ollamaCfg.apiKey : undefined,
+  });
+  const llamacpp =
+    llamaCfgs.length > 0
+      ? await Promise.all(
+          llamaCfgs.map(([id, b]) =>
+            probeLlamaCpp({
+              baseUrl: b.type === "llamacpp" ? b.baseUrl : DEFAULT_LLAMACPP_BASE,
+              apiKey: b.type === "llamacpp" ? b.apiKey : undefined,
+            }).then((status) => ({ id, ...status })),
+          ),
+        )
+      : [];
+  return {
+    ollama,
+    llamacpp,
+    llamaServerBinary: llamaServerOnPath() ?? null,
+    ollamaBinary: ollamaOnPath() ?? null,
+  };
+}
+
+function collectSecretMutations(body: Record<string, unknown>): {
+  updates: Record<string, string>;
+  clears: string[];
+} {
+  const updates: Record<string, string> = {};
+  const clears: string[] = [];
+  const apply = (name: string, value: string) => {
+    if (!value.trim()) clears.push(name);
+    else updates[name] = value;
+  };
+  if (typeof body.name === "string" && typeof body.value === "string") {
+    apply(body.name, body.value);
+  } else if (isRecord(body.secrets)) {
+    for (const [name, value] of Object.entries(body.secrets)) {
+      if (typeof value === "string") apply(name, value);
+    }
+  } else {
+    for (const [name, value] of Object.entries(body)) {
+      if (typeof value === "string" && isEnvVarName(name)) apply(name, value);
+    }
+  }
+  return { updates, clears };
 }
 
 function secretNamesForConfig(orchestrator: Orchestrator): string[] {

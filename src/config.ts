@@ -10,6 +10,9 @@ import type {
 } from "./types.js";
 import { isEnvVarName } from "./providers/keys.js";
 import { isGeminiOpenAiConfig, parseGeminiModelId } from "./providers/gemini.js";
+import { parseModelId, parseNickname } from "./identity.js";
+import { normalizeLoopbackOpenAiUrl } from "./local-servers/loopback.js";
+import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./local-servers/loopback.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -53,6 +56,14 @@ function optionalApiKeyEnv(id: string, raw: unknown): string | undefined {
   return raw.trim();
 }
 
+function withNickname<T extends BackendConfig>(id: string, raw: Record<string, unknown>, backend: T): T {
+  if (!("nickname" in raw) || raw.nickname === undefined || raw.nickname === null || raw.nickname === "") {
+    return backend;
+  }
+  const nickname = parseNickname(raw.nickname);
+  return nickname ? { ...backend, nickname } : backend;
+}
+
 function parseBackend(id: string, raw: unknown): BackendConfig {
   if (!isRecord(raw) || typeof raw.type !== "string") {
     throw new Error(`Backend "${id}" is missing a type`);
@@ -60,11 +71,11 @@ function parseBackend(id: string, raw: unknown): BackendConfig {
   const type = raw.type;
   if (type === "cursor") {
     const runtime = raw.runtime === "cloud" ? "cloud" : "local";
-    return {
+    return withNickname(id, raw, {
       type: "cursor",
       runtime,
       model: typeof raw.model === "string" ? raw.model : undefined,
-    };
+    });
   }
   if (type === "openai") {
     const model = asString(raw.model, `backends.${id}.model`);
@@ -73,30 +84,30 @@ function parseBackend(id: string, raw: unknown): BackendConfig {
     const resolvedModel = isGeminiOpenAiConfig(id, { type: "openai", baseUrl, apiKeyEnv, model })
       ? parseGeminiModelId(model)
       : model;
-    return {
+    return withNickname(id, raw, {
       type: "openai",
       baseUrl,
       model: resolvedModel,
       apiKeyEnv,
       apiKey: typeof raw.apiKey === "string" ? raw.apiKey : undefined,
-    };
+    });
   }
   if (type === "anthropic") {
-    return {
+    return withNickname(id, raw, {
       type: "anthropic",
       baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl : undefined,
       model: asString(raw.model, `backends.${id}.model`),
       apiKeyEnv: optionalApiKeyEnv(id, raw.apiKeyEnv),
       apiKey: typeof raw.apiKey === "string" ? raw.apiKey : undefined,
       maxTokens: typeof raw.maxTokens === "number" ? raw.maxTokens : undefined,
-    };
+    });
   }
   if (type === "vllm") {
     const baseUrl =
       typeof raw.baseUrl === "string" && raw.baseUrl.trim()
         ? raw.baseUrl.trim()
         : "http://127.0.0.1:8000/v1";
-    return {
+    return withNickname(id, raw, {
       type: "vllm",
       baseUrl,
       model: asString(raw.model, `backends.${id}.model`),
@@ -104,10 +115,24 @@ function parseBackend(id: string, raw: unknown): BackendConfig {
       apiKey: typeof raw.apiKey === "string" ? raw.apiKey : undefined,
       probe: raw.probe === false ? false : true,
       probeTimeoutMs: typeof raw.probeTimeoutMs === "number" ? raw.probeTimeoutMs : undefined,
-    };
+    });
+  }
+  if (type === "ollama" || type === "llamacpp") {
+    const label = type === "ollama" ? "Ollama" : "llama.cpp";
+    const fallback = type === "ollama" ? DEFAULT_OLLAMA_BASE : DEFAULT_LLAMACPP_BASE;
+    const rawUrl = typeof raw.baseUrl === "string" && raw.baseUrl.trim() ? raw.baseUrl.trim() : fallback;
+    return withNickname(id, raw, {
+      type,
+      baseUrl: normalizeLoopbackOpenAiUrl(rawUrl, label),
+      model: asString(raw.model, `backends.${id}.model`),
+      apiKeyEnv: optionalApiKeyEnv(id, raw.apiKeyEnv),
+      apiKey: typeof raw.apiKey === "string" ? raw.apiKey : undefined,
+      probe: raw.probe === false ? false : true,
+      probeTimeoutMs: typeof raw.probeTimeoutMs === "number" ? raw.probeTimeoutMs : undefined,
+    });
   }
   if (type === "http") {
-    return {
+    return withNickname(id, raw, {
       type: "http",
       url: asString(raw.url, `backends.${id}.url`),
       method: raw.method === "PUT" ? "PUT" : "POST",
@@ -119,7 +144,7 @@ function parseBackend(id: string, raw: unknown): BackendConfig {
           )
         : undefined,
       timeoutMs: typeof raw.timeoutMs === "number" ? raw.timeoutMs : undefined,
-    };
+    });
   }
   throw new Error(`Backend "${id}" has unsupported type "${type}"`);
 }
@@ -252,6 +277,7 @@ function escapeRegExp(value: string): string {
 export function patchBackendModelYaml(yamlText: string, backendId: string, model: string): string {
   const id = backendId.trim();
   if (!id) throw new Error("backend id required");
+  const quoted = JSON.stringify(parseModelId(model));
   const header = /^backends:\s*\n/m.exec(yamlText);
   if (!header || header.index === undefined) {
     throw new Error(`Backend "${id}" not found in config`);
@@ -268,8 +294,39 @@ export function patchBackendModelYaml(yamlText: string, backendId: string, model
   const block = match[1];
   const modelRe = /^( {4}model:)\s*.*$/m;
   const nextBlock = modelRe.test(block)
-    ? block.replace(modelRe, `$1 ${model}`)
-    : block.replace(/^( {2}\S+:\n)/, `$1    model: ${model}\n`);
+    ? block.replace(modelRe, `$1 ${quoted}`)
+    : block.replace(/^( {2}\S+:\n)/, `$1    model: ${quoted}\n`);
   const abs = start + match.index;
   return yamlText.slice(0, abs) + nextBlock + yamlText.slice(abs + block.length);
+}
+
+/** Set or clear `backends.<id>.nickname`. Empty nickname removes the field. */
+export function patchBackendNicknameYaml(yamlText: string, backendId: string, nickname?: string): string {
+  const id = backendId.trim();
+  if (!id) throw new Error("backend id required");
+  const parsed = nickname === undefined || nickname === "" ? undefined : parseNickname(nickname);
+  const header = /^backends:\s*\n/m.exec(yamlText);
+  if (!header || header.index === undefined) {
+    throw new Error(`Backend "${id}" not found in config`);
+  }
+  const start = header.index + header[0].length;
+  const rest = yamlText.slice(start);
+  const nextSection = rest.search(/^[A-Za-z][A-Za-z0-9_-]*:\s*$/m);
+  const sectionText = nextSection >= 0 ? rest.slice(0, nextSection) : rest;
+  const blockRe = new RegExp(`^( {2}${escapeRegExp(id)}:\\n(?: {4}.*\\n)*)`, "m");
+  const match = blockRe.exec(sectionText);
+  if (!match?.[1] || match.index === undefined) {
+    throw new Error(`Backend "${id}" not found in config`);
+  }
+  let block = match[1];
+  const nickRe = /^( {4}nickname:)\s*.*$/m;
+  if (!parsed) {
+    block = block.replace(/^( {4}nickname:)\s*.*\n/m, "");
+  } else if (nickRe.test(block)) {
+    block = block.replace(nickRe, `$1 ${JSON.stringify(parsed)}`);
+  } else {
+    block = block.replace(/^( {2}\S+:\n)/, `$1    nickname: ${JSON.stringify(parsed)}\n`);
+  }
+  const abs = start + match.index;
+  return yamlText.slice(0, abs) + block + yamlText.slice(abs + match[1].length);
 }

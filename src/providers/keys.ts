@@ -8,8 +8,9 @@ export const GEMINI_KEY_ENV_NAMES = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
 ] as const;
 
-/** Bearer value for loopback vLLM when the OpenAI client requires a token. Not a real secret. */
+/** Bearer value for loopback OpenAI-compat servers when the client requires a token. Not a real secret. */
 export const VLLM_LOCAL_DUMMY_KEY = "sk-local";
+export const LOCAL_OPENAI_DUMMY_KEY = VLLM_LOCAL_DUMMY_KEY;
 
 export function isEnvVarName(name: string | undefined): name is string {
   return Boolean(name && ENV_NAME_RE.test(name));
@@ -58,6 +59,9 @@ export function envNamesForBackend(id: string, config: BackendConfig): string[] 
       return uniqueNames([config.apiKeyEnv, "ANTHROPIC_API_KEY"]);
     case "vllm":
       return uniqueNames([config.apiKeyEnv, "VLLM_API_KEY"]);
+    case "ollama":
+    case "llamacpp":
+      return [];
     case "openai":
       if (isGeminiBackend(id, config)) {
         return uniqueNames([config.apiKeyEnv, ...GEMINI_KEY_ENV_NAMES]);
@@ -76,6 +80,7 @@ export function backendNeedsKey(id: string, config: BackendConfig): boolean {
   if (config.type === "anthropic") return true;
   if (config.type === "http") return false;
   if (config.type === "vllm") return false;
+  if (config.type === "ollama" || config.type === "llamacpp") return false;
   if (config.type === "openai") {
     if (config.apiKey === "ollama") return false;
     if (isLocalOpenAiUrl(config.baseUrl)) return false;
@@ -87,13 +92,22 @@ export function backendNeedsKey(id: string, config: BackendConfig): boolean {
 export function defaultBaseUrl(config: BackendConfig): string | undefined {
   if (config.type === "openai") return config.baseUrl ?? "https://api.openai.com/v1";
   if (config.type === "vllm") return config.baseUrl ?? "http://127.0.0.1:8000/v1";
+  if (config.type === "ollama") return config.baseUrl ?? "http://127.0.0.1:11434/v1";
+  if (config.type === "llamacpp") return config.baseUrl ?? "http://127.0.0.1:8080/v1";
   if (config.type === "anthropic") return config.baseUrl;
   if (config.type === "http") return config.url;
   return undefined;
 }
 
 export function backendModel(config: BackendConfig): string | undefined {
-  if (config.type === "cursor" || config.type === "openai" || config.type === "anthropic" || config.type === "vllm") {
+  if (
+    config.type === "cursor" ||
+    config.type === "openai" ||
+    config.type === "anthropic" ||
+    config.type === "vllm" ||
+    config.type === "ollama" ||
+    config.type === "llamacpp"
+  ) {
     return config.model;
   }
   return undefined;
@@ -103,11 +117,15 @@ export function normalizeBaseUrl(url: string): string {
   return url.replace(/\/$/, "");
 }
 
-export function vllmUnreachableReason(baseUrl: string, error: unknown): string | undefined {
+export function localUnreachableReason(label: string, baseUrl: string, error: unknown): string | undefined {
   if (isUnreachableError(error)) {
-    return `vLLM not running at ${baseUrl}`;
+    return `${label} not running at ${baseUrl}`;
   }
   return undefined;
+}
+
+export function vllmUnreachableReason(baseUrl: string, error: unknown): string | undefined {
+  return localUnreachableReason("vLLM", baseUrl, error);
 }
 
 export function isUnreachableError(error: unknown): boolean {
@@ -121,7 +139,10 @@ export function isUnreachableError(error: unknown): boolean {
     if (typeof current !== "object") return false;
     const rec = current as { code?: unknown; cause?: unknown; message?: unknown; name?: unknown };
     if (typeof rec.code === "string" && codes.has(rec.code)) return true;
-    if (typeof rec.message === "string" && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ECONNRESET/i.test(rec.message)) {
+    if (
+      typeof rec.message === "string" &&
+      /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ECONNRESET|fetch failed/i.test(rec.message)
+    ) {
       return true;
     }
     current = rec.cause;

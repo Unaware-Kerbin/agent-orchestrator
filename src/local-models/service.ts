@@ -4,13 +4,15 @@ import { join } from "node:path";
 import { isPathInside, type WriteAllowlist } from "../allowlist.js";
 import { detectHardware, type HardwareSnapshot } from "../hardware.js";
 import { readConfigYaml, writeConfigYaml } from "../config.js";
+import { refreshRuntimeEnv, hfTokenConfigured } from "../secrets.js";
 import type { OrchestratorConfig } from "../types.js";
-import { LOCAL_MODEL_CATALOG, findCatalogModel, type CatalogModel } from "./catalog.js";
+import { LOCAL_MODEL_CATALOG, findCatalogModel, isNewestHubId, type CatalogModel } from "./catalog.js";
 import { DownloadManager, snapshotLooksDownloaded, type DownloadJob } from "./download.js";
-import { fitModel, recommendModels } from "./fit.js";
+import { fitModel, recommendModels, type FitKind } from "./fit.js";
 import { assertModelDest, defaultModelsDir, ensureModelsDir } from "./paths.js";
 import {
   VllmManager,
+  resolveVllmGpuLaunchForFit,
   type VllmInstanceSelector,
   type VllmProcessRuntime,
   type VllmRuntimeState,
@@ -34,7 +36,9 @@ export interface LocalModelView {
   weightsMiB: number;
   vramNeededMiB: number;
   fits: boolean;
+  fitKind: FitKind;
   fitReason: string;
+  newest: boolean;
   cpuFeasible: boolean;
   gated: boolean;
   downloaded: boolean;
@@ -124,7 +128,7 @@ export class LocalModelService {
       models,
       recommended,
       jobs: this.downloads.list(),
-      hfTokenSet: Boolean(process.env.HF_TOKEN?.trim() || process.env.HUGGING_FACE_HUB_TOKEN?.trim()),
+      hfTokenSet: hfTokenConfigured(),
       intelDocker,
       preferredRuntime: intelDocker.preferred && hardware.primaryBackend === "intel-xpu" ? "docker" : "host",
     };
@@ -155,6 +159,7 @@ export class LocalModelService {
   }
 
   download(input: { modelId?: string; hfRepo?: string; dest?: string; dryRun?: boolean }): DownloadJob {
+    refreshRuntimeEnv();
     return this.downloads.start(input);
   }
 
@@ -168,6 +173,7 @@ export class LocalModelService {
     image?: string;
     runtime?: VllmProcessRuntime;
     replace?: boolean;
+    useAllGpus?: boolean;
   }): Promise<VllmRuntimeState> {
     const result = await this.vllm.start(this.prepareVllmStart(input));
     this.events.emit("local-models", this.snapshot());
@@ -184,6 +190,7 @@ export class LocalModelService {
     image?: string;
     runtime?: VllmProcessRuntime;
     replace?: boolean;
+    useAllGpus?: boolean;
   }): VllmStartAccepted {
     const accepted = this.vllm.beginStart(this.prepareVllmStart(input));
     this.events.emit("local-models", this.snapshot());
@@ -200,6 +207,7 @@ export class LocalModelService {
     image?: string;
     runtime?: VllmProcessRuntime;
     replace?: boolean;
+    useAllGpus?: boolean;
   }) {
     const model = this.resolve(input.modelId, input.hfRepo);
     const modelsDir = ensureModelsDir(this.allowlist, this.modelsDir());
@@ -211,6 +219,12 @@ export class LocalModelService {
     }
     const hardware = this.hardware();
     const fit = fitModel(model, hardware);
+    const gpu = resolveVllmGpuLaunchForFit({
+      useAllGpus: input.useAllGpus,
+      deviceCount: hardware.deviceCount || hardware.accelerators.length || 1,
+      fitKind: fit.kind,
+      fitParallel: fit.parallel,
+    });
     const quant =
       hardware.primaryBackend === "intel-xpu"
         ? undefined
@@ -225,8 +239,8 @@ export class LocalModelService {
       host: input.host,
       timeoutMs: input.timeoutMs,
       backend: hardware.primaryBackend,
-      tensorParallel: fit.parallel && fit.parallel > 1 ? fit.parallel : undefined,
-      deviceCount: hardware.deviceCount || hardware.accelerators.length || 1,
+      tensorParallel: gpu.tensorParallel,
+      deviceCount: gpu.deviceCount,
       image: input.image,
       runtime: input.runtime,
       replace: input.replace,
@@ -350,6 +364,10 @@ export class LocalModelService {
         id: model.id,
         name: model.name,
         quantization: model.quantization,
+        fits: model.fits,
+        fitKind: model.fitKind,
+        newest: model.newest,
+        parallel: model.parallel,
       })),
     };
   }
@@ -367,6 +385,8 @@ export class LocalModelService {
       name: needle,
       hfRepo: needle,
       family: needle,
+      lineage: "custom",
+      generation: 0,
       paramsB: 0,
       quantization: "fp16",
       weightsMiB: 0,
@@ -399,7 +419,9 @@ export class LocalModelService {
       weightsMiB: model.weightsMiB,
       vramNeededMiB: fit.vramNeededMiB,
       fits: fit.fits,
+      fitKind: fit.kind,
       fitReason: fit.reason,
+      newest: isNewestHubId(model),
       cpuFeasible: model.cpuFeasible,
       gated: model.gated,
       downloaded: snapshotLooksDownloaded(dest),

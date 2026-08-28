@@ -5,8 +5,10 @@ import { defaultWorkspaceCwd, loadConfig } from "./config.js";
 import { LocalModelService } from "./local-models/service.js";
 import { specialistPrompt } from "./prompts.js";
 import { createProviders } from "./providers/index.js";
+import { hasLogo } from "./identity.js";
 import { refreshRuntimeEnv } from "./secrets.js";
 import { RunStore } from "./store.js";
+import { TempAnalyzeAllowlist } from "./temp-allowlist.js";
 import type {
   AgentProvider,
   BackendConfig,
@@ -33,6 +35,8 @@ export interface DispatchInput {
   /** Override specialist conversation mode (e.g. plan during round-table debate). */
   mode?: ConversationMode;
   onDelta?: (delta: string) => void;
+  /** Cap this dispatch. Hung cloud calls should fail fast in a round-table. */
+  timeoutMs?: number;
 }
 
 export interface FollowUpInput {
@@ -40,6 +44,7 @@ export interface FollowUpInput {
   message: string;
   wait?: boolean;
   onDelta?: (delta: string) => void;
+  timeoutMs?: number;
 }
 
 export interface WorkflowInput {
@@ -73,6 +78,7 @@ export class Orchestrator {
   readonly store = new RunStore();
   readonly events = new EventEmitter();
   readonly localModels: LocalModelService;
+  readonly tempAnalyze = new TempAnalyzeAllowlist();
   providers: Map<string, AgentProvider>;
   private configMtime = 0;
 
@@ -134,7 +140,15 @@ export class Orchestrator {
         healthById.set(id, await providerHealth(provider));
       }),
     );
-    const backends = [...this.providers.keys()].map((id) => healthById.get(id)!);
+    const backends = [...this.providers.keys()].map((id) => {
+      const health = healthById.get(id)!;
+      const cfg = this._config.backends[id];
+      return {
+        ...health,
+        nickname: cfg?.nickname,
+        hasLogo: hasLogo(id),
+      };
+    });
     const specialists = Object.entries(this._config.specialists).map(([id, spec]) => {
       const backendCfg = this._config.backends[spec.backend];
       return {
@@ -156,6 +170,8 @@ export class Orchestrator {
         step.backend ? `${step.specialist} (${step.backend})` : step.specialist,
       ),
     }));
+    const ollama = backends.find((b) => b.type === "ollama");
+    const llamacpp = backends.filter((b) => b.type === "llamacpp");
     return {
       backends,
       specialists,
@@ -165,7 +181,25 @@ export class Orchestrator {
         defaultCwd: this.defaultCwd(),
         fileWrites: "cursor-local-only" as const,
       },
-      localRuntime: this.localModels.catalogSummary(),
+      localRuntime: {
+        ...this.localModels.catalogSummary(),
+        ollama: ollama
+          ? {
+              running: ollama.ready,
+              model: ollama.model,
+              baseUrl: ollama.baseUrl,
+              reason: ollama.reason,
+              models: ollama.modelChoices,
+            }
+          : { running: false, reason: "No Ollama backend configured" },
+        llamacpp: llamacpp.map((b) => ({
+          id: b.id,
+          running: b.ready,
+          model: b.model,
+          baseUrl: b.baseUrl,
+          reason: b.reason,
+        })),
+      },
     };
   }
 
@@ -196,6 +230,7 @@ export class Orchestrator {
       model: input.model ?? (backend?.type === "cursor" ? this._config.defaults?.model : undefined),
       mode: input.mode ?? spec.mode,
       onDelta: input.onDelta,
+      timeoutMs: input.timeoutMs,
       cloud: input.repoUrl
         ? {
             repos: [{ url: input.repoUrl, startingRef: input.branch }],
@@ -206,7 +241,7 @@ export class Orchestrator {
 
     const wait = input.wait ?? this._config.defaults?.wait ?? true;
     if (!wait) {
-      void this.execute(run.id, provider, request);
+      void this.execute(run.id, provider, request).catch(() => undefined);
       return this.store.get(run.id)!;
     }
     await this.execute(run.id, provider, request);
@@ -231,6 +266,7 @@ export class Orchestrator {
       resumeAgentId: existing.agentId,
       cwd: existing.cwd,
       onDelta: input.onDelta,
+      timeoutMs: input.timeoutMs,
     };
     const child = this.store.create({
       specialist: existing.specialist,
@@ -244,7 +280,7 @@ export class Orchestrator {
     this.emitRun(child.id);
     const wait = input.wait ?? true;
     if (!wait) {
-      void this.execute(child.id, provider, request);
+      void this.execute(child.id, provider, request).catch(() => undefined);
       return this.store.get(child.id)!;
     }
     await this.execute(child.id, provider, request);
@@ -358,23 +394,37 @@ export class Orchestrator {
     provider: AgentProvider,
     request: ProviderRunRequest,
   ): Promise<ProviderRunResult> {
-    const result = await provider.run(request);
-    const existing = this.store.get(runId);
-    this.store.update(runId, {
-      status: result.status,
-      text: result.text,
-      error: result.error,
-      agentId: result.agentId ?? existing?.agentId,
-      providerRunId: result.providerRunId,
-      durationMs: result.durationMs,
-      history: [
-        ...(existing?.history ?? []),
-        { role: "user", content: request.prompt },
-        ...(result.text ? [{ role: "assistant" as const, content: result.text }] : []),
-      ],
-    });
-    this.emitRun(runId);
-    return result;
+    try {
+      const result = await provider.run(request);
+      const existing = this.store.get(runId);
+      this.store.update(runId, {
+        status: result.status,
+        text: result.text,
+        error: result.error,
+        agentId: result.agentId ?? existing?.agentId,
+        providerRunId: result.providerRunId,
+        durationMs: result.durationMs,
+        history: [
+          ...(existing?.history ?? []),
+          { role: "user", content: request.prompt },
+          ...(result.text ? [{ role: "assistant" as const, content: result.text }] : []),
+        ],
+      });
+      this.emitRun(runId);
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const existing = this.store.get(runId);
+      this.store.update(runId, {
+        status: "error",
+        text: existing?.text ?? "",
+        error: message,
+        agentId: existing?.agentId,
+        history: existing?.history ?? [],
+      });
+      this.emitRun(runId);
+      return { status: "error", text: "", error: message, durationMs: 0 };
+    }
   }
 
   private emitRun(runId: string): void {

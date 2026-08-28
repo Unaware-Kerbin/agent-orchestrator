@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { packageRoot } from "./config.js";
+import { ensureSecureDir } from "./platform.js";
 
 export function stateDir(): string {
   const fromEnv = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
@@ -9,6 +9,6 @@ export function stateDir(): string {
       ? fromEnv
       : resolve(process.cwd(), fromEnv)
     : resolve(packageRoot(), ".orchestrator");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ensureSecureDir(dir);
   return dir;
 }

@@ -1,3 +1,5 @@
+import { parseModelId } from "../identity.js";
+
 export const DEFAULT_VLLM_BACKEND_ID = "vllm-local";
 export const DEFAULT_VLLM_SPECIALIST_ID = "vllm-chat";
 export const VLLM_CONTAINER_PREFIX = "orch-vllm";
@@ -33,6 +35,10 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function yamlQuote(value: string): string {
+  return JSON.stringify(value);
+}
+
 function setBlockField(block: string, key: string, value: string): string {
   const re = new RegExp(`^( {4}${escapeRegExp(key)}:)\\s*.*$`, "m");
   if (re.test(block)) return block.replace(re, `$1 ${value}`);
@@ -51,18 +57,20 @@ export function patchVllmBackendYaml(
   fields: { baseUrl: string; model: string; backendId?: string },
 ): string {
   const id = fields.backendId ?? DEFAULT_VLLM_BACKEND_ID;
+  const model = yamlQuote(parseModelId(fields.model));
+  const baseUrl = yamlQuote(fields.baseUrl);
   const found = mappingBlocksInSection(yamlText, "backends").find((block) => block.id === id);
   if (found) {
     let block = found.block;
-    block = setBlockField(block, "baseUrl", fields.baseUrl);
-    block = setBlockField(block, "model", fields.model);
+    block = setBlockField(block, "baseUrl", baseUrl);
+    block = setBlockField(block, "model", model);
     if (!/^ {4}type:/m.test(block)) {
       block = block.replace(`  ${id}:\n`, `  ${id}:\n    type: vllm\n`);
     }
     return yamlText.slice(0, found.index) + block + yamlText.slice(found.index + found.block.length);
   }
 
-  const insertion = `  ${id}:\n    type: vllm\n    baseUrl: ${fields.baseUrl}\n    model: ${fields.model}\n`;
+  const insertion = `  ${id}:\n    type: vllm\n    baseUrl: ${baseUrl}\n    model: ${model}\n`;
   if (/^backends:\s*\n/m.test(yamlText)) {
     return yamlText.replace(/^backends:\s*\n/m, `backends:\n${insertion}`);
   }

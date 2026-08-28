@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import type { WriteAllowlist } from "../allowlist.js";
+import { ensureSecureDir } from "../platform.js";
 import { stateDir } from "../state.js";
 import { repoDirName } from "./catalog.js";
 
@@ -39,6 +39,6 @@ export function assertModelDest(
 
 export function ensureModelsDir(allowlist: WriteAllowlist, modelsDir: string): string {
   const allowed = allowlist.assertWritable(modelsDir);
-  mkdirSync(allowed, { recursive: true, mode: 0o700 });
+  ensureSecureDir(allowed);
   return allowed;
 }

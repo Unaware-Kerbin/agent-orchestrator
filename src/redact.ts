@@ -1,9 +1,12 @@
+import { KNOWN_SECRET_NAMES, loadSecretsFile } from "./secrets.js";
+
 const MASK = "••••••••";
+const HF_TOKEN_PATTERN = /\bhf_[A-Za-z0-9]{8,}\b/g;
 
 export function maskSecret(value: string | undefined): string | undefined {
   if (value === undefined || value === "") return value;
   if (value.startsWith("${") && value.endsWith("}")) return value;
-  if (value === "ollama") return value;
+  if (value === "ollama" || value === "sk-local") return value;
   return MASK;
 }
 
@@ -41,6 +44,29 @@ export function restoreMaskedSecrets(current: unknown, incoming: unknown): unkno
     return out;
   }
   return incoming;
+}
+
+/** Strip known secret values and Hugging Face `hf_…` tokens from logs and error text. */
+export function redactSecretText(text: string): string {
+  if (!text) return text;
+  let out = text;
+  const values = new Set<string>();
+  for (const name of KNOWN_SECRET_NAMES) {
+    const envVal = process.env[name]?.trim();
+    if (envVal && envVal.length > 3) values.add(envVal);
+  }
+  try {
+    for (const value of Object.values(loadSecretsFile())) {
+      const trimmed = value.trim();
+      if (trimmed.length > 3) values.add(trimmed);
+    }
+  } catch {
+    // secrets file may be missing or unreadable; env + pattern still apply
+  }
+  for (const value of values) {
+    out = out.split(value).join("***");
+  }
+  return out.replace(HF_TOKEN_PATTERN, "hf_***");
 }
 
 export function redactConfigValue(value: unknown): unknown {

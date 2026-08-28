@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
+import { writeSecureFile } from "./platform.js";
 import { stateDir } from "./state.js";
 
 const FILE_NAME = "gui.secret";
@@ -16,7 +17,7 @@ export function loadOrCreateGuiToken(): { token: string; path: string; created: 
     if (token.length >= 16) return { token, path, created: false };
   }
   const token = randomBytes(32).toString("base64url");
-  writeFileSync(path, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  writeSecureFile(path, `${token}\n`);
   return { token, path, created: true };
 }
 

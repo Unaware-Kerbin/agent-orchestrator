@@ -39,6 +39,7 @@ export class AnthropicProvider implements AgentProvider {
     const baseUrl = (this.config.baseUrl ?? "https://api.anthropic.com").replace(/\/$/, "");
     const messages = [...(request.history ?? []), { role: "user" as const, content: request.prompt }];
 
+    const timeoutMs = request.timeoutMs ?? 30_000;
     try {
       const response = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
@@ -53,6 +54,7 @@ export class AnthropicProvider implements AgentProvider {
           system: request.system,
           messages,
         }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const payload: unknown = await response.json().catch(() => ({ error: response.statusText }));
       if (!response.ok) {

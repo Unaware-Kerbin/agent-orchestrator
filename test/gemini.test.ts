@@ -46,6 +46,15 @@ test("suggestGeminiModelFromError parses Google 404 replacement text", () => {
   assert.equal(formatted.includes("models/models/"), false);
 });
 
+test("Gemini 429 is a one-line skip, not the quota JSON", () => {
+  const dump = JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED quota" } });
+  const formatted = formatGeminiChatError(429, dump, "gemini-3.6-flash");
+  assert.match(formatted, /429/);
+  assert.match(formatted, /skipped/);
+  assert.doesNotMatch(formatted, /RESOURCE_EXHAUSTED quota/);
+  assert.ok(formatted.length < 120);
+});
+
 test("extractHttpText reads Google OpenAI-compat error arrays", () => {
   const payload = [
     {

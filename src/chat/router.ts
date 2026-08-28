@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { isPathInside } from "../allowlist.js";
+import { backendLogoUrl } from "../identity.js";
 import { wantsHostInstall } from "./approval.js";
 import type {
   ChatIntent,
@@ -21,7 +22,38 @@ export const MAX_ROUNDS = 3;
 
 const DEBATE_INTENTS = new Set<ChatIntent>(["code", "review", "reason"]);
 
-const SKIP_UNLESS_NAMED = new Set(["ollama"]);
+/**
+ * Late (and similar MCP clients) wrap the operator turn after SYSTEM + untrusted
+ * device output. Intent/control must use that turn — the wrapper mentions
+ * "allowlist" / vLLM tools and must not become the chat reply.
+ */
+/** Late MCP wraps the operator turn after SYSTEM + untrusted device output. */
+export function isLateDeviceWrap(message: string): boolean {
+  return /^SYSTEM:/m.test(message) && /UNTRUSTED DEVICE OUTPUT follows/i.test(message);
+}
+
+export function extractRoutableMessage(message: string): string {
+  const text = message.trim();
+  if (!text) return text;
+  if (!isLateDeviceWrap(text)) return text;
+
+  const endRe = /END UNTRUSTED DEVICE OUTPUT[^\n]*/gi;
+  let last = -1;
+  let match: RegExpExecArray | null;
+  while ((match = endRe.exec(text))) {
+    last = match.index + match[0].length;
+  }
+  let rest = last >= 0 ? text.slice(last).trim() : "";
+  if (!rest) {
+    const header = text.match(/UNTRUSTED DEVICE OUTPUT follows[^\n]*/i);
+    if (header && header.index !== undefined) {
+      const body = text.slice(header.index + header[0].length).trim();
+      const paras = body.split(/\n\s*\n/);
+      rest = (paras[paras.length - 1] ?? "").trim();
+    }
+  }
+  return rest || text;
+}
 
 export function detectIntent(message: string): ChatIntent {
   const text = message.trim();
@@ -51,7 +83,7 @@ export function detectIntent(message: string): ChatIntent {
     /\b(build|scaffold)\b/i.test(text) ||
     /\bcreate (?:a |the )?(?:file|readme|project|app|bot|dir(?:ectory)?|folder)\b/i.test(text) ||
     /\bcreate \S+\.\w{1,8}\b/i.test(text) ||
-    (/\b(here|in|into|at)\s+(?:~|\/)/i.test(text) &&
+    (/\b(here|in|into|at)\s+(?:~|\/|[A-Za-z]:[\\/])/i.test(text) &&
       /\b(build|create|write|implement|put|scaffold|generate)\b/i.test(text)) ||
     (detectVisual3dIntent(text) &&
       /\b(create|generate|export|implement|build|add|make|render)\b/i.test(text))
@@ -86,11 +118,12 @@ export function detectNamedBackend(message: string): string | undefined {
   const text = message.toLowerCase();
   if (/\b(cursor cloud|cloud cursor|cloud[- ]builder)\b/.test(text)) return "cursor-cloud";
   if (/\b(cursor local|local cursor)\b/.test(text)) return "cursor-local";
-  if (/\b(vllm|local vllm|local model|qwen|llama)\b/.test(text) && !/\bcursor\b/.test(text)) return "local";
+  if (/\b(llama\.cpp|llamacpp|llama-server|llama cpp)\b/.test(text) && !/\bcursor\b/.test(text)) return "llamacpp";
+  if (/\bollama\b/.test(text)) return "ollama";
+  if (/\b(vllm|local vllm|local model|qwen|llama|gemma|mistral|phi-?4|olmo|granite|deepseek)\b/.test(text) && !/\bcursor\b/.test(text)) return "local";
   if (/\b(gemini|google gemini)\b/.test(text)) return "gemini";
   if (/\b(anthropic|claude)\b/.test(text)) return "anthropic";
   if (/\b(openai|gpt-4|gpt4)\b/.test(text)) return "openai";
-  if (/\bollama\b/.test(text)) return "ollama";
   return undefined;
 }
 
@@ -120,14 +153,20 @@ const MODE_PINS = new Set(["auto", "debate", "single"]);
 /** Absolute or home-relative filesystem paths mentioned in a chat message. */
 export function extractFilesystemPaths(message: string): string[] {
   const found: string[] = [];
-  const re = /(?:^|[\s"'`=(])((?:~|\/)[^\s"'`<>|]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(message))) {
-    let raw = match[1] ?? "";
-    raw = raw.replace(/[.,;:!?)]+$/g, "");
-    if (raw.length < 4) continue;
-    if (raw.startsWith("//")) continue;
-    found.push(raw);
+  const patterns = [
+    /(?:^|[\s"'`=(])((?:~|\/)[^\s"'`<>|]+)/g,
+    /(?:^|[\s"'`=(])([A-Za-z]:[\\/][^\s"'`<>|]+)/g,
+    /(?:^|[\s"'`=(])(\\\\[^\s"'`<>|]+)/g,
+  ];
+  for (const re of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(message))) {
+      let raw = match[1] ?? "";
+      raw = raw.replace(/[.,;:!?)]+$/g, "");
+      if (raw.length < 4) continue;
+      if (raw.startsWith("//") && !raw.startsWith("\\\\")) continue;
+      found.push(raw);
+    }
   }
   return [...new Set(found)];
 }
@@ -175,6 +214,7 @@ export function shortModelName(modelId?: string): string {
 }
 
 export function speakerLabel(backend: RouterBackend, vllmModelId?: string, specialistId?: string): string {
+  if (backend.nickname?.trim()) return backend.nickname.trim();
   if (specialistId === "procedural-3d-artist") return "Procedural 3D (Gemini)";
   if (specialistId === "procedural-3d-local") {
     const model = backend.model || vllmModelId;
@@ -183,6 +223,12 @@ export function speakerLabel(backend: RouterBackend, vllmModelId?: string, speci
   if (backend.type === "vllm" || backend.id.startsWith("vllm")) {
     const model = backend.model || vllmModelId;
     return `${shortModelName(model)} local`;
+  }
+  if (isOllamaBackend(backend)) {
+    return backend.model ? `${shortModelName(backend.model)} (Ollama)` : "Ollama";
+  }
+  if (isLlamaCppBackend(backend)) {
+    return backend.model ? `${shortModelName(backend.model)} (llama.cpp)` : "llama.cpp";
   }
   if (backend.id === "gemini" || /gemini/i.test(backend.id)) return "Gemini";
   if (backend.id === "cursor-cloud" || backend.runtime === "cloud") return "Cursor cloud";
@@ -230,6 +276,12 @@ function specialistFor(
   if (backendId.startsWith("vllm") || backendId === "local") {
     return matching[0]?.id ?? pick(["vllm-chat"]) ?? matching[0]?.id ?? "vllm-chat";
   }
+  if (isOllamaId(backendId)) {
+    return matching[0]?.id ?? pick(["ollama-chat"]) ?? matching[0]?.id ?? "ollama-chat";
+  }
+  if (isLlamaCppId(backendId)) {
+    return matching[0]?.id ?? pick(["llamacpp-chat"]) ?? matching[0]?.id ?? "llamacpp-chat";
+  }
   if (backendId === "gemini") return pick(["gemini-planner"]) ?? matching[0]?.id ?? "gemini-planner";
   if (intent === "review") return pick(["reviewer"]) ?? matching[0]?.id ?? backendId;
   if (intent === "reason" || intent === "general") {
@@ -244,6 +296,35 @@ function findBackend(backends: RouterBackend[], id: string): RouterBackend | und
 
 function vllmBackend(backends: RouterBackend[]): RouterBackend | undefined {
   return backends.find((b) => b.type === "vllm" || b.id.startsWith("vllm"));
+}
+
+function isOllamaId(id: string): boolean {
+  return id === "ollama" || id.startsWith("ollama");
+}
+
+function isLlamaCppId(id: string): boolean {
+  return (
+    id === "llamacpp" ||
+    id === "llama-server" ||
+    id.startsWith("llamacpp") ||
+    /^llama[-.]?cpp/i.test(id)
+  );
+}
+
+function isOllamaBackend(backend: RouterBackend): boolean {
+  return backend.type === "ollama" || isOllamaId(backend.id);
+}
+
+function isLlamaCppBackend(backend: RouterBackend): boolean {
+  return backend.type === "llamacpp" || isLlamaCppId(backend.id);
+}
+
+function ollamaBackend(backends: RouterBackend[]): RouterBackend | undefined {
+  return backends.find(isOllamaBackend);
+}
+
+function llamaCppBackend(backends: RouterBackend[]): RouterBackend | undefined {
+  return backends.find(isLlamaCppBackend);
 }
 
 function resolvePinTarget(
@@ -272,6 +353,24 @@ function resolvePinTarget(
       suggestedAction: { label: "Open backends", action: "open_settings", payload: { page: "backends" } },
     };
   }
+  if (normalized === "ollama") {
+    const found = ollamaBackend(backends) ?? findBackend(backends, "ollama");
+    if (found?.ready) return { backend: found };
+    return {
+      error: found?.reason ?? "Ollama is not running on 127.0.0.1:11434.",
+      suggestedAction: { label: "Open backends", action: "open_settings", payload: { page: "backends" } },
+      backend: undefined,
+    };
+  }
+  if (normalized === "llamacpp" || normalized === "llama.cpp" || normalized === "llama-server") {
+    const found = llamaCppBackend(backends) ?? findBackend(backends, "llamacpp");
+    if (found?.ready) return { backend: found };
+    return {
+      error: found?.reason ?? "llama.cpp is not running on 127.0.0.1. Start llama-server bound to 127.0.0.1, then add it in Settings → Backends.",
+      suggestedAction: { label: "Open backends", action: "open_settings", payload: { page: "backends" } },
+      backend: undefined,
+    };
+  }
   const direct = findBackend(backends, pin) ?? findBackend(backends, normalized);
   if (direct) {
     if (direct.ready) return { backend: direct };
@@ -285,8 +384,9 @@ function resolvePinTarget(
 }
 
 function readyPool(ctx: RouterContext): RouterBackend[] {
+  const skip = new Set(ctx.skipBackendIds ?? []);
   const ready = ctx.backends.filter((b) => {
-    if (SKIP_UNLESS_NAMED.has(b.id)) return false;
+    if (skip.has(b.id)) return false;
     if ((b.type === "vllm" || b.id.startsWith("vllm")) && ctx.vllmRunning === false) return false;
     return b.ready;
   });
@@ -301,24 +401,42 @@ function readyPool(ctx: RouterContext): RouterBackend[] {
 
 function asSpeaker(backend: RouterBackend, intent: ChatIntent, ctx: RouterContext, visual3d: boolean): RouteSpeaker {
   const specialist = specialistFor(backend.id, intent, ctx.specialists ?? [], visual3d);
+  const nickname = backend.nickname?.trim() || undefined;
+  const hasLogo = Boolean(backend.hasLogo);
   return {
     backendId: backend.id,
     specialist,
     label: speakerLabel(backend, ctx.vllmModelId, specialist),
     writesLocalFiles: backend.writesLocalFiles,
+    nickname,
+    hasLogo,
+    logoUrl: hasLogo ? backendLogoUrl(backend.id) : undefined,
   };
 }
 
-const DEBATE_PREFERENCE = ["vllm", "gemini", "anthropic", "openai", "cursor-local", "cursor-cloud"];
+const DEBATE_PREFERENCE = ["vllm", "ollama", "llamacpp", "gemini", "anthropic", "openai", "cursor-local", "cursor-cloud"];
 
 function debateRank(backend: RouterBackend): number {
-  if (backend.type === "vllm" || backend.id.startsWith("vllm")) return 0;
+  if (isLocalServerBackend(backend)) return 0;
   const idx = DEBATE_PREFERENCE.indexOf(backend.id);
   return idx === -1 ? 50 : idx;
 }
 
 function isVllmBackend(backend: RouterBackend): boolean {
   return backend.type === "vllm" || backend.id.startsWith("vllm");
+}
+
+function isLocalServerBackend(backend: RouterBackend): boolean {
+  return isVllmBackend(backend) || isOllamaBackend(backend) || isLlamaCppBackend(backend);
+}
+
+/** Cloud/API specialists that join a round-table when ready. Not SKIP_UNLESS_NAMED. */
+function isRoundtableCloud(backend: RouterBackend): boolean {
+  const id = backend.id;
+  if (id === "gemini" || id === "anthropic" || id === "openai") return true;
+  if (id === "cursor-local" || id === "cursor-cloud" || backend.type === "cursor") return true;
+  if (/gemini/i.test(id)) return true;
+  return false;
 }
 
 function writerBackend(ready: RouterBackend[], preferLocal: boolean): RouterBackend | undefined {
@@ -343,30 +461,23 @@ function pickDebateSpeakers(
     }
     return debateRank(a) - debateRank(b);
   });
-  const vllms = sorted.filter(isVllmBackend);
-  const others = sorted.filter((b) => !isVllmBackend(b));
-  const maxSpeakers = Math.max(3, vllms.length + 1);
+  const locals = sorted.filter(isLocalServerBackend);
+  const clouds = sorted.filter((b) => !isLocalServerBackend(b) && isRoundtableCloud(b));
+  const others = sorted.filter((b) => !isLocalServerBackend(b) && !isRoundtableCloud(b));
+  const maxSpeakers = Math.max(8, locals.length + clouds.length);
   const chosen: RouterBackend[] = [];
-  for (const backend of vllms) {
-    if (chosen.length >= maxSpeakers) break;
+  const take = (backend: RouterBackend) => {
+    if (chosen.length >= maxSpeakers) return;
+    if (chosen.some((c) => c.id === backend.id)) return;
     chosen.push(backend);
-  }
-  for (const backend of others) {
-    if (chosen.length >= maxSpeakers) break;
-    if (backend.id === "cursor-local" || backend.id === "cursor-cloud") continue;
-    chosen.push(backend);
-  }
+  };
+  for (const backend of locals) take(backend);
+  // Cursor and Gemini join by default when keys/ready — not SKIP_UNLESS_NAMED.
+  for (const backend of clouds) take(backend);
+  for (const backend of others) take(backend);
   if (needsWrites || intent === "code") {
     const cursor = writerBackend(ready, preferLocal);
-    if (cursor && !chosen.some((c) => c.id === cursor.id)) {
-      if (chosen.length >= maxSpeakers) {
-        const drop = [...chosen].map((row, i) => ({ row, i })).reverse().find((x) => !isVllmBackend(x.row));
-        if (drop) chosen[drop.i] = cursor;
-        else chosen.push(cursor);
-      } else {
-        chosen.push(cursor);
-      }
-    }
+    if (cursor) take(cursor);
   }
   return chosen.map((b) => asSpeaker(b, intent, ctx, visual3d));
 }
@@ -409,6 +520,10 @@ function pickSingle(
   }
   const vllm = ready.find((b) => b.type === "vllm" || b.id.startsWith("vllm"));
   if (vllm && ctx.vllmRunning !== false) return asSpeaker(vllm, intent, ctx, visual3d);
+  const ollama = ready.find(isOllamaBackend);
+  if (ollama) return asSpeaker(ollama, intent, ctx, visual3d);
+  const llamaCpp = ready.find(isLlamaCppBackend);
+  if (llamaCpp) return asSpeaker(llamaCpp, intent, ctx, visual3d);
   const gemini = ready.find((b) => b.id === "gemini");
   if (gemini) return asSpeaker(gemini, intent, ctx, visual3d);
   const cursor = ready.find((b) => b.id === "cursor-local") ?? ready.find((b) => b.id === "cursor-cloud");
@@ -449,25 +564,27 @@ function allowlistAction(path: string): ChatSuggestedAction {
 }
 
 export function routeChat(ctx: RouterContext): RouteDecision {
+  const message = extractRoutableMessage(ctx.message);
+  const routed = { ...ctx, message };
   const rawPin = (ctx.pin?.trim() || "auto").trim();
   const pinLower = rawPin.toLowerCase();
   const mode: "auto" | "debate" | "single" | "backend" = MODE_PINS.has(pinLower)
     ? (pinLower as "auto" | "debate" | "single")
     : "backend";
-  const named = mode === "auto" ? detectNamedBackend(ctx.message) : undefined;
+  const named = mode === "auto" ? detectNamedBackend(message) : undefined;
   const effectivePin = mode === "backend" ? rawPin : (named ?? pinLower);
-  const intent = detectIntent(ctx.message);
-  const visual3d = detectVisual3dIntent(ctx.message);
-  const workspace = resolveWorkspaceHint(ctx);
-  const needsHostInstall = wantsHostInstall(ctx.message);
-  const needsWrites = wantsFileWrites(intent, ctx.message);
+  const intent = detectIntent(message);
+  const visual3d = detectVisual3dIntent(message);
+  const workspace = resolveWorkspaceHint(routed);
+  const needsHostInstall = wantsHostInstall(message);
+  const needsWrites = wantsFileWrites(intent, message);
   const needsApproval = needsWrites || needsHostInstall;
   const preferLocal = Boolean(workspace?.path);
   const writeCwd = workspace?.allowed ? workspace.cwd : undefined;
   const approval = { needsWrites, needsHostInstall, needsApproval };
 
   if (intent === "control") {
-    const control = detectControl(ctx.message) ?? "hardware";
+    const control = detectControl(message) ?? "hardware";
     return {
       kind: "control",
       pin: effectivePin,
@@ -545,7 +662,7 @@ export function routeChat(ctx: RouterContext): RouteDecision {
       chip: "none ready",
       error: gemini && !gemini.ready
         ? `No backends are ready. ${gemini.reason ?? "Gemini is not ready."}`
-        : "No backends are ready. Start local vLLM or add an API key in Settings.",
+        : "No backends are ready. Start local vLLM, connect Ollama or llama.cpp, or add an API key in Settings.",
       suggestedAction: suggested,
     };
   }
@@ -571,7 +688,7 @@ export function routeChat(ctx: RouterContext): RouteDecision {
   const debateReady =
     ready.length >= 2 &&
     (!needsWrites || Boolean(writerBackend(ready, preferLocal)));
-  const multipleLocalModels = ready.filter(isVllmBackend).length >= 2;
+  const multipleLocalModels = ready.filter(isLocalServerBackend).length >= 2;
   const autoDebate =
     mode === "auto" && debateReady && (DEBATE_INTENTS.has(intent) || multipleLocalModels);
 

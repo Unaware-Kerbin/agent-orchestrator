@@ -26,24 +26,52 @@ Put API keys in `.env` or in the GUI **Backends** page — never in `agents.conf
 npm run gui
 ```
 
-Open the URL printed on stderr (`http://127.0.0.1:8787?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored).
+Open the token URL from stderr (`http://127.0.0.1:8787?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored). Port **8787 is the GUI only** — it is not MCP.
+
+**HTTP MCP** is a separate process: `npm run mcp:http` → `http://127.0.0.1:8790/mcp` (also `/MCP`). Stdio MCP is unchanged (`npm start` / Cursor `.cursor/mcp.json`).
+
+### Windows
+
+Same Node 22.13+ and `npm` commands work in PowerShell or cmd. Loopback bind and GUI auth are unchanged (`127.0.0.1` only).
+
+```powershell
+npm install
+copy .env.example .env
+npm run gui
+```
+
+Open the token URL from stderr. Stop with `npm run gui:stop`. MCP stdio: `npm start`, or Cursor via [`.cursor/mcp.json`](.cursor/mcp.json) (`node` + `tsx/dist/cli.mjs`, not a Unix `.bin` shim).
+
+Local models are **user-installed** Windows binaries talking to `127.0.0.1`:
+
+- **Ollama** — install from ollama.com; typical path `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`. Register the loopback API in the GUI.
+- **llama.cpp** — put `llama-server.exe` on `PATH`, start with `--host 127.0.0.1`.
+- **vLLM** — Windows CUDA wheel when you have NVIDIA + `nvidia-smi`; host `vllm` / `python -m vllm`. AMD: ROCm tools (`amd-smi`) when present.
+- **Docker Desktop** — optional. NVIDIA GPU in Docker Desktop can work when GPU support is enabled. **Intel XPU / `/dev/dri` images are a Linux path**; on Windows use WSL2 or a Linux host, or skip Intel Docker.
+
+Hardware detect uses `nvidia-smi` (including `C:\Windows\System32` / NVIDIA NVSMI), Win32 video controllers, and vendor CLIs when present — not Linux `lspci` / sysfs. If probes fail, the GUI shows a reason instead of crashing.
+
+State stays in `.orchestrator` under the repo (or `AGENT_ORCHESTRATOR_STATE_DIR`). Write-allowlist paths may use drive letters (`C:\Users\…`). POSIX `0600`/`0700` bits do **not** apply on NTFS; use folder ACLs if the machine is shared.
 
 | Command | Purpose |
 | --- | --- |
-| `npm run gui` | Start the control plane on `127.0.0.1:8787` |
+| `npm run gui` | Control plane on `127.0.0.1:8787` (web UI + token). Not MCP. |
 | `npm run gui:stop` | Stop that process |
 | `npm run gui:restart` | Stop then start |
 | `npm start` | Stdio MCP server |
+| `npm run mcp:http` | Streamable HTTP MCP on `127.0.0.1:8790/mcp` |
+
+The GUI on port 8787 is **not** MCP. On this computer, start `npm run mcp:http` and point Late at `http://127.0.0.1:8790/mcp`. For another machine, start HTTP yourself (`AGENT_ORCHESTRATOR_MCP_HOST=0.0.0.0 AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http`) and use `http://THAT_IP:8790/mcp`. Late will not start this process.
 
 If port 8787 is already in use, the GUI is already running — use `gui:stop` or open the existing token URL. Stopping a local model container does **not** stop the GUI.
 
-Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json). Reload MCP once after clone. `list_agents` re-reads env and GUI secrets without a full IDE restart.
+Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json) (stdio). Reload MCP once after clone. `list_agents` re-reads env and GUI secrets without a full IDE restart. HTTP clients (Late) use `http://127.0.0.1:8790/mcp` after `npm run mcp:http`.
 
 ## Chat
 
 Home is a chat thread. The header (new chat, thread switcher, settings) and composer stay on screen; only messages scroll.
 
-- **Auto** (default) — control tools for hardware/download/start; debate for plan/fix/review when two or more backends are ready, and whenever two or more local vLLM servers are running; otherwise a single agent.
+- **Auto** (default) — control tools for hardware/download/start; debate for plan/fix/review when two or more backends are ready, and whenever two or more local servers (vLLM, Ollama, llama.cpp) are running; otherwise a single agent.
 - **Debate** — round-table: each ready model speaks in turn (one bubble per speaker), then a closer synthesizes.
 - **Single** / pin a backend — that backend only.
 
@@ -55,22 +83,27 @@ While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so
 
 | Page | What it does |
 | --- | --- |
-| Backends | Ready/not-ready, paste keys (masked), Gemini model id |
-| Local models | Detect GPU VRAM, recommend weights that fit, download, start/stop/remove local servers |
+| Backends | Ready/not-ready, paste keys (masked), Gemini model id, nicknames, custom logos |
+| Local models | Detect GPU VRAM, recommend weights that fit, download, start/stop/remove local servers. **Hugging Face token** (gated Gemma/Llama/Mistral): paste a Hub read token; status is configured/not; value is never returned |
 | Allowlist | Directories Cursor may write to |
 | Config | Edit `agents.config.yaml` (validated; no live keys) |
 | Run workflow | Optional named pipelines |
+| Theme | Appearance for this browser. Stored in localStorage (`orchestrator.gui.theme`), not in git. |
 
-Keys live in `.env` and `.orchestrator/secrets.env` (gitignored, mode `0600`). **Reload env** picks up a key added after start.
+Keys live in `.env` and `.orchestrator/secrets.env` (gitignored). On POSIX the orchestrator creates secret/state files as mode `0600` and directories as `0700`, then `chmod`s again after overwrite (Node’s `mode` option only applies when creating a new file). **Windows does not honor Unix permission bits** — Node can only toggle the read-only flag, not user vs group vs others. If other accounts use the machine, restrict the repo folder with NTFS ACLs (your user only). **Reload env** picks up a key added after start.
+
+Nicknames are stored on each backend in `agents.config.yaml` (`nickname: Arc Qwen`). Custom logos are PNG/JPEG/WebP files under `.orchestrator/logos/` (gitignored, 512 KiB max; SVG/HTML rejected by magic bytes). Chat bubbles and Settings use the nickname and logo when set.
+
+The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per browser/profile so people sharing a machine can keep their own look. It is not stored in git.
 
 ## Security
 
 | Property | Behavior |
 | --- | --- |
-| Bind | GUI and local model HTTP bind **`127.0.0.1` only**. Non-loopback host exits. |
-| Auth | GUI requires a Bearer token. Unauthenticated `/api/*` is 401. |
+| Bind | GUI is **`127.0.0.1:8787` only**. HTTP MCP defaults to `127.0.0.1:8790`; a remote box may set `AGENT_ORCHESTRATOR_MCP_HOST=0.0.0.0`. Local model HTTP is loopback. |
+| Auth | GUI `/api/*` requires the session token. Streamable HTTP MCP on :8790 does not use that token. |
 | Origin | Non-loopback `Host` / `Origin` is rejected. |
-| Secrets | Never logged or shown in full. Not committed. |
+| Secrets | Never logged or shown in full. Not committed. POSIX files `0600`; Windows needs NTFS ACLs. |
 | Writes | Realpath + allowlist; `..` and symlink escapes fail. |
 
 Do not tunnel the GUI or vLLM. Cloud Cursor agents cannot reach localhost; the orchestrator passes **text** between local and cloud.
@@ -83,9 +116,17 @@ Default: this workspace (`WORKSPACE_CWD` / `workspace.cwd`). Add more via Settin
 
 `list_hardware` probes **whatever accelerators are present** (NVIDIA CUDA, AMD ROCm, Intel XPU, or CPU if none). Recommendations use **measured VRAM**, not a single vendor. Missing NVIDIA is not treated as “CPU only” when another GPU exists.
 
-A catalog model **fits** when estimated weights plus ~20% KV-cache headroom are ≤ per-GPU VRAM. Multi-GPU can use tensor parallel when a model misses one card but fits two.
+A catalog model **fits** a single GPU when estimated weights plus ~20% KV-cache headroom are ≤ that GPU’s VRAM. `start_vllm` uses **every GPU on this computer** by default (`vllm serve --tensor-parallel-size N`). Pass `use_all_gpus=false` to stay on one card. A larger model can still *fit* via tensor parallel when weight shards fit in combined VRAM. Remaining memory on each card is used for the KV cache (`--gpu-memory-utilization 0.9`). The catalog is **not** tied to one vendor: it includes Qwen 2.5/3/3.5/3.8, Gemma 2 and Gemma 4 Instruct, Llama 3.1/3.3/4 Scout, Mistral 7B and Small 3.2, Phi-4, OLMo 2/3, IBM Granite 3.3/4.2, and DeepSeek-R1 Qwen distills. **Recommendations** list every catalog snapshot (no top-8 cap) with fit flags for this computer (fits / needs tensor parallel / too big). Newest Hub id is marked when a family has several names (Gemma 4 over Gemma 2/3, Qwen3.8 over Qwen2.5). Older generations stay downloadable. FP16 rows work on CUDA, ROCm, and Intel XPU; AWQ/GPTQ rows are CUDA/ROCm only. Official Gemma 2 ([Gemma Terms of Use](https://ai.google.dev/gemma/terms)) and Llama (Llama Community License / Llama 4 Community License) Hugging Face repos are **gated**. Gemma 4 Instruct is **ungated Apache-2.0**. Community Llama AWQ snapshots in the catalog are ungated on Hugging Face but still under the Llama Community License. You can still download any other `org/name` snapshot that vLLM can load.
 
-Download snapshots into `.orchestrator/models` (gitignored, must stay on the allowlist). Gated Hugging Face repos need `HF_TOKEN` in env or the GUI — never in git.
+Download snapshots into `.orchestrator/models` (gitignored, must stay on the allowlist).
+
+**Gated Hugging Face models** (Gemma, Llama, Mistral, and similar Hub gates):
+
+1. While logged into your Hugging Face account, open the model card and **accept the license / access terms** (Gemma 2: Gemma Terms of Use; Llama 4: Llama 4 Community License).
+2. Create a **read** access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). Paste it in the GUI: **Settings → Local models → Hugging Face token** (stored as `HF_TOKEN` in gitignored `.orchestrator/secrets.env`). `HUGGING_FACE_HUB_TOKEN` in env or that same secrets file is also honored. Do not put the token in `agents.config.yaml` or git.
+3. The GUI never returns the raw token (status is configured / not configured). Clear or paste a new token to rotate. POSIX file mode is `0600`; on Windows use NTFS ACLs if the machine is shared.
+
+The download helper uses that stored token. If it is missing, a 401 from a gated repo still tells you to set `HF_TOKEN` in the GUI or env — never commit it.
 
 `start_vllm` picks a serving stack from the detected backend:
 
@@ -103,6 +144,79 @@ pip install -r scripts/requirements-hf.txt   # downloads
 # Then install the vLLM build that matches your GPU (CUDA, ROCm, or vendor XPU/Docker).
 ```
 
+### Ollama
+
+Ollama is a separate local OpenAI-compat API (`http://127.0.0.1:11434/v1`). The orchestrator **detects and registers** a running daemon; it does not install Ollama or pull weights.
+
+1. Install Ollama yourself and run it so it listens on loopback.
+2. `ollama pull llama3.1` (or any tag you want).
+3. In the GUI: **Local models → Register Ollama backend**, or **Backends → Add Ollama backend**. Chat Auto treats a ready Ollama backend like other local speakers.
+
+YAML type is `ollama`. Dummy `apiKey: ollama` is not a secret. Non-loopback hosts are refused.
+
+### llama.cpp
+
+Connect to a user-started [`llama-server`](https://github.com/ggml-org/llama.cpp) OpenAI API. GGUF files are **not** the vLLM Hugging Face catalog.
+
+```bash
+llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080
+# Windows: llama-server.exe -m C:\path\to\model.gguf --host 127.0.0.1 --port 8080
+```
+
+Then **Backends → Add llama.cpp backend** with `http://127.0.0.1:8080/v1` and the model id the server reports. Bind **127.0.0.1 only**. The GUI will mention `llama-server` if it is already on `PATH`; this app does not download binaries or GGUF weights.
+
+YAML type is `llamacpp`.
+
+Ready vLLM, Ollama, and llama.cpp backends all participate in Auto debate when two or more local servers are up. File writes still go through Cursor.
+
+## HTTP MCP (any client)
+
+**8787 is the GUI.** Streamable HTTP MCP is **`http://127.0.0.1:8790/mcp`** (`npm run mcp:http`). `/MCP` is the same route. Late does not send a GUI token.
+
+```http
+POST /mcp HTTP/1.1
+Host: 127.0.0.1:8790
+Accept: application/json, text/event-stream
+Content-Type: application/json
+MCP-Protocol-Version: 2025-03-26
+```
+
+**Late:** Settings → MCP on. Address `http://127.0.0.1:8790/mcp`. Save, then Check. `http://localhost:8787` is the web UI, not this. List/status tools run; starts and writes still wait for Approve. You start `npm run mcp:http`; Late will not start it.
+
+Stdio remains `tsx src/index.ts` for Cursor.
+
+### Optional ClearPass / ISE / Active Directory
+
+Off by default (`AGENT_ORCHESTRATOR_MCP_AUTH=local-token`). Passwords and RADIUS secrets go in `.env` or GUI **Backends** secrets (`RADIUS_SECRET`, `LDAP_BIND_PASSWORD`) — never `agents.config.yaml`.
+
+LDAP/RADIUS verify the user, then `/mcp/login` returns a short-lived Bearer for `/mcp`. HTTP Basic username/password on `/mcp` also works when those plugins are on. If an allowlist is set, the AD `memberOf` / RADIUS `Filter-Id` must match or the result is 401.
+
+**LDAPS (Active Directory)** — prefer `ldaps://` (port 636). Plain `ldap://` is refused.
+
+```bash
+AGENT_ORCHESTRATOR_MCP_AUTH=local-token,ldap
+AGENT_ORCHESTRATOR_LDAP_URL=ldaps://dc.example.com:636
+AGENT_ORCHESTRATOR_LDAP_BIND_DN=CN={username},CN=Users,DC=example,DC=com
+AGENT_ORCHESTRATOR_LDAP_BASE_DN=DC=example,DC=com
+AGENT_ORCHESTRATOR_LDAP_FILTER=(sAMAccountName={username})
+AGENT_ORCHESTRATOR_LDAP_ALLOWED_GROUPS=CN=MCP Users,OU=Groups,DC=example,DC=com
+# LDAP_BIND_PASSWORD in GUI secrets if you use a service bind DN
+```
+
+Windows and Linux: same env vars. Trust the DC certificate (or lab-only `AGENT_ORCHESTRATOR_LDAP_TLS_REJECT_UNAUTHORIZED=0`).
+
+**RADIUS (ClearPass and Cisco ISE)** — Access-Request/Accept, PAP. Point the host at the NAD/RADIUS listener ClearPass or ISE already uses. Set a Filter-Id (or equivalent) on the accept profile and allowlist it here.
+
+```bash
+AGENT_ORCHESTRATOR_MCP_AUTH=local-token,radius
+AGENT_ORCHESTRATOR_RADIUS_HOST=clearpass.example.com
+AGENT_ORCHESTRATOR_RADIUS_PORT=1812
+AGENT_ORCHESTRATOR_RADIUS_ALLOWED_FILTER_IDS=mcp-users
+# RADIUS_SECRET in GUI secrets (writeSecureFile / POSIX 0600)
+```
+
+Login: not used by Late. HTTP MCP for Late is `http://127.0.0.1:8790/mcp` with no GUI token. A remote box may bind `0.0.0.0`.
+
 ## MCP tools
 
 | Tool | Purpose |
@@ -114,7 +228,8 @@ pip install -r scripts/requirements-hf.txt   # downloads
 | `list_allowed_dirs` / `add_allowed_dir` / `remove_allowed_dir` | Write sandbox |
 | `list_hardware` / `list_local_models` / `recommend_local_models` | Fit and catalog |
 | `download_local_model` | Hugging Face snapshot |
-| `start_vllm` / `stop_vllm` / `remove_vllm` / `vllm_status` / `delete_local_model` | Local servers |
+| `start_vllm` / `stop_vllm` / `remove_vllm` / `vllm_status` / `delete_local_model` | Local vLLM servers |
+| `ollama_status` / `llamacpp_status` | Probe loopback Ollama / llama-server |
 
 ## Default specialists
 
@@ -126,6 +241,7 @@ pip install -r scripts/requirements-hf.txt   # downloads
 | `pr-triage` | Cursor local | Failing checks |
 | `gemini-planner` | Gemini | Extra external planner |
 | `vllm-chat` | Local vLLM | Text-only local model |
+| `ollama-chat` | Local Ollama | Text-only; daemon on 127.0.0.1:11434 |
 | `cloud-builder` | Cursor cloud | Isolated cloud agent |
 
 Only **Cursor** backends edit files. Point `backend` at any id in `agents.config.yaml`.
@@ -158,8 +274,11 @@ Gemini uses Google’s OpenAI-compatible endpoint. Set **one** current model id 
   "mcpServers": {
     "agent-orchestrator": {
       "type": "stdio",
-      "command": "/absolute/path/to/this-repo/node_modules/.bin/tsx",
-      "args": ["/absolute/path/to/this-repo/src/index.ts"],
+      "command": "node",
+      "args": [
+        "/absolute/path/to/this-repo/node_modules/tsx/dist/cli.mjs",
+        "/absolute/path/to/this-repo/src/index.ts"
+      ],
       "env": {
         "AGENT_ORCHESTRATOR_CONFIG": "/absolute/path/to/this-repo/agents.config.yaml",
         "WORKSPACE_CWD": "${workspaceFolder}",
@@ -170,6 +289,12 @@ Gemini uses Google’s OpenAI-compatible endpoint. Set **one** current model id 
 }
 ```
 
+On Windows use the same `node` + `tsx/dist/cli.mjs` form with `C:\…` paths (or `${workspaceFolder}` in Cursor). Do not point `command` at `node_modules/.bin/tsx` — that shim is a Unix shell script.
+
 ## What is not in git
 
-`.env`, `.orchestrator/` (GUI token, secrets, chats, allowlist, model weights, vLLM state), `node_modules/`, and logs. See `.gitignore`.
+`.env`, `.orchestrator/` (GUI token, secrets, chats, logos, allowlist, model weights, vLLM state), `gui.secret` / `secrets.env` if copied to the repo root, `node_modules/`, and logs. See `.gitignore`.
+
+## Licenses
+
+This repository is [MIT](LICENSE). npm dependencies keep their own licenses under `node_modules` after `npm install` (including `@cursor/sdk` and `@modelcontextprotocol/server`). Model weights you download are **not** in this repo and remain under their upstream terms (Gemma Terms of Use, Llama Community License, Apache-2.0, MIT, and others as listed on each Hugging Face card).

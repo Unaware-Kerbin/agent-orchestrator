@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import path, { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { ensureSecureDir, writeSecureFile, type PathApi } from "./platform.js";
 import { stateDir } from "./state.js";
 
 const FILE_NAME = "write-allowlist.json";
@@ -40,10 +41,13 @@ export function resolveContainedPath(input: string): string {
   return join(realpathSync(current), ...missing);
 }
 
-export function isPathInside(target: string, root: string): boolean {
-  const rel = relative(root, target);
+export function isPathInside(target: string, root: string, pathImpl: PathApi = path): boolean {
+  const rel = pathImpl.relative(root, target);
   if (rel === "") return true;
-  return !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
+  if (rel === ".." || pathImpl.isAbsolute(rel)) return false;
+  const sepChar = pathImpl.sep;
+  const normalized = rel.replace(/[\\/]/g, sepChar);
+  return !normalized.startsWith(`..${sepChar}`);
 }
 
 export function canonicalizeDirectory(input: string): string {
@@ -188,9 +192,9 @@ export class WriteAllowlist {
   }
 
   private persist(): void {
-    mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
+    ensureSecureDir(dirname(this.filePath));
     const payload: AllowlistFile = { version: 1, directories: [...this.directories] };
-    writeFileSync(this.filePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    writeSecureFile(this.filePath, `${JSON.stringify(payload, null, 2)}\n`);
     try {
       this.mtimeMs = statSync(this.filePath).mtimeMs;
     } catch {

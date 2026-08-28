@@ -1,4 +1,60 @@
 const TOKEN_KEY = "orchestrator.gui.token";
+const THEME_KEY = "orchestrator.gui.theme";
+const DEFAULT_THEME = "grove";
+const THEMES = [
+  { id: "grove", label: "Grove" },
+  { id: "noir", label: "Noir" },
+  { id: "linen", label: "Linen" },
+  { id: "harbor", label: "Harbor" },
+  { id: "ember", label: "Ember" },
+  { id: "paper", label: "Paper" },
+];
+
+function isThemeId(value) {
+  return THEMES.some((theme) => theme.id === value);
+}
+
+function readStoredTheme() {
+  try {
+    const stored = localStorage.getItem(THEME_KEY);
+    return isThemeId(stored) ? stored : DEFAULT_THEME;
+  } catch {
+    return DEFAULT_THEME;
+  }
+}
+
+function themeOptionsHtml(selected) {
+  const current = isThemeId(selected) ? selected : DEFAULT_THEME;
+  return THEMES.map(
+    (theme) =>
+      `<option value="${escapeHtml(theme.id)}"${theme.id === current ? " selected" : ""}>${escapeHtml(theme.label)}</option>`,
+  ).join("");
+}
+
+function themePickerMarkup(selectId) {
+  const current = readStoredTheme();
+  return `<label class="theme-field" for="${escapeHtml(selectId)}">
+      Theme
+      <select id="${escapeHtml(selectId)}" class="theme-select" aria-label="Theme">${themeOptionsHtml(current)}</select>
+    </label>`;
+}
+
+function applyTheme(id) {
+  const theme = isThemeId(id) ? id : DEFAULT_THEME;
+  document.documentElement.setAttribute("data-theme", theme);
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    /* private mode / blocked storage */
+  }
+  for (const select of document.querySelectorAll(".theme-select")) {
+    if (![...select.options].some((option) => option.value === theme) || select.options.length !== THEMES.length) {
+      select.innerHTML = themeOptionsHtml(theme);
+    } else {
+      select.value = theme;
+    }
+  }
+}
 
 function $(id) {
   return document.getElementById(id);
@@ -11,6 +67,33 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function backendEntry(id) {
+  return (catalog.backends ?? []).find((b) => b.id === id);
+}
+
+function backendDisplayName(id) {
+  const known = backendEntry(id);
+  return (known?.nickname || id || "").trim() || id;
+}
+
+function logoSrc(id) {
+  return `/api/backends/${encodeURIComponent(id)}/logo?token=${encodeURIComponent(token)}`;
+}
+
+function avatarMarkup(id, hasLogo) {
+  if (!id || id === "user" || id === "orchestrator") {
+    const letter = id === "user" ? "Y" : id === "orchestrator" ? "O" : "?";
+    return `<span class="avatar avatar-letter" aria-hidden="true">${letter}</span>`;
+  }
+  const known = backendEntry(id);
+  const showLogo = hasLogo ?? known?.hasLogo;
+  const letter = String((known?.nickname || id).trim().charAt(0) || "?").toUpperCase();
+  if (showLogo) {
+    return `<img class="avatar" alt="" src="${escapeHtml(logoSrc(id))}" />`;
+  }
+  return `<span class="avatar avatar-letter" aria-hidden="true">${escapeHtml(letter)}</span>`;
 }
 
 function tokenFromLocation() {
@@ -30,6 +113,7 @@ let token = tokenFromLocation();
 let catalog = { backends: [], specialists: [], workflows: [], writePolicy: { allowedDirectories: [], defaultCwd: "" }, localRuntime: {} };
 let runs = [];
 let localModels = null;
+let localServers = { ollama: null, llamacpp: [], llamaServerBinary: null, ollamaBinary: null };
 let selectedRunId = null;
 let events = null;
 let threads = [];
@@ -110,7 +194,7 @@ async function api(path, options = {}) {
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     throw new Error(
-      /NetworkError|Failed to fetch|Load failed|network/i.test(raw)
+      /NetworkError|Failed to fetch|Load failed|fetch failed|network/i.test(raw)
         ? "Lost connection to the orchestrator GUI (127.0.0.1). Stay on Local models while vLLM starts (often several minutes). If you opened this page without ?token=, paste the token from the terminal."
         : raw,
     );
@@ -158,9 +242,34 @@ function flash(message, kind = "ok") {
   return `<div class="flash ${kind}">${escapeHtml(message)}</div>`;
 }
 
+function isTransientVllmWaitLog(text) {
+  if (!text) return true;
+  const t = String(text).trim();
+  if (/^(fetch failed|Failed to fetch|Load failed|NetworkError|ECONNREFUSED|UND_ERR_CONNECT)/i.test(t)) return true;
+  if (/fetch failed/i.test(t) && t.length < 120) return true;
+  return /Waiting for GET \/v1\/models/i.test(t) && /connection refused/i.test(t);
+}
+
+function vllmStartingDetail(vllm) {
+  const raw = vllm.startJob?.lastLog || vllm.lastLog || "";
+  if (isTransientVllmWaitLog(raw)) {
+    return "Waiting for GET /v1/models… Intel Docker is loading weights (often several minutes). Connection refused is normal until the API binds.";
+  }
+  return raw;
+}
+
+function vllmErrorDetail(vllm) {
+  const raw = vllm.startJob?.error || vllm.lastError || "vLLM failed to start";
+  const cleaned = String(raw).replace(/(Last log:\s*)fetch failed/gi, "$1(no HTTP yet while loading weights)");
+  if (isTransientVllmWaitLog(cleaned)) {
+    return "vLLM exited before GET /v1/models was ready. That is not a GUI network error — inspect the container log. Connection refused during weight load is expected.";
+  }
+  return cleaned;
+}
+
 function pill(ready, reason) {
   if (ready) return `<span class="pill ok">ready</span>`;
-  const label = /vLLM not running/i.test(reason ?? "") ? "not ready" : "missing";
+  const label = /vLLM not running|Ollama not running|llama\.cpp not running/i.test(reason ?? "") ? "not ready" : "missing";
   return `<span class="pill warn" title="${escapeHtml(reason ?? "")}">${label}</span>`;
 }
 
@@ -193,7 +302,11 @@ function renderThreadList() {
   }
   el.innerHTML = threads
     .map((t) => {
-      const agents = (t.agents ?? []).filter((a) => a && a !== "user" && a !== "orchestrator").slice(0, 3).join(" · ");
+      const agents = (t.agents ?? [])
+        .filter((a) => a && a !== "user" && a !== "orchestrator")
+        .slice(0, 3)
+        .map((a) => backendDisplayName(a))
+        .join(" · ");
       return `<button type="button" class="thread-item ${t.id === active ? "active" : ""}" data-thread="${escapeHtml(t.id)}" role="listitem">
         <span>${escapeHtml(t.title || "New chat")}</span>
         ${agents ? `<small>${escapeHtml(agents)}</small>` : ""}
@@ -205,7 +318,7 @@ function renderThreadList() {
 function pinOptions(selected) {
   const extras = (catalog.backends ?? [])
     .filter((b) => !["cursor-local", "cursor-cloud", "gemini"].includes(b.id))
-    .map((b) => `<option value="${escapeHtml(b.id)}" ${selected === b.id ? "selected" : ""}>${escapeHtml(b.id)}</option>`)
+    .map((b) => `<option value="${escapeHtml(b.id)}" ${selected === b.id ? "selected" : ""}>${escapeHtml(b.nickname ? `${b.nickname} (${b.id})` : b.id)}</option>`)
     .join("");
   const backendPin = selected && !["auto", "debate", "single"].includes(selected) ? selected : "";
   return `
@@ -277,6 +390,7 @@ function renderMessages() {
           : "";
       return `<article class="msg ${role}" data-id="${escapeHtml(m.id)}">
         <div class="msg-meta">
+          ${avatarMarkup(m.speaker)}
           <span class="speaker">${escapeHtml(m.label || m.speaker || role)}</span>
           <span>${escapeHtml(formatTime(m.createdAt))}${escapeHtml(round)}</span>
         </div>
@@ -379,6 +493,7 @@ function ensureChatLayout() {
               <a href="#config" data-page="config">Config</a>
               <a href="#dispatch" data-page="dispatch">Run workflow</a>
               <a href="#runs" data-page="runs">Runs</a>
+              ${themePickerMarkup("theme-select-chat")}
             </nav>
           </details>
         </div>
@@ -445,6 +560,24 @@ function renderOverview() {
         <p class="muted">Bound to localhost only. Cloud agents cannot reach it. Auto prefers it for drafts when it is running.</p>
       </article>
       <article class="card">
+        <h2>Ollama</h2>
+        <p>${runtime.ollama?.running ? `running · ${escapeHtml(runtime.ollama.model ?? "")}` : "not running"}</p>
+        <p class="mono muted">${escapeHtml(runtime.ollama?.baseUrl ?? "http://127.0.0.1:11434/v1")}</p>
+        <p class="muted">${escapeHtml(runtime.ollama?.reason ?? "Detect a daemon on 127.0.0.1:11434, then Register on Local models.")}</p>
+      </article>
+      <article class="card">
+        <h2>llama.cpp</h2>
+        <p>${
+          (runtime.llamacpp ?? []).some((row) => row.running)
+            ? (runtime.llamacpp ?? [])
+                .filter((row) => row.running)
+                .map((row) => `${row.id ?? "llamacpp"} · ${row.model ?? ""}`)
+                .join("; ")
+            : "no loopback llama-server registered"
+        }</p>
+        <p class="muted">Connect to a user-started <span class="mono">llama-server</span> on 127.0.0.1. GGUF weights are not the vLLM catalog.</p>
+      </article>
+      <article class="card">
         <h2>Default cwd</h2>
         <p class="mono">${escapeHtml(policy.defaultCwd ?? "")}</p>
         <p class="muted">Used when chat omits cwd. Must sit inside the allowlist.</p>
@@ -453,6 +586,11 @@ function renderOverview() {
         <h2>Allowed directories</h2>
         <p>${(policy.allowedDirectories ?? []).length} granted</p>
         <p class="muted">Local Cursor agents cannot write elsewhere.</p>
+      </article>
+      <article class="card">
+        <h2>Theme</h2>
+        <p class="muted">Look for this browser. Stored locally, not in git.</p>
+        ${themePickerMarkup("theme-select-overview")}
       </article>
     </div>
     <div class="card" style="margin-top:0.85rem">
@@ -521,6 +659,8 @@ async function renderBackends() {
         b.id === "gemini" ||
         /generativelanguage\.googleapis\.com/i.test(b.baseUrl ?? "") ||
         geminiModels.length > 0;
+      const localCompat = b.type === "ollama" || b.type === "llamacpp";
+      const localModelsList = b.modelChoices ?? [];
       const modelForm = isGemini
         ? `<form class="backend-model-form" data-backend="${escapeHtml(b.id)}">
             <label class="field">Model (one id, not a list)
@@ -530,11 +670,36 @@ async function renderBackends() {
             <p class="muted">Google OpenAI-compat expects a bare id such as gemini-3.6-flash (not models/…, not 1.5/2.0). Datalist is live ListModels when the key works, else the 2026 catalog.</p>
             <div class="actions"><button type="submit">Save model</button></div>
           </form>`
-        : "";
+        : localCompat
+          ? `<form class="backend-model-form" data-backend="${escapeHtml(b.id)}">
+            <label class="field">Model
+              <input name="model" list="local-models-${escapeHtml(b.id)}" value="${escapeHtml(b.model ?? "")}" required placeholder="${b.type === "ollama" ? "llama3.1" : "local"}" autocomplete="off" />
+            </label>
+            <datalist id="local-models-${escapeHtml(b.id)}">${localModelsList.map((m) => `<option value="${escapeHtml(m)}"></option>`).join("")}</datalist>
+            <p class="muted">${b.type === "ollama" ? "Ollama tag from /api/tags when the daemon is up." : "Model id llama-server reports on /v1/models (often the GGUF filename or --alias)."}</p>
+            <div class="actions"><button type="submit">Save model</button></div>
+          </form>`
+          : "";
+      const identityForm = `<form class="backend-nick-form" data-backend="${escapeHtml(b.id)}">
+            <label class="field">Nickname
+              <input name="nickname" type="text" maxlength="48" value="${escapeHtml(b.nickname ?? "")}" placeholder="Display name in chat" autocomplete="off" />
+            </label>
+            <div class="actions"><button type="submit">Save nickname</button></div>
+          </form>
+          <div class="backend-logo">
+            <label class="field">Logo (PNG, JPEG, or WebP · 512 KiB max)
+              <input class="backend-logo-input" type="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" data-backend="${escapeHtml(b.id)}" />
+            </label>
+            ${b.hasLogo ? `<button type="button" class="btn secondary" data-logo-remove="${escapeHtml(b.id)}">Remove logo</button>` : ""}
+          </div>`;
       return `
       <article class="card">
-        <div class="row">
-          <h3 class="mono">${escapeHtml(b.id)}</h3>
+        <div class="row backend-head">
+          ${avatarMarkup(b.id, b.hasLogo)}
+          <div class="backend-title">
+            <h3 class="${b.nickname ? "" : "mono"}">${escapeHtml(b.nickname || b.id)}</h3>
+            ${b.nickname ? `<p class="muted mono" style="margin:0">${escapeHtml(b.id)}</p>` : ""}
+          </div>
           ${pill(b.ready, b.reason)}
           ${writePill(b.writesLocalFiles)}
         </div>
@@ -543,6 +708,7 @@ async function renderBackends() {
         <p>${escapeHtml(b.reason ?? (b.ready ? "API key present (masked; never displayed)." : ""))}</p>
         <p class="muted">capabilities: ${escapeHtml((b.capabilities ?? []).join(", "))}</p>
         ${modelForm}
+        ${identityForm}
         ${keyForm}
       </article>`;
     })
@@ -551,23 +717,63 @@ async function renderBackends() {
     <div class="page-title">
       <div>
         <h1>Backends</h1>
-        <p>Ready vs missing keys. Secrets are never shown in full. Adding a key here or in <span class="mono">.env</span> takes effect after Reload env.</p>
+        <p>Ready vs missing keys. Nicknames and logos appear in chat. Logos stay in <span class="mono">.orchestrator/logos</span> (not git). Secrets are never shown in full. Adding a key here or in <span class="mono">.env</span> takes effect after Reload env.</p>
       </div>
       <button type="button" id="reload-env" class="btn secondary">Reload env</button>
     </div>
     <div id="backends-status"></div>
     <div class="cards">${cards}</div>
+    <div class="card" style="margin-top:0.85rem">
+      <h2>MCP HTTP (any client)</h2>
+      <p class="muted">Streamable HTTP at <span class="mono">http://127.0.0.1:8787/mcp</span>. Requires <span class="mono">Authorization: Bearer</span> (same loopback token as this GUI). Path is <span class="mono">/mcp</span>. Unauthenticated calls return 401. Stdio MCP is unchanged.</p>
+      <p class="muted">Optional ClearPass / ISE (RADIUS) and Active Directory (LDAPS) are off until you set <span class="mono">AGENT_ORCHESTRATOR_MCP_AUTH</span> in <span class="mono">.env</span>. Secrets below never go in YAML.</p>
+      <form class="secret-form" data-name="RADIUS_SECRET">
+        <label class="field">RADIUS_SECRET (ClearPass / ISE shared secret)
+          <input name="value" type="password" autocomplete="off" placeholder="${secretSet.get("RADIUS_SECRET") ? "set — paste to replace" : "optional"}" />
+        </label>
+        <div class="actions"><button type="submit">Save</button>${secretSet.get("RADIUS_SECRET") ? ` <button type="button" class="btn secondary" data-clear-secret="RADIUS_SECRET">Clear</button>` : ""}</div>
+      </form>
+      <form class="secret-form" data-name="LDAP_BIND_PASSWORD">
+        <label class="field">LDAP_BIND_PASSWORD (optional AD service bind)
+          <input name="value" type="password" autocomplete="off" placeholder="${secretSet.get("LDAP_BIND_PASSWORD") ? "set — paste to replace" : "optional"}" />
+        </label>
+        <div class="actions"><button type="submit">Save</button>${secretSet.get("LDAP_BIND_PASSWORD") ? ` <button type="button" class="btn secondary" data-clear-secret="LDAP_BIND_PASSWORD">Clear</button>` : ""}</div>
+      </form>
+    </div>
     <form id="vllm-form" class="card" style="margin-top:0.85rem">
       <h2>Add vLLM backend</h2>
       <p class="muted">OpenAI-compatible HTTP API. Typical URL <span class="mono">http://127.0.0.1:8000/v1</span>. API key optional. Multiple endpoints = multiple backend ids / ports.</p>
       <label class="field">Backend id <input name="id" type="text" required placeholder="vllm-local" /></label>
       <label class="field">Base URL <input name="baseUrl" type="text" placeholder="http://127.0.0.1:8000/v1" /></label>
       <label class="field">Model <input name="model" type="text" required placeholder="meta-llama/Llama-3.1-8B-Instruct" /></label>
+      <label class="field">Optional nickname <input name="nickname" type="text" maxlength="48" placeholder="Arc Qwen" autocomplete="off" /></label>
       <label class="field">Optional API key env name <input name="apiKeyEnv" type="text" placeholder="VLLM_API_KEY" /></label>
       <label class="field">Optional API key <input name="apiKey" type="password" autocomplete="off" /></label>
       <label class="field">Optional specialist id <input name="specialistId" type="text" placeholder="vllm-chat" /></label>
       <div class="actions"><button type="submit">Add vLLM backend</button></div>
       <div id="vllm-status"></div>
+    </form>
+    <form id="ollama-form" class="card" style="margin-top:0.85rem">
+      <h2>Add Ollama backend</h2>
+      <p class="muted">Loopback OpenAI-compat API. Typical URL <span class="mono">http://127.0.0.1:11434/v1</span>. Install and run Ollama yourself; this GUI only detects and registers it. Non-loopback hosts are refused.</p>
+      <label class="field">Backend id <input name="id" type="text" required placeholder="ollama" /></label>
+      <label class="field">Base URL <input name="baseUrl" type="text" placeholder="http://127.0.0.1:11434/v1" /></label>
+      <label class="field">Model <input name="model" type="text" required placeholder="llama3.1" /></label>
+      <label class="field">Optional nickname <input name="nickname" type="text" maxlength="48" placeholder="Ollama" autocomplete="off" /></label>
+      <label class="field">Optional specialist id <input name="specialistId" type="text" placeholder="ollama-chat" /></label>
+      <div class="actions"><button type="submit">Add Ollama backend</button></div>
+      <div id="ollama-status"></div>
+    </form>
+    <form id="llamacpp-form" class="card" style="margin-top:0.85rem">
+      <h2>Add llama.cpp backend</h2>
+      <p class="muted">Connect to a user-started <span class="mono">llama-server</span> OpenAI API. Example: <span class="mono">llama-server -m model.gguf --host 127.0.0.1 --port 8080</span>. GGUF files are not vLLM Hugging Face snapshots. Bind 127.0.0.1 only.</p>
+      <label class="field">Backend id <input name="id" type="text" required placeholder="llamacpp" /></label>
+      <label class="field">Base URL <input name="baseUrl" type="text" placeholder="http://127.0.0.1:8080/v1" /></label>
+      <label class="field">Model <input name="model" type="text" required placeholder="local" /></label>
+      <label class="field">Optional nickname <input name="nickname" type="text" maxlength="48" placeholder="llama.cpp" autocomplete="off" /></label>
+      <label class="field">Optional specialist id <input name="specialistId" type="text" placeholder="llamacpp-chat" /></label>
+      <div class="actions"><button type="submit">Add llama.cpp backend</button></div>
+      <div id="llamacpp-status"></div>
     </form>
   `;
 }
@@ -655,7 +861,9 @@ function renderLocalModels() {
   const dockerImages = docker.images ?? [];
   const preferredDocker = docker.preferred?.ref ?? docker.preferred;
   const preferDocker = data.preferredRuntime === "docker" || Boolean(preferredDocker && backend === "intel-xpu");
-  const recIds = new Set((data.recommended ?? []).map((m) => m.id));
+  const recIds = new Set(
+    (data.recommended ?? []).filter((m) => m.fits && m.newest).map((m) => m.id),
+  );
   const jobs = new Map((data.jobs ?? []).map((j) => [j.modelId, j]));
   const phase = vllm.phase ?? (vllm.healthy ? "running" : vllm.running ? "starting" : "idle");
   const instances = Array.isArray(vllm.instances) && vllm.instances.length
@@ -672,7 +880,16 @@ function renderLocalModels() {
     .map((m) => {
       const job = jobs.get(m.id);
       const rec = recIds.has(m.id) ? `<span class="pill ok">recommended</span>` : "";
-      const fit = m.fits ? `<span class="pill ok">fits</span>` : `<span class="pill warn">no fit</span>`;
+      const newest = m.newest ? `<span class="pill">newest</span>` : `<span class="pill">previous</span>`;
+      const gated = m.gated ? `<span class="pill warn">gated</span>` : "";
+      const fit =
+        m.fitKind === "needs_tp" || m.parallel > 1
+          ? `<span class="pill warn">needs TP</span>`
+          : m.fits
+            ? `<span class="pill ok">fits</span>`
+            : m.fitKind === "incompatible"
+              ? `<span class="pill warn">incompatible</span>`
+              : `<span class="pill warn">too big</span>`;
       const dl = m.downloaded ? `<span class="pill ok">downloaded</span>` : `<span class="pill">not downloaded</span>`;
       const inst = instanceFor(m);
       const thisStarting = Boolean(inst && inst.phase === "starting");
@@ -702,12 +919,19 @@ function renderLocalModels() {
       }
       return `<tr>
         <td>
-          <strong>${escapeHtml(m.name)}</strong>
-          <div class="muted mono">${escapeHtml(m.id)}</div>
-          ${rec} ${fit} ${dl} ${run}
+          <div class="row backend-head">
+            ${avatarMarkup(m.backendId)}
+            <div>
+              <strong>${escapeHtml(m.name)}</strong>
+              ${backendEntry(m.backendId)?.nickname ? `<div class="muted">${escapeHtml(backendDisplayName(m.backendId))}</div>` : ""}
+              <div class="muted mono">${escapeHtml(m.id)}</div>
+            </div>
+          </div>
+          ${rec} ${newest} ${gated} ${fit} ${dl} ${run}
+          ${m.gated && !data.hfTokenSet ? `<p class="muted">Gated: accept the Hugging Face license, then save a token above.</p>` : ""}
           ${progress}
         </td>
-        <td class="mono">${escapeHtml(m.quantization)} · ${escapeHtml(String(m.paramsB))}B<br/>~${escapeHtml(String(m.vramNeededMiB))} MiB w/ KV</td>
+        <td class="mono">${escapeHtml(m.quantization)} · ${escapeHtml(String(m.paramsB))}B<br/>~${escapeHtml(String(m.vramNeededMiB))} MiB w/ KV${m.parallel > 1 ? ` · TP ${escapeHtml(String(m.parallel))}` : ""}</td>
         <td>${escapeHtml(m.fitReason)}</td>
         <td>
           <div class="actions">
@@ -729,7 +953,7 @@ function renderLocalModels() {
   const statusFlash = starting
     ? flash("Starting… Intel containers often take several minutes. Stay on this page. Other models can still be started.", "ok")
     : phase === "error" && !healthy
-      ? flash(vllm.startJob?.error || vllm.lastError || "vLLM failed to start", "bad")
+      ? flash(vllmErrorDetail(vllm), "bad")
       : healthy
         ? flash(
             `Ready backends: ${instances
@@ -739,19 +963,36 @@ function renderLocalModels() {
             "ok",
           )
         : "";
+  const hfTokenSet = Boolean(data.hfTokenSet);
   $("main").innerHTML = `
     <div class="page-title">
       <div>
         <h1>Local models</h1>
-        <p>Hardware-aware catalog. Start several models at once (each gets its own 127.0.0.1 port, container, and backend id). Stop or Remove from mix one without tearing the others down. Chat Auto uses every ready vLLM as a round-table speaker.</p>
+        <p>Hardware-aware catalog for vLLM (Hugging Face snapshots). Ollama and llama.cpp are separate loopback OpenAI APIs — register them below or on Backends. Two or more GPUs of the same vendor can tensor-parallel a vLLM model that does not fit on one card (combined VRAM). Start several vLLM models at once (each gets its own 127.0.0.1 port, container, and backend id). Chat Auto uses every ready local server (vLLM, Ollama, llama.cpp) as a round-table speaker.</p>
       </div>
     </div>
     <div id="local-models-status">${statusFlash}</div>
+    <div class="card" style="margin-bottom:0.85rem">
+      <h2>Hugging Face token</h2>
+      <p class="muted">Gated models (Gemma 2, Llama, Mistral 7B, and others) need two steps: accept the license on the model card while logged into your Hugging Face account, then paste a <strong>read</strong> access token here. Stored in gitignored <span class="mono">.orchestrator/secrets.env</span> (POSIX mode 0600). This UI never shows the value again. Gemma 2 weights are under Google’s Gemma Terms of Use. Gemma 4 is Apache 2.0 and ungated on Hugging Face.</p>
+      <p>${hfTokenSet ? `<span class="pill ok">configured</span> <span class="muted">Token is set (value never displayed). Paste a new one to rotate.</span>` : `<span class="pill warn">not configured</span> <span class="muted">Downloads of gated repos will fail with 401 until a token is saved.</span>`}</p>
+      <p class="muted"><a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer">Open Hugging Face token page</a> — create a token, copy it, paste below. This app does not use OAuth or a public callback.</p>
+      <form id="hf-token-form" class="secret-form" data-name="HF_TOKEN">
+        <label class="field">HF_TOKEN (stored locally, never shown in full)
+          <input name="value" type="password" autocomplete="off" placeholder="${hfTokenSet ? "set — paste to replace" : "hf_…"}" />
+        </label>
+        <div class="actions">
+          <button type="submit">Save HF token</button>
+          ${hfTokenSet ? `<button type="button" class="btn secondary" data-clear-secret="HF_TOKEN">Clear token</button>` : ""}
+        </div>
+        <div class="secret-status"></div>
+      </form>
+    </div>
     <div class="cards">
       <article class="card">
         <h2>Hardware</h2>
         <p>${escapeHtml(gpuLine)}</p>
-        <p class="muted">Backend ${escapeHtml(backendLabel)} · ${escapeHtml(String(hw.deviceCount ?? accelerators.length ?? 0))} device(s) · ${escapeHtml(String(hw.totalVramMiB ?? hw.vramMiB ?? "?"))} MiB total · RAM ${escapeHtml(String(hw.ramMiB ?? "?"))} MiB · ${escapeHtml(String(hw.cpuCount ?? "?"))} CPUs${hw.constrained ? " · CPU fallback (no accelerator)" : ""}</p>
+        <p class="muted">Backend ${escapeHtml(backendLabel)} · ${escapeHtml(String(hw.deviceCount ?? accelerators.length ?? 0))} device(s) · ${escapeHtml(String(hw.totalVramMiB ?? hw.vramMiB ?? "?"))} MiB total · RAM ${escapeHtml(String(hw.ramMiB ?? "?"))} MiB · ${escapeHtml(String(hw.cpuCount ?? "?"))} CPUs${hw.constrained ? " · CPU fallback (no accelerator)" : ""}${(hw.deviceCount ?? accelerators.length ?? 0) > 1 ? " · tensor parallel available for models that need more than one card" : ""}</p>
         ${(hw.notes ?? []).map((n) => `<p class="muted">${escapeHtml(n)}</p>`).join("")}
       </article>
       <article class="card">
@@ -763,7 +1004,7 @@ function renderLocalModels() {
         }
         <p class="muted">${
           starting
-            ? escapeHtml(vllm.startJob?.lastLog || vllm.lastLog || vllm.modelId || "Waiting for GET /v1/models…")
+            ? escapeHtml(vllmStartingDetail(vllm) || vllm.modelId || "Waiting for GET /v1/models…")
             : healthy
               ? "Each row is a separate container/process. Stop removes that instance only; Remove from mix also deletes its backend from agents.config.yaml."
               : vllm.installed
@@ -771,6 +1012,39 @@ function renderLocalModels() {
                 : escapeHtml(vllm.installHint ?? "Install the serving stack that matches this GPU.")
         }</p>
         ${phase === "error" && (vllm.startJob?.lastLog || vllm.lastLog) ? `<pre class="muted" style="white-space:pre-wrap">${escapeHtml(String(vllm.startJob?.lastLog || vllm.lastLog).slice(-1500))}</pre>` : ""}
+      </article>
+      <article class="card">
+        <h2>Ollama</h2>
+        <p>${localServers.ollama?.running ? `<span class="pill ok">running</span>` : `<span class="pill warn">not running</span>`} ${escapeHtml(localServers.ollama?.origin ?? "http://127.0.0.1:11434")}</p>
+        <p class="muted">${escapeHtml(localServers.ollama?.reason ?? "Probe loopback 11434. Install Ollama yourself — this app does not download it.")}${
+          localServers.ollamaBinary ? ` Found <span class="mono">${escapeHtml(localServers.ollamaBinary)}</span> on PATH.` : ""
+        }</p>
+        ${
+          (localServers.ollama?.models ?? []).length
+            ? `<ul>${localServers.ollama.models.map((m) => `<li class="mono">${escapeHtml(m)}</li>`).join("")}</ul>`
+            : `<p class="muted">No tags yet. Run <span class="mono">ollama pull llama3.1</span> then Register.</p>`
+        }
+        <div class="actions">
+          <button type="button" class="btn" id="ollama-connect" ${localServers.ollama?.running ? "" : "disabled"}>Register Ollama backend</button>
+        </div>
+      </article>
+      <article class="card">
+        <h2>llama.cpp</h2>
+        ${
+          (localServers.llamacpp ?? []).length
+            ? `<ul>${localServers.llamacpp
+                .map(
+                  (row) =>
+                    `<li><span class="mono">${escapeHtml(row.id ?? "llamacpp")}</span> · ${row.running ? "ready" : "not running"} · ${escapeHtml(row.baseUrl ?? "")} · ${escapeHtml(row.model || (row.models ?? [])[0] || "")}</li>`,
+                )
+                .join("")}</ul>`
+            : `<p>No llama.cpp backend configured.</p>`
+        }
+        <p class="muted">${
+          localServers.llamaServerBinary
+            ? `Found <span class="mono">llama-server</span> at ${escapeHtml(localServers.llamaServerBinary)}. Start it yourself with <span class="mono">--host 127.0.0.1</span>, then add the backend on Settings → Backends. This app does not download GGUF files.`
+            : `Start <span class="mono">llama-server -m model.gguf --host 127.0.0.1 --port 8080</span> then add a backend. GGUF is not the vLLM Hugging Face catalog.`
+        }</p>
       </article>
       <article class="card">
         <h2>Cursor cloud</h2>
@@ -799,22 +1073,25 @@ function renderLocalModels() {
       <h2>Recommended for this machine</h2>
       <ul>${
         (data.recommended ?? [])
-          .map(
-            (m) =>
-              `<li><span class="mono">${escapeHtml(m.id)}</span> · ${escapeHtml(m.name)} · ${escapeHtml(m.quantization)} · ~${escapeHtml(String(m.vramNeededMiB))} MiB${m.parallel > 1 ? ` · TP ${escapeHtml(String(m.parallel))}` : ""}</li>`,
-          )
+          .map((m) => {
+            const fit =
+              m.fitKind === "needs_tp" || m.parallel > 1
+                ? "needs TP"
+                : m.fits
+                  ? "fits"
+                  : m.fitKind === "incompatible"
+                    ? "incompatible"
+                    : "too big";
+            const gen = m.newest ? "newest" : "previous";
+            return `<li><span class="mono">${escapeHtml(m.id)}</span> · ${escapeHtml(m.name)} · ${escapeHtml(m.quantization)} · ${escapeHtml(fit)} · ${escapeHtml(gen)} · ~${escapeHtml(String(m.vramNeededMiB))} MiB${m.parallel > 1 ? ` · TP ${escapeHtml(String(m.parallel))}` : ""}</li>`;
+          })
           .join("") || "<li class='muted'>Nothing in the catalog fits. Use a smaller model, or add GPU VRAM.</li>"
       }</ul>
-      <p class="muted">Models dir: <span class="mono">${escapeHtml(data.modelsDir ?? "")}</span>${data.hfTokenSet ? " · HF token set" : " · optional HF_TOKEN for gated repos"}</p>
-      <form id="hf-token-form" class="secret-form" data-name="HF_TOKEN">
-        <label class="field">HF_TOKEN (gated repos; stored locally, never shown in full)
-          <input name="value" type="password" autocomplete="off" placeholder="${data.hfTokenSet ? "set — paste to replace" : "hf_…"}" />
-        </label>
-        <div class="actions"><button type="submit">Save HF token</button></div>
-      </form>
+      <p class="muted">Every catalog snapshot that fits this hardware (no top-N cap), newest generation per family (Gemma 4 over Gemma 2/3, Qwen3.8 over 2.5). Older gens stay in the table below for download. Models dir: <span class="mono">${escapeHtml(data.modelsDir ?? "")}</span>${hfTokenSet ? " · HF token configured" : " · save an HF token above for gated repos"}</p>
     </div>
     <div class="card" style="margin-top:0.85rem">
       <h2>Catalog</h2>
+      <p class="muted">Full list, including older generations. Gated repos show a gated pill; Gemma 4 is ungated Apache 2.0. Download and Start are in the table.</p>
       <table>
         <thead><tr><th>Model</th><th>Size / VRAM</th><th>Fit</th><th></th></tr></thead>
         <tbody>${rows || `<tr><td colspan="4" class="muted">Catalog unavailable.</td></tr>`}</tbody>
@@ -931,6 +1208,14 @@ async function loadLocalModels() {
   localModels = await api("/api/local-models");
 }
 
+async function loadLocalServers() {
+  try {
+    localServers = await api("/api/local-servers");
+  } catch {
+    localServers = { ollama: { running: false, models: [] }, llamacpp: [], llamaServerBinary: null, ollamaBinary: null };
+  }
+}
+
 async function loadRuns() {
   runs = await api("/api/runs?limit=100");
   if (selectedRunId) {
@@ -995,6 +1280,7 @@ async function render() {
   } else if (page === "dispatch") renderDispatch();
   else if (page === "local-models") {
     await loadLocalModels();
+    await loadLocalServers();
     renderLocalModels();
   } else if (page === "allowlist") renderAllowlist();
   else if (page === "config") {
@@ -1029,6 +1315,10 @@ function connectEvents() {
     catalog = JSON.parse(ev.data);
     if (["overview", "specialists", "backends", "allowlist", "dispatch", "local-models"].includes(pageId())) {
       render();
+    } else if (pageId() === "chat") {
+      renderChatHeader();
+      renderMessages();
+      renderThreadList();
     }
   });
   events.addEventListener("local-models", (ev) => {
@@ -1106,10 +1396,45 @@ $("shell").addEventListener("click", (event) => {
   }
 });
 
-$("main").addEventListener("change", (event) => {
+document.addEventListener("change", (event) => {
+  const select = event.target?.closest?.(".theme-select");
+  if (!select) return;
+  applyTheme(select.value);
+});
+
+$("main").addEventListener("change", async (event) => {
   if (event.target?.id === "chat-thread-pick") {
     const id = event.target.value;
     if (id) location.hash = `#chat/${id}`;
+    return;
+  }
+  const logoInput = event.target?.closest?.(".backend-logo-input");
+  if (!(logoInput instanceof HTMLInputElement) || !logoInput.files?.[0]) return;
+  const backendId = logoInput.getAttribute("data-backend");
+  const file = logoInput.files[0];
+  if (!backendId) return;
+  if (file.size > 512 * 1024) {
+    $("backends-status").innerHTML = flash("Logo must be 512 KiB or smaller", "bad");
+    logoInput.value = "";
+    return;
+  }
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(new Error("Could not read logo file"));
+      reader.readAsDataURL(file);
+    });
+    const result = await api(`/api/backends/${encodeURIComponent(backendId)}/logo`, {
+      method: "POST",
+      body: JSON.stringify({ data: dataUrl }),
+    });
+    catalog = result.catalog ?? catalog;
+    await renderBackends();
+    $("backends-status").innerHTML = flash("Logo saved", "ok");
+  } catch (error) {
+    $("backends-status").innerHTML = flash(error.message, "bad");
+    logoInput.value = "";
   }
 });
 
@@ -1199,6 +1524,7 @@ $("main").addEventListener("submit", async (event) => {
           type: "vllm",
           baseUrl: data.get("baseUrl") || undefined,
           model: data.get("model"),
+          nickname: String(data.get("nickname") ?? "").trim() || undefined,
           apiKeyEnv: data.get("apiKeyEnv") || undefined,
           apiKey: data.get("apiKey") || undefined,
           specialist: specialistId
@@ -1209,6 +1535,38 @@ $("main").addEventListener("submit", async (event) => {
       catalog = result.catalog ?? catalog;
       await renderBackends();
       $("vllm-status").innerHTML = flash(`Saved backend ${result.id}`, "ok");
+    } else if (form.id === "ollama-form") {
+      const specialistId = data.get("specialistId") || "ollama-chat";
+      const result = await api("/api/backends", {
+        method: "POST",
+        body: JSON.stringify({
+          id: data.get("id"),
+          type: "ollama",
+          baseUrl: data.get("baseUrl") || undefined,
+          model: data.get("model"),
+          nickname: String(data.get("nickname") ?? "").trim() || undefined,
+          specialist: { id: specialistId, description: `Local Ollama specialist (${data.get("id")})` },
+        }),
+      });
+      catalog = result.catalog ?? catalog;
+      await renderBackends();
+      $("ollama-status").innerHTML = flash(`Saved backend ${result.id}`, "ok");
+    } else if (form.id === "llamacpp-form") {
+      const specialistId = data.get("specialistId") || "llamacpp-chat";
+      const result = await api("/api/backends", {
+        method: "POST",
+        body: JSON.stringify({
+          id: data.get("id"),
+          type: "llamacpp",
+          baseUrl: data.get("baseUrl") || undefined,
+          model: data.get("model"),
+          nickname: String(data.get("nickname") ?? "").trim() || undefined,
+          specialist: { id: specialistId, description: `Local llama.cpp specialist (${data.get("id")})` },
+        }),
+      });
+      catalog = result.catalog ?? catalog;
+      await renderBackends();
+      $("llamacpp-status").innerHTML = flash(`Saved backend ${result.id}`, "ok");
     } else if (form.classList.contains("backend-model-form")) {
       const backendId = form.getAttribute("data-backend");
       const model = String(data.get("model") ?? "").trim();
@@ -1220,6 +1578,17 @@ $("main").addEventListener("submit", async (event) => {
       catalog = result.catalog ?? catalog;
       await renderBackends();
       $("backends-status").innerHTML = flash(`Saved model ${result.model}`, "ok");
+    } else if (form.classList.contains("backend-nick-form")) {
+      const backendId = form.getAttribute("data-backend");
+      if (!backendId) return;
+      const nickname = String(data.get("nickname") ?? "").trim();
+      const result = await api(`/api/backends/${encodeURIComponent(backendId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ nickname }),
+      });
+      catalog = result.catalog ?? catalog;
+      await renderBackends();
+      $("backends-status").innerHTML = flash(nickname ? `Nickname saved as ${nickname}` : "Nickname cleared", "ok");
     } else if (form.classList.contains("secret-form")) {
       const name = form.getAttribute("data-name");
       const value = data.get("value");
@@ -1255,9 +1624,13 @@ $("main").addEventListener("submit", async (event) => {
               ? "allow-status"
               : form.id === "vllm-form"
                 ? "vllm-status"
-                : pageId() === "local-models"
-                  ? "local-models-status"
-                  : "backends-status";
+                : form.id === "ollama-form"
+                  ? "ollama-status"
+                  : form.id === "llamacpp-form"
+                    ? "llamacpp-status"
+                    : pageId() === "local-models"
+                      ? "local-models-status"
+                      : "backends-status";
     if (form.id === "composer-form") {
       const list = $("thread-messages");
       if (list) list.insertAdjacentHTML("beforeend", flash(error.message, "bad"));
@@ -1274,6 +1647,54 @@ $("main").addEventListener("submit", async (event) => {
 $("main").addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
+  const clearSecret = target.closest?.("[data-clear-secret]");
+  if (clearSecret) {
+    const name = clearSecret.getAttribute("data-clear-secret");
+    if (!name) return;
+    try {
+      const result = await api("/api/secrets", {
+        method: "DELETE",
+        body: JSON.stringify({ name }),
+      });
+      catalog = result.catalog ?? catalog;
+      await loadLocalModels();
+      renderLocalModels();
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(`${name} cleared`, "ok");
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  if (target.id === "ollama-connect") {
+    try {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash("Registering Ollama…", "ok");
+      const result = await api("/api/ollama/connect", { method: "POST", body: JSON.stringify({}) });
+      catalog = result.catalog ?? catalog;
+      await loadLocalServers();
+      await loadCatalog();
+      renderLocalModels();
+      if ($("local-models-status")) {
+        $("local-models-status").innerHTML = flash(`Registered Ollama backend ${result.id} · ${result.model}`, "ok");
+      }
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  const logoRemove = target.closest?.("[data-logo-remove]");
+  if (logoRemove) {
+    const backendId = logoRemove.getAttribute("data-logo-remove");
+    if (!backendId) return;
+    try {
+      const result = await api(`/api/backends/${encodeURIComponent(backendId)}/logo`, { method: "DELETE" });
+      catalog = result.catalog ?? catalog;
+      await renderBackends();
+      $("backends-status").innerHTML = flash("Logo removed", "ok");
+    } catch (error) {
+      $("backends-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
   const modeBtn = target.closest?.(".mode-btn");
   if (modeBtn) {
     const mode = modeBtn.getAttribute("data-mode") || "auto";
@@ -1494,4 +1915,5 @@ async function boot() {
   }
 }
 
+applyTheme(readStoredTheme());
 boot();

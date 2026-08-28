@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadConfig, parseOrchestratorConfig, patchBackendModelYaml, validateConfigYaml } from "../src/config.js";
+import { loadConfig, parseOrchestratorConfig, patchBackendModelYaml, patchBackendNicknameYaml, validateConfigYaml } from "../src/config.js";
 import { loadEnvFile } from "../src/env.js";
 import { GEMINI_ONE_ID_ERROR, parseGeminiModelId } from "../src/providers/gemini.js";
 import { OpenAIProvider } from "../src/providers/openai.js";
@@ -157,9 +157,95 @@ specialists:
     backend: gemini
 `;
   const next = patchBackendModelYaml(yaml, "gemini", "gemini-3.6-flash");
-  assert.match(next, /model: gemini-3\.6-flash/);
+  assert.match(next, /model: "gemini-3\.6-flash"/);
   assert.match(next, /vllm-local:/);
   assert.match(next, /Qwen\/Qwen2\.5-0\.5B-Instruct/);
+  const parsed = validateConfigYaml(next);
+  assert.equal(parsed.backends.gemini?.type, "openai");
+  if (parsed.backends.gemini?.type === "openai") {
+    assert.equal(parsed.backends.gemini.model, "gemini-3.6-flash");
+  }
+});
+
+test("patchBackendModelYaml quotes colon tags and rejects newline injection", () => {
+  const yaml = `backends:
+  ollama:
+    type: ollama
+    baseUrl: http://127.0.0.1:11434/v1
+    model: llama3.1
+specialists:
+  chat:
+    description: t
+    backend: ollama
+`;
+  const poison =
+    "llama3.1\n    type: openai\n    baseUrl: https://api.openai.com/v1\n    apiKeyEnv: OPENAI_API_KEY";
+  assert.throws(() => patchBackendModelYaml(yaml, "ollama", poison), /line breaks/);
+  const next = patchBackendModelYaml(yaml, "ollama", "llama3.2:latest");
+  assert.match(next, /model: "llama3\.2:latest"/);
+  assert.doesNotMatch(next, /type: openai/);
+  assert.doesNotMatch(next, /api\.openai\.com/);
+  const parsed = validateConfigYaml(next);
+  assert.equal(parsed.backends.ollama?.type, "ollama");
+  if (parsed.backends.ollama?.type === "ollama") {
+    assert.equal(parsed.backends.ollama.model, "llama3.2:latest");
+    assert.equal(parsed.backends.ollama.baseUrl, "http://127.0.0.1:11434/v1");
+  }
+});
+
+test("parseOrchestratorConfig reads optional nickname", () => {
+  const config = parseOrchestratorConfig({
+    backends: {
+      gemini: {
+        type: "openai",
+        model: "gemini-3.6-flash",
+        apiKeyEnv: "GEMINI_API_KEY",
+        nickname: "  Flash  ",
+      },
+    },
+    specialists: { planner: { description: "x", backend: "gemini" } },
+  });
+  assert.equal(config.backends.gemini?.nickname, "Flash");
+});
+
+test("parseOrchestratorConfig rejects overlong nicknames", () => {
+  assert.throws(
+    () =>
+      parseOrchestratorConfig({
+        backends: {
+          gemini: {
+            type: "openai",
+            model: "gemini-3.6-flash",
+            apiKeyEnv: "GEMINI_API_KEY",
+            nickname: "x".repeat(49),
+          },
+        },
+        specialists: { planner: { description: "x", backend: "gemini" } },
+      }),
+    /48 characters/,
+  );
+});
+
+test("patchBackendNicknameYaml sets and clears nickname without rewriting other backends", () => {
+  const yaml = `backends:
+  gemini:
+    type: openai
+    model: gemini-3.6-flash
+    apiKeyEnv: GEMINI_API_KEY
+  vllm-local:
+    type: vllm
+    model: Qwen/Qwen2.5-0.5B-Instruct
+specialists:
+  chat:
+    description: t
+    backend: gemini
+`;
+  const named = patchBackendNicknameYaml(yaml, "vllm-local", "Arc Qwen");
+  assert.match(named, /nickname: "Arc Qwen"/);
+  assert.match(named, /model: gemini-3\.6-flash/);
+  const cleared = patchBackendNicknameYaml(named, "vllm-local", undefined);
+  assert.equal(/nickname:/.test(cleared.split("vllm-local:")[1]?.split("specialists:")[0] ?? "nickname:"), false);
+  assert.match(cleared, /Qwen\/Qwen2\.5-0\.5B-Instruct/);
 });
 
 test("gemini is ready when GEMINI_API_KEY is set", () => {
@@ -240,6 +326,13 @@ test("repo agents.config.yaml names GEMINI_API_KEY and includes vllm", () => {
     assert.ok(vllm.model.length > 0);
   }
   assert.equal(config.specialists["vllm-chat"]?.backend, "vllm-local");
+  const ollama = config.backends.ollama;
+  assert.equal(ollama?.type, "ollama");
+  if (ollama?.type === "ollama") {
+    assert.equal(ollama.baseUrl, "http://127.0.0.1:11434/v1");
+    assert.ok(ollama.model.length > 0);
+  }
+  assert.equal(config.specialists["ollama-chat"]?.backend, "ollama");
 });
 
 test("vllm type parses and allows multiple endpoints", () => {

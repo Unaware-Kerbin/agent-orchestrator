@@ -1,6 +1,8 @@
 import type {
   AgentProvider,
+  LlamaCppBackendConfig,
   OpenAIBackendConfig,
+  OllamaBackendConfig,
   ProviderHealth,
   ProviderRunRequest,
   ProviderRunResult,
@@ -20,9 +22,9 @@ import {
   envNamesForBackend,
   isLocalOpenAiUrl,
   isUnreachableError,
+  localUnreachableReason,
   normalizeBaseUrl,
   VLLM_LOCAL_DUMMY_KEY,
-  vllmUnreachableReason,
 } from "./keys.js";
 import { extractHttpText, missingKeyHealth, readyHealth, secretFrom } from "./util.js";
 
@@ -33,7 +35,11 @@ function chatModelFor(id: string, config: OpenAiCompatConfig, override?: string,
   return override ?? config.model;
 }
 
-export type OpenAiCompatConfig = OpenAIBackendConfig | VllmBackendConfig;
+export type OpenAiCompatConfig =
+  | OpenAIBackendConfig
+  | VllmBackendConfig
+  | OllamaBackendConfig
+  | LlamaCppBackendConfig;
 
 async function readOpenAiStream(response: Response, onDelta: (delta: string) => void): Promise<string> {
   const reader = response.body?.getReader();
@@ -105,6 +111,7 @@ export async function runOpenAiChat(
   const stream = typeof request.onDelta === "function";
   const body: Record<string, unknown> = { model, messages };
   if (stream) body.stream = true;
+  const timeoutMs = request.timeoutMs ?? 30_000;
 
   try {
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -114,11 +121,22 @@ export async function runOpenAiChat(
         authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const contentType = response.headers.get("content-type") ?? "";
     if (!response.ok) {
       const payload: unknown = await response.json().catch(() => ({ error: response.statusText }));
       const extracted = extractHttpText(payload);
+      if (response.status === 429) {
+        return {
+          status: "error",
+          text: "",
+          error: gemini
+            ? formatGeminiChatError(429, extracted, model)
+            : `${options.label} rate-limited (429) — skipped so other speakers can finish.`,
+          durationMs: Date.now() - started,
+        };
+      }
       return {
         status: "error",
         text: "",
@@ -145,8 +163,7 @@ export async function runOpenAiChat(
       durationMs: Date.now() - started,
     };
   } catch (error) {
-    const unreachable =
-      options.label === "vLLM" ? vllmUnreachableReason(baseUrl, error) : undefined;
+    const unreachable = localUnreachableReason(options.label, baseUrl, error);
     const fallback = error instanceof Error ? error.message : String(error);
     return {
       status: "error",

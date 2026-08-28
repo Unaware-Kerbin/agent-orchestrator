@@ -29,6 +29,11 @@ export interface ChatMessage {
   chip?: string;
   error?: string;
   suggestedAction?: ChatSuggestedAction;
+  /** Backend nickname when set — prefer this over the raw model id. */
+  nickname?: string;
+  hasLogo?: boolean;
+  /** Loopback URL (no token). Late/GUI fetch with Bearer. */
+  logoUrl?: string;
 }
 
 export interface ChatHeartbeatPayload {
@@ -77,6 +82,8 @@ export interface ChatThread {
   pendingApproval?: PendingApproval;
   createdAt: number;
   updatedAt: number;
+  /** True while respond() is in flight. Not persisted; MCP/Late poll this. */
+  busy?: boolean;
 }
 
 export interface ChatThreadSummary {
@@ -95,6 +102,8 @@ export interface RouterBackend {
   runtime?: "local" | "cloud";
   model?: string;
   reason?: string;
+  nickname?: string;
+  hasLogo?: boolean;
 }
 
 export interface RouterSpecialist {
@@ -126,6 +135,8 @@ export interface RouterContext {
   allowedDirectories?: string[];
   /** Pre-resolved workspace from ChatService (realpath + allowlist). */
   workspace?: WorkspaceHint;
+  /** Backends that already timed out or 429'd on this thread — skip on follow-up. */
+  skipBackendIds?: string[];
 }
 
 export interface RouteSpeaker {
@@ -133,6 +144,9 @@ export interface RouteSpeaker {
   specialist: string;
   label: string;
   writesLocalFiles: boolean;
+  nickname?: string;
+  hasLogo?: boolean;
+  logoUrl?: string;
 }
 
 export type ControlKind = "hardware" | "models" | "start_vllm" | "stop_vllm" | "vllm_status" | "allowlist";

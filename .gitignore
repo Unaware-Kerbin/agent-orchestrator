@@ -6,6 +6,9 @@ dist/
 .orchestrator/
 # Hugging Face snapshots live under .orchestrator/models (covered above)
 # GUI pid/token: .orchestrator/gui.pid, .orchestrator/gui.secret (never commit)
+# If these are copied out of .orchestrator/, still do not commit them
+gui.secret
+secrets.env
 *.log
 .DS_Store
 __pycache__/

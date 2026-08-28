@@ -187,6 +187,9 @@ export function suggestGeminiModelFromError(errorText: string, sentModel?: strin
 }
 
 export function formatGeminiChatError(status: number, bodyText: string, sentModel: string): string {
+  if (status === 429) {
+    return "Gemini rate-limited (429) — skipped so other speakers can finish.";
+  }
   const suggestion = suggestGeminiModelFromError(bodyText, sentModel);
   const hint = suggestion
     ? ` Google suggests ${suggestion}. Send a bare id (not models/${suggestion}) on v1beta/openai/chat/completions.`

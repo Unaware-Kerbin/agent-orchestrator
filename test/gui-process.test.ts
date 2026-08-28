@@ -28,6 +28,7 @@ test("isGuiCmdline matches this project's GUI entrypoint only", () => {
   assert.equal(isGuiCmdline("tsx src/gui.ts"), true);
   assert.equal(isGuiCmdline("/home/x/.local/bin/node --import loader.mjs src/gui.ts"), true);
   assert.equal(isGuiCmdline("tsx src/gui.ts --open"), true);
+  assert.equal(isGuiCmdline("C:\\Users\\me\\AppData\\tsx src\\gui.ts"), true);
   assert.equal(isGuiCmdline("tsx src/gui.ts --stop"), false);
   assert.equal(isGuiCmdline("vllm serve /models/foo"), false);
   assert.equal(isGuiCmdline("node dist/index.js"), false);

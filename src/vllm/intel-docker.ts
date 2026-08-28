@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { GPU_MEMORY_UTILIZATION } from "../local-models/fit.js";
+import { isWindows } from "../platform.js";
 
 /** Host publish address only. Inside the container vLLM still listens on 0.0.0.0:8000. */
 const LOOPBACK_HOST = "127.0.0.1";
@@ -164,23 +166,30 @@ export function classifyDockerError(stderr: string, status: number | null, error
   if (/enoent|not found|no such file/.test(text) && /docker/.test(text)) {
     return {
       daemon: "missing",
-      message: "docker is not installed or not on PATH. Install Docker Engine and retry.",
+      message: "docker is not installed or not on PATH. Install Docker Engine or Docker Desktop and retry.",
     };
   }
   if (/permission denied|dial unix.*permission|got permission denied while trying to connect/.test(text)) {
     return {
       daemon: "permission",
       message:
-        "docker images failed: permission denied on the Docker socket. Add this user to the docker group (`sudo usermod -aG docker $USER`), then log out and back in.",
+        "docker images failed: permission denied on the Docker socket. On Linux, add this user to the docker group (`sudo usermod -aG docker $USER`), then log out and back in. On Windows, start Docker Desktop and confirm it is running.",
     };
   }
   if (
-    /cannot connect|connect: no such file|daemon is not running|is the docker daemon running|docker.sock/.test(text)
+    /cannot connect|connect: no such file|daemon is not running|is the docker daemon running|docker.sock|npipe|named pipe|dockerDesktopLinuxEngine|docker_engine|\\\\\.\\pipe\\docker/i.test(
+      text,
+    )
   ) {
+    const windowsPipe = /npipe|named pipe|dockerDesktopLinuxEngine|docker_engine|\\\\\.\\pipe\\docker|\/\/\.\/pipe/i.test(
+      text,
+    );
     return {
       daemon: "down",
       message:
-        "Docker daemon is not reachable (unix:///var/run/docker.sock). Start Docker, and confirm this user is in the docker group.",
+        windowsPipe || isWindows()
+          ? "Docker Desktop is not reachable. Start Docker Desktop (Settings → General) and wait until it is running. Intel XPU GPU passthrough typically needs WSL2 or a Linux host; NVIDIA can use Docker Desktop GPU support when enabled."
+          : "Docker daemon is not reachable (unix:///var/run/docker.sock). Start Docker, and confirm this user is in the docker group.",
     };
   }
   if (status !== 0 && status !== null) {
@@ -194,7 +203,7 @@ export function classifyDockerError(stderr: string, status: number | null, error
 
 function defaultExec(command: string, args: string[]): DockerExecResult {
   try {
-    const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000 });
+    const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000, windowsHide: true });
     return {
       status: result.status,
       stdout: result.stdout ?? "",
@@ -287,6 +296,7 @@ export function classifyIntelImage(ref: string, entrypoint?: string[] | null): I
 }
 
 export function lookupGroupGid(group: string, exec: DockerExec = defaultExec): string | undefined {
+  if (isWindows()) return undefined;
   const result = exec("getent", ["group", group]);
   if (result.status !== 0) return undefined;
   const gid = result.stdout.trim().split(":")[2];
@@ -294,13 +304,14 @@ export function lookupGroupGid(group: string, exec: DockerExec = defaultExec): s
 }
 
 function containerModelPathFor(modelsDir: string, modelPath: string): string {
-  const dir = modelsDir.replace(/\/+$/, "");
-  const path = modelPath.replace(/\/+$/, "");
-  if (path === dir) return CONTAINER_MODEL_ROOT;
-  if (path.startsWith(`${dir}/`)) {
-    return `${CONTAINER_MODEL_ROOT}/${path.slice(dir.length + 1)}`;
+  const dirNorm = modelsDir.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  const pathNorm = modelPath.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  if (pathNorm === dirNorm) return CONTAINER_MODEL_ROOT;
+  if (pathNorm.startsWith(`${dirNorm}/`)) {
+    return `${CONTAINER_MODEL_ROOT}/${pathNorm.slice(dirNorm.length + 1)}`;
   }
-  return `${CONTAINER_MODEL_ROOT}/${basename(path)}`;
+  const base = pathNorm.split("/").pop() || basename(modelPath);
+  return `${CONTAINER_MODEL_ROOT}/${base}`;
 }
 
 /**
@@ -308,6 +319,12 @@ function containerModelPathFor(modelsDir: string, modelPath: string): string {
  * Their CLI rejects `--device xpu` and wants the model as a positional arg
  * (`vllm serve <model> …`), matching Local GPU Terminal Emulator compose.
  */
+/** Intel 0.21 Gemma 4 recipe (`--mamba-ssm-cache-dtype float16`). Safe no-op for other families. */
+export function gemma4VllmExtraArgs(servedModelName: string, modelPath: string): string[] {
+  if (!/gemma-4/i.test(`${servedModelName} ${modelPath}`)) return [];
+  return ["--mamba-ssm-cache-dtype", "float16"];
+}
+
 export function buildIntelVllmArgs(input: {
   containerModelPath: string;
   servedModelName: string;
@@ -329,7 +346,8 @@ export function buildIntelVllmArgs(input: {
     "--enforce-eager",
     "--trust-remote-code",
     "--gpu-memory-utilization",
-    "0.9",
+    String(GPU_MEMORY_UTILIZATION),
+    ...gemma4VllmExtraArgs(input.servedModelName, input.containerModelPath),
   ];
 }
 
@@ -378,6 +396,7 @@ export function buildIntelDockerRunArgs(input: {
   });
   const driDir = input.driDir ?? "/dev/dri";
   const dxgPath = input.dxgPath ?? "/dev/dxg";
+  const hostModels = modelsDir.replace(/\\/g, "/");
   const args: string[] = [
     "run",
     "-d",
@@ -414,16 +433,15 @@ export function buildIntelDockerRunArgs(input: {
     "-e",
     `HF_HOME=${CONTAINER_MODEL_ROOT}`,
     "-v",
-    `${modelsDir}:${CONTAINER_MODEL_ROOT}`,
+    `${hostModels}:${CONTAINER_MODEL_ROOT}`,
   ];
-  if (existsSync(driDir) || input.driDir) {
+  const attachDri = Boolean(input.driDir) || existsSync(driDir);
+  if (attachDri) {
     args.push("--device", driDir);
     const byPath = `${driDir}/by-path`;
     if (existsSync(byPath) || input.driDir) {
       args.push("-v", `${byPath}:${byPath}`);
     }
-  } else {
-    args.push("--device", "/dev/dri");
   }
   if (existsSync(dxgPath)) {
     args.push("--device", dxgPath);
@@ -507,7 +525,7 @@ export function dockerRunDetached(args: string[], exec?: DockerExec): string {
     exec ??
     ((command: string, runArgs: string[]) => {
       try {
-        const result = spawnSync(command, runArgs, { encoding: "utf8", timeout: 60_000 });
+        const result = spawnSync(command, runArgs, { encoding: "utf8", timeout: 60_000, windowsHide: true });
         return {
           status: result.status,
           stdout: result.stdout ?? "",
@@ -534,6 +552,7 @@ export function dockerRunDetached(args: string[], exec?: DockerExec): string {
 }
 
 export function resolveDockerGroups(exec: DockerExec = defaultExec): { renderGid?: string; videoGid?: string } {
+  if (isWindows()) return {};
   return {
     renderGid: lookupGroupGid("render", exec),
     videoGid: lookupGroupGid("video", exec),

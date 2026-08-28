@@ -1,9 +1,20 @@
 import type { Orchestrator } from "../orchestrator.js";
 import { canonicalizeDirectory } from "../allowlist.js";
 import type { OrchestratedRun } from "../types.js";
+import { summarizePcapFile } from "../pcap-summary.js";
 import { buildPendingApproval, pendingCardText } from "./approval.js";
-import { extractFilesystemPaths, expandUserPath, routeChat, speakerLabel } from "./router.js";
+import { extractFilesystemPaths, expandUserPath, extractRoutableMessage, isLateDeviceWrap, routeChat, speakerLabel } from "./router.js";
 import { ChatStore } from "./store.js";
+import {
+  earlyFlushGraceMs,
+  isSpeakerSkipError,
+  looksLikeLateToolJson,
+  raceTimeout,
+  sleep,
+  speakerSkipLine,
+  speakerTimeoutMs,
+  timeoutErrorMessage,
+} from "./timeout.js";
 import type {
   ChatHeartbeatPayload,
   ChatMessage,
@@ -47,8 +58,19 @@ export class ChatService {
   readonly store = new ChatStore();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly heartbeats = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly busyCount = new Map<string, number>();
 
   constructor(private readonly orchestrator: Orchestrator) {}
+
+  isBusy(id: string): boolean {
+    return (this.busyCount.get(id) ?? 0) > 0;
+  }
+
+  /** Thread plus in-flight flag for MCP/Late polling. `busy` is not persisted. */
+  view(id: string): ChatThread {
+    const thread = this.store.require(id);
+    return { ...thread, busy: this.isBusy(id) };
+  }
 
   list() {
     return this.store.list();
@@ -90,15 +112,22 @@ export class ChatService {
     });
     this.emit(this.store.require(thread.id));
 
-    const work = this.enqueue(thread.id, () => this.respond(thread.id, { ...input, message }));
+    this.markBusy(thread.id);
+    const work = this.enqueue(thread.id, async () => {
+      try {
+        await this.respond(thread.id, { ...input, message });
+      } finally {
+        this.unmarkBusy(thread.id);
+      }
+    });
     if (input.wait === false) {
       void work.catch((error) => {
         this.fail(thread.id, error);
       });
-      return this.store.require(thread.id);
+      return this.view(thread.id);
     }
     await work;
-    return this.store.require(thread.id);
+    return this.view(thread.id);
   }
 
   async runAction(input: {
@@ -111,8 +140,10 @@ export class ChatService {
       const requested = typeof input.payload?.modelId === "string" ? input.payload.modelId : undefined;
       const model =
         snap.models.find((m) => m.id === requested) ??
-        snap.recommended.find((m) => m.downloaded) ??
-        snap.recommended[0] ??
+        snap.recommended.find((m) => m.downloaded && m.fits && m.newest) ??
+        snap.recommended.find((m) => m.downloaded && m.fits) ??
+        snap.recommended.find((m) => m.fits && m.newest && !m.cpuFeasible) ??
+        snap.recommended.find((m) => m.fits) ??
         snap.models.find((m) => m.downloaded);
       if (!model) {
         throw new Error("No catalog model is available to start. Open Settings → Local models.");
@@ -214,9 +245,12 @@ export class ChatService {
       runtime: b.runtime,
       model: b.model,
       reason: b.reason,
+      nickname: b.nickname,
+      hasLogo: b.hasLogo,
     }));
     const vllm = catalog.localRuntime?.vllm;
     const workspace = this.resolveWorkspace(input.message, input.cwd);
+    const pcap = await this.pcapAnalyzeContext(input.message, input.extraContext);
     const decision = routeChat({
       message: input.message,
       pin: input.pin ?? thread.pin,
@@ -231,8 +265,11 @@ export class ChatService {
       followUp: thread.messages.filter((m) => m.role === "assistant").length > 0,
       allowedDirectories: this.orchestrator.allowlist.list(),
       workspace,
+      skipBackendIds: skippedBackendIds(thread),
     });
+    const routedInput = { ...input, extraContext: pcap.extraContext };
 
+    try {
     if (decision.kind === "control") {
       await this.handleControl(threadId, decision, input.message);
       return;
@@ -253,10 +290,13 @@ export class ChatService {
       return;
     }
     if (decision.kind === "single") {
-      await this.runSingle(threadId, decision, input, Boolean(decision.needsApproval));
+      await this.runSingle(threadId, decision, routedInput, Boolean(decision.needsApproval));
       return;
     }
-    await this.runDebate(threadId, decision, input, Boolean(decision.needsApproval));
+    await this.runDebate(threadId, decision, routedInput, Boolean(decision.needsApproval));
+    } finally {
+      this.releaseTempPcaps(pcap.granted);
+    }
   }
 
   private async handleControl(threadId: string, decision: RouteDecision, message: string): Promise<void> {
@@ -268,17 +308,22 @@ export class ChatService {
         const snap = this.orchestrator.localModels.snapshot();
         const hw = snap.hardware;
         const acc = (hw.accelerators ?? []).map((g) => `${g.name} · ${g.vramMiB} MiB`).join("; ") || "no discrete GPU";
-        const rec = snap.recommended.map((m) => `${m.name} (${m.id}, ~${m.vramNeededMiB} MiB)`).join("; ") || "none fit";
+        const rec = snap.recommended
+          .map((m) => `${m.name} (${m.id}, ~${m.vramNeededMiB} MiB${m.parallel && m.parallel > 1 ? `, TP ${m.parallel}` : ""})`)
+          .join("; ") || "none fit";
         content =
-          `Hardware: ${acc}\nBackend: ${hw.primaryBackend} · ${hw.totalVramMiB ?? hw.vramMiB} MiB total · RAM ${hw.ramMiB} MiB\n` +
+          `Hardware: ${acc}\nBackend: ${hw.primaryBackend} · ${hw.deviceCount ?? 0} device(s) · ${hw.totalVramMiB ?? hw.vramMiB} MiB total · RAM ${hw.ramMiB} MiB\n` +
           `vLLM: ${snap.vllm.running ? `running ${snap.vllm.modelId} on 127.0.0.1:${snap.vllm.port}` : "stopped"}\n` +
           `Recommended: ${rec}`;
-        if (!snap.vllm.running && snap.recommended[0]) {
-          suggestedAction = {
-            label: "Start recommended local model",
-            action: "start_vllm",
-            payload: { modelId: snap.recommended[0].id },
-          };
+        if (!snap.vllm.running && snap.recommended.find((m) => m.fits && m.newest)) {
+          const start = snap.recommended.find((m) => m.fits && m.newest && !m.cpuFeasible) ?? snap.recommended.find((m) => m.fits);
+          if (start) {
+            suggestedAction = {
+              label: "Start recommended local model",
+              action: "start_vllm",
+              payload: { modelId: start.id },
+            };
+          }
         }
       } else if (kind === "vllm_status") {
         const status = this.orchestrator.localModels.vllmStatus();
@@ -337,28 +382,37 @@ export class ChatService {
     try {
       const history = this.historyFor(threadId, placeholder.id);
       const onDelta = this.deltaHandler(threadId, placeholder.id);
-      const run = decision.followUpRunId && !holdWrites
-        ? await this.orchestrator.followUp({
-            runId: decision.followUpRunId,
-            message: input.message,
-            wait: true,
-            onDelta,
-          })
-        : await this.orchestrator.dispatch({
-            specialist: speaker.specialist,
-            backend: speaker.backendId,
-            task: holdWrites
-              ? `${input.message}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.`
-              : input.message,
-            cwd: this.cwdForDispatch(decision, speaker, input.cwd),
-            prUrl: input.prUrl,
-            repoUrl: input.repoUrl,
-            branch: input.branch,
-            extraContext: this.mergeContext(input.extraContext, history),
-            wait: true,
-            mode: this.dispatchMode(decision, speaker, holdWrites, false),
-            onDelta,
-          });
+      const timeoutMs = speakerTimeoutMs();
+      const work =
+        decision.followUpRunId && !holdWrites
+          ? this.orchestrator.followUp({
+              runId: decision.followUpRunId,
+              message: input.message,
+              wait: true,
+              timeoutMs,
+              onDelta,
+            })
+          : this.orchestrator.dispatch({
+              specialist: speaker.specialist,
+              backend: speaker.backendId,
+              task: holdWrites
+                ? `${input.message}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.`
+                : input.message,
+              cwd: this.cwdForDispatch(decision, speaker, input.cwd),
+              prUrl: input.prUrl,
+              repoUrl: input.repoUrl,
+              branch: input.branch,
+              extraContext: this.mergeContext(input.extraContext, history),
+              wait: true,
+              timeoutMs,
+              mode: this.dispatchMode(decision, speaker, holdWrites, false),
+              onDelta,
+            });
+      const run = await this.dispatchTimed(threadId, work, timeoutMs, speaker.label, placeholder.id);
+      if (!run) {
+        if (holdWrites) this.holdForApproval(threadId, decision, input, input.message);
+        return;
+      }
       this.applyRun(threadId, placeholder.id, run, decision);
       if (holdWrites) {
         this.holdForApproval(threadId, decision, input, run.text?.trim() || run.error || input.message);
@@ -380,67 +434,195 @@ export class ChatService {
     const speakers = decision.speakers ?? [];
     const closer = decision.closer ?? speakers[speakers.length - 1];
     if (speakers.length === 0 || !closer) throw new Error("Router returned a debate without speakers");
-    const rounds = Math.min(Math.max(input.rounds ?? decision.rounds ?? 2, 1), 3);
+    const lateWrap = isLateDeviceWrap(input.message);
+    const rounds = lateWrap ? 1 : Math.min(Math.max(input.rounds ?? decision.rounds ?? 2, 1), 3);
     const transcript: Array<{ label: string; speaker: string; text: string }> = [];
     const history = this.historyFor(threadId);
+    let lateJson = false;
 
     for (let round = 1; round <= rounds; round++) {
-      for (const speaker of speakers) {
-        const placeholder = this.beginSpeaker(threadId, speaker, decision, "debate", "debating", round);
-        const task = debateTurnPrompt({
-          user: input.message,
+      const snapshot = [...transcript];
+      const turns = speakers.map((speaker) =>
+        this.debateTurn({
+          threadId,
+          speaker,
+          decision,
+          input,
+          history,
           round,
           rounds,
-          speaker,
-          transcript,
-        });
-        try {
-          const run = await this.orchestrator.dispatch({
-            specialist: speaker.specialist,
-            backend: speaker.backendId,
-            task,
-            cwd: this.cwdForDispatch(decision, speaker, input.cwd),
-            prUrl: input.prUrl,
-            repoUrl: input.repoUrl,
-            branch: input.branch,
-            extraContext: this.mergeContext(input.extraContext, history),
-            wait: true,
-            mode: speaker.writesLocalFiles ? "plan" : undefined,
-            onDelta: this.deltaHandler(threadId, placeholder.id),
-          });
-          this.applyRun(threadId, placeholder.id, run, decision, { systemNote: DEBATE_SYSTEM });
-          const text = run.text?.trim() || run.error || "";
+          transcript: snapshot,
+        }).then((text) => {
           if (text) transcript.push({ label: speaker.label, speaker: speaker.backendId, text });
-        } catch (error) {
-          this.patchError(threadId, placeholder.id, error);
+          if (looksLikeLateToolJson(text)) lateJson = true;
+          return text;
+        }),
+      );
+      const all = Promise.all(turns);
+      if (lateWrap) {
+        while (true) {
+          const winner = await Promise.race([all.then(() => "all" as const), sleep(80).then(() => "tick" as const)]);
+          if (winner === "all") break;
+          if (lateJson) {
+            const grace = earlyFlushGraceMs();
+            if (grace > 0) await sleep(grace);
+            this.skipLeftoverThinking(threadId, timeoutErrorMessage("speaker", speakerTimeoutMs()));
+            break;
+          }
         }
+      } else {
+        await all;
       }
+      if (lateWrap && lateJson) break;
+    }
+
+    if (lateWrap) {
+      this.skipLeftoverThinking(threadId, timeoutErrorMessage("speaker", speakerTimeoutMs()));
+      if (holdWrites) {
+        this.holdForApproval(threadId, decision, input, transcript.map((t) => t.text).join("\n\n") || input.message);
+      }
+      return;
+    }
+
+    const closerFailed = this.store.require(threadId).messages.some(
+      (m) => m.role === "assistant" && m.speaker === closer.backendId && m.status === "error",
+    );
+    if (closerFailed) {
+      if (holdWrites) {
+        this.holdForApproval(threadId, decision, input, transcript.map((t) => t.text).join("\n\n") || input.message);
+      }
+      return;
     }
 
     const placeholder = this.beginSpeaker(threadId, closer, decision, "synthesis", "waiting");
     try {
-      const run = await this.orchestrator.dispatch({
-        specialist: closer.specialist,
-        backend: closer.backendId,
-        task: synthesisPrompt(input.message, transcript, closer, holdWrites),
-        cwd: this.cwdForDispatch(decision, closer, input.cwd),
-        prUrl: input.prUrl,
-        repoUrl: input.repoUrl,
-        branch: input.branch,
-        extraContext: this.mergeContext(input.extraContext, history),
-        wait: true,
-        mode: this.dispatchMode(decision, closer, holdWrites, true),
-        onDelta: this.deltaHandler(threadId, placeholder.id),
-      });
-      this.applyRun(threadId, placeholder.id, run, decision);
+      const timeoutMs = speakerTimeoutMs();
+      const run = await this.dispatchTimed(
+        threadId,
+        this.orchestrator.dispatch({
+          specialist: closer.specialist,
+          backend: closer.backendId,
+          task: synthesisPrompt(input.message, transcript, closer, holdWrites),
+          cwd: this.cwdForDispatch(decision, closer, input.cwd),
+          prUrl: input.prUrl,
+          repoUrl: input.repoUrl,
+          branch: input.branch,
+          extraContext: this.mergeContext(input.extraContext, history),
+          wait: true,
+          timeoutMs,
+          mode: this.dispatchMode(decision, closer, holdWrites, true),
+          onDelta: this.deltaHandler(threadId, placeholder.id),
+        }),
+        timeoutMs,
+        closer.label,
+        placeholder.id,
+      );
+      if (run) this.applyRun(threadId, placeholder.id, run, decision);
       if (holdWrites) {
-        this.holdForApproval(threadId, decision, input, run.text?.trim() || transcript.map((t) => t.text).join("\n\n") || input.message);
+        this.holdForApproval(threadId, decision, input, run?.text?.trim() || transcript.map((t) => t.text).join("\n\n") || input.message);
       }
     } catch (error) {
       this.patchError(threadId, placeholder.id, error, decision.suggestedAction);
       if (holdWrites) {
         this.holdForApproval(threadId, decision, input, transcript.map((t) => t.text).join("\n\n") || input.message);
       }
+    }
+  }
+
+  private async debateTurn(opts: {
+    threadId: string;
+    speaker: RouteSpeaker;
+    decision: RouteDecision;
+    input: ChatSendInput;
+    history: Array<{ role: "user" | "assistant"; content: string }>;
+    round: number;
+    rounds: number;
+    transcript: Array<{ label: string; speaker: string; text: string }>;
+  }): Promise<string> {
+    const { threadId, speaker, decision, input, history, round, rounds, transcript } = opts;
+    const placeholder = this.beginSpeaker(threadId, speaker, decision, "debate", "debating", round);
+    const task = debateTurnPrompt({
+      user: input.message,
+      round,
+      rounds,
+      speaker,
+      transcript,
+    });
+    const timeoutMs = speakerTimeoutMs();
+    try {
+      const run = await this.dispatchTimed(
+        threadId,
+        this.orchestrator.dispatch({
+          specialist: speaker.specialist,
+          backend: speaker.backendId,
+          task,
+          cwd: this.cwdForDispatch(decision, speaker, input.cwd),
+          prUrl: input.prUrl,
+          repoUrl: input.repoUrl,
+          branch: input.branch,
+          extraContext: this.mergeContext(input.extraContext, history),
+          wait: true,
+          timeoutMs,
+          mode: speaker.writesLocalFiles ? "plan" : undefined,
+          onDelta: this.deltaHandler(threadId, placeholder.id),
+        }),
+        timeoutMs,
+        speaker.label,
+        placeholder.id,
+      );
+      if (!run) return "";
+      this.applyRun(threadId, placeholder.id, run, decision, { systemNote: DEBATE_SYSTEM });
+      if (run.status === "error") return "";
+      return run.text?.trim() || "";
+    } catch (error) {
+      this.patchError(threadId, placeholder.id, error);
+      return "";
+    }
+  }
+
+  /** Wait for a dispatch, or skip this speaker when it exceeds the per-speaker cap. */
+  private async dispatchTimed(
+    threadId: string,
+    work: Promise<OrchestratedRun>,
+    timeoutMs: number,
+    label: string,
+    messageId: string,
+  ): Promise<OrchestratedRun | undefined> {
+    const timedOut = { current: false };
+    const run = await raceTimeout(work, timeoutMs, () => {
+      timedOut.current = true;
+      return {
+        id: "",
+        specialist: "",
+        backend: "",
+        status: "error" as const,
+        prompt: "",
+        text: "",
+        error: timeoutErrorMessage(label, timeoutMs),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        history: [],
+      };
+    });
+    if (timedOut.current) {
+      this.patchError(threadId, messageId, new Error(run.error ?? timeoutErrorMessage(label, timeoutMs)));
+      return undefined;
+    }
+    return run;
+  }
+
+  private markBusy(threadId: string): void {
+    this.busyCount.set(threadId, (this.busyCount.get(threadId) ?? 0) + 1);
+  }
+
+  private unmarkBusy(threadId: string): void {
+    const n = (this.busyCount.get(threadId) ?? 1) - 1;
+    if (n <= 0) this.busyCount.delete(threadId);
+    else this.busyCount.set(threadId, n);
+    try {
+      this.emit(this.store.require(threadId));
+    } catch {
+      /* thread deleted */
     }
   }
 
@@ -452,12 +634,19 @@ export class ChatService {
     _opts?: { systemNote?: string },
   ): void {
     const error = run.status === "error" ? run.error : undefined;
+    const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
+    const label = current?.label || current?.nickname || current?.speaker || "Speaker";
+    const content = error
+      ? isSpeakerSkipError(error)
+        ? speakerSkipLine(label, error)
+        : error
+      : run.text?.trim() || "";
     this.store.patchMessage(threadId, messageId, {
-      content: run.text?.trim() || run.error || "",
+      content,
       status: error ? "error" : "finished",
-      runId: run.id,
-      agentId: run.agentId,
-      error,
+      runId: error ? undefined : run.id,
+      agentId: error ? undefined : run.agentId,
+      error: error ? content : undefined,
       chip: decision.chip,
       thinkingPhase: undefined,
       thinkingStartedAt: undefined,
@@ -467,20 +656,32 @@ export class ChatService {
     this.emit(this.store.require(threadId));
   }
 
+  private skipLeftoverThinking(threadId: string, reason: string): void {
+    const thread = this.store.get(threadId);
+    if (!thread) return;
+    for (const msg of thread.messages) {
+      if (msg.status !== "thinking" && msg.status !== "streaming") continue;
+      this.patchError(threadId, msg.id, new Error(reason));
+    }
+  }
+
   private patchError(
     threadId: string,
     messageId: string,
     error: unknown,
     suggestedAction?: ChatSuggestedAction,
   ): void {
-    const text = error instanceof Error ? error.message : String(error);
+    const raw = error instanceof Error ? error.message : String(error);
+    const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
+    const label = current?.label || current?.nickname || current?.speaker || "Speaker";
+    const text = isSpeakerSkipError(raw) || /skipped/i.test(raw) ? speakerSkipLine(label, raw) : raw;
     this.store.patchMessage(threadId, messageId, {
       content: text,
       status: "error",
       error: text,
       thinkingPhase: undefined,
       thinkingStartedAt: undefined,
-      suggestedAction: suggestedAction ?? suggestedForRunError(text),
+      suggestedAction: suggestedAction ?? suggestedForRunError(raw),
     });
     this.stopHeartbeatIfIdle(threadId);
     this.emit(this.store.require(threadId));
@@ -648,8 +849,45 @@ export class ChatService {
     return this.orchestrator.allowlist.assertCwd(candidate);
   }
 
+  private async pcapAnalyzeContext(
+    message: string,
+    extra?: string,
+  ): Promise<{ extraContext?: string; granted: string[] }> {
+    const temp = this.orchestrator.tempAnalyze;
+    if (!temp) return { extraContext: extra, granted: [] };
+    const granted: string[] = [];
+    const summaries: string[] = [];
+    const turn = extractRoutableMessage(message);
+    const candidates = new Set<string>([...extractFilesystemPaths(turn), ...temp.list().map((g) => g.path)]);
+    for (const raw of candidates) {
+      const expanded = expandUserPath(raw);
+      if (!temp.has(expanded) && !temp.has(raw)) continue;
+      if (!turn.includes(raw) && !turn.includes(expanded)) continue;
+      try {
+        const path = temp.list().find((g) => g.path === expanded || g.path.endsWith(raw) || expanded.endsWith(g.path))?.path ?? expanded;
+        if (granted.includes(path)) continue;
+        granted.push(path);
+        summaries.push(await summarizePcapFile(path));
+      } catch {
+        /* skip unreadable grants */
+      }
+    }
+    if (summaries.length === 0) return { extraContext: extra, granted };
+    const block = `Temporary pcap analyze grant (read-only, payloads omitted):\n${summaries.join("\n\n")}`;
+    const extraContext = extra?.trim() ? `${extra.trim()}\n\n${block}` : block;
+    return { extraContext, granted };
+  }
+
+  private releaseTempPcaps(granted: string[]): void {
+    const temp = this.orchestrator.tempAnalyze;
+    if (!temp) return;
+    for (const path of granted) {
+      temp.remove(path);
+    }
+  }
+
   private resolveWorkspace(message: string, explicitCwd?: string): WorkspaceHint | undefined {
-    const raw = explicitCwd?.trim() || extractFilesystemPaths(message)[0];
+    const raw = explicitCwd?.trim() || extractFilesystemPaths(extractRoutableMessage(message))[0];
     if (!raw) return undefined;
     const expanded = expandUserPath(raw);
     try {
@@ -682,7 +920,7 @@ export class ChatService {
   }
 
   private emit(thread: ChatThread): void {
-    this.orchestrator.events.emit("chat", thread);
+    this.orchestrator.events.emit("chat", this.view(thread.id));
     this.orchestrator.events.emit("chats", this.store.list());
   }
 
@@ -705,6 +943,9 @@ export class ChatService {
       chip: decision.chip,
       thinkingPhase,
       thinkingStartedAt: Date.now(),
+      nickname: speaker.nickname,
+      hasLogo: speaker.hasLogo,
+      logoUrl: speaker.logoUrl,
     });
     this.emit(this.store.require(threadId));
     this.startHeartbeat(threadId);
@@ -827,6 +1068,21 @@ Round-table transcript:
 ${body}
 
 Write the merged recommendation. ${closerHint}`;
+}
+
+function skippedBackendIds(thread: ChatThread): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const msg of thread.messages) {
+    if (msg.role !== "assistant" || msg.status !== "error" || !msg.speaker) continue;
+    if (msg.speaker === "orchestrator" || msg.speaker === "user") continue;
+    const text = `${msg.error ?? ""} ${msg.content ?? ""}`;
+    if (!isSpeakerSkipError(text) && !/skipped/i.test(text)) continue;
+    if (seen.has(msg.speaker)) continue;
+    seen.add(msg.speaker);
+    ids.push(msg.speaker);
+  }
+  return ids;
 }
 
 function suggestedForRunError(error?: string, decision?: RouteDecision): ChatSuggestedAction | undefined {

@@ -11,6 +11,14 @@ workspace:
   cwd: ${WORKSPACE_CWD}
 
 backends:
+  vllm-gemma-4-e2b-it:
+    type: vllm
+    baseUrl: "http://127.0.0.1:8002/v1"
+    model: "google/gemma-4-E2B-it"
+  vllm-qwen25-05b-instruct:
+    type: vllm
+    baseUrl: "http://127.0.0.1:8001/v1"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
   cursor-local:
     type: cursor
     runtime: local
@@ -47,7 +55,7 @@ backends:
     apiKeyEnv: GEMINI_API_KEY
 
   ollama:
-    type: openai
+    type: ollama
     baseUrl: http://127.0.0.1:11434/v1
     model: llama3.1
     apiKey: ollama
@@ -65,6 +73,13 @@ backends:
   #   baseUrl: http://127.0.0.1:8001/v1
   #   model: mistralai/Mistral-7B-Instruct-v0.3
 
+  # llama.cpp llama-server (OpenAI-compat). Start it yourself, bound to 127.0.0.1:
+  #   llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080
+  # llamacpp:
+  #   type: llamacpp
+  #   baseUrl: http://127.0.0.1:8080/v1
+  #   model: local
+
   # Generic HTTP agent: POST { prompt, system, history, metadata } → { text | result | output }
   # custom-http:
   #   type: http
@@ -74,6 +89,14 @@ backends:
   #     Authorization: Bearer ${CUSTOM_AGENT_TOKEN}
 
 specialists:
+  vllm-gemma-4-e2b-it:
+    description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
+    backend: vllm-gemma-4-e2b-it
+    fallback: cursor-local
+  vllm-qwen25-05b-instruct:
+    description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
+    backend: vllm-qwen25-05b-instruct
+    fallback: cursor-local
   planner:
     description: Breaks a goal into a sequenced implementation plan
     backend: anthropic
@@ -104,6 +127,11 @@ specialists:
   vllm-chat:
     description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
     backend: vllm-local
+    fallback: cursor-local
+
+  ollama-chat:
+    description: Local Ollama OpenAI-compatible model (text only; file writes stay on Cursor)
+    backend: ollama
     fallback: cursor-local
 
   cloud-builder:

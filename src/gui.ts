@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
 import { createOrchestrator } from "./bootstrap.js";
 import { loadOrCreateGuiToken } from "./gui-auth.js";
 import { bindLoopbackOnly, startGuiServer } from "./gui/http.js";
 import { clearGuiPid, guiAddrInUseMessage, guiPidPath, stopOurGui, writeGuiPid } from "./gui-process.js";
+import { openUrl as openInBrowser } from "./platform.js";
 
 const port = Number(process.env.AGENT_ORCHESTRATOR_GUI_PORT ?? "8787");
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -11,10 +11,12 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   process.exit(1);
 }
 
-if (process.argv.includes("--stop")) {
+if (process.argv.includes("--stop") || process.argv.includes("--restart")) {
   const result = await stopOurGui({ port });
   console.error(result.message);
-  process.exit(result.foreign.length > 0 ? 1 : 0);
+  if (process.argv.includes("--stop") || result.foreign.length > 0) {
+    process.exit(result.foreign.length > 0 ? 1 : 0);
+  }
 }
 
 try {
@@ -56,12 +58,11 @@ server.listen(listen.port, listen.host, () => {
   console.error(`  token:  ${secret.path}${secret.created ? " (created)" : ""}`);
   console.error(`  notes:  MCP stdio is unchanged. This UI is a local extra surface.`);
   console.error(`          Do not tunnel, proxy, or bind this process off localhost.`);
+  console.error(`          Streamable HTTP MCP is a separate process: npm run mcp:http on :8790.`);
   console.error(`          Stop: npm run gui:stop   Restart: npm run gui:restart`);
   console.error(`          Docker stop of an orch-vllm-* container does not stop this GUI.`);
 
   if (process.argv.includes("--open")) {
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-    const args = process.platform === "win32" ? ["/c", "start", "", openUrl] : [openUrl];
-    spawn(opener, args, { stdio: "ignore", detached: true }).unref();
+    openInBrowser(openUrl);
   }
 });

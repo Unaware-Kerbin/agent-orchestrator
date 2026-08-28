@@ -1,4 +1,4 @@
-export type RuntimeKind = "cursor" | "openai" | "anthropic" | "http" | "vllm";
+export type RuntimeKind = "cursor" | "openai" | "anthropic" | "http" | "vllm" | "ollama" | "llamacpp";
 export type CursorRuntime = "local" | "cloud";
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 export type ConversationMode = "plan" | "agent";
@@ -45,12 +45,35 @@ export interface VllmBackendConfig {
   probeTimeoutMs?: number;
 }
 
-export type BackendConfig =
+export interface OllamaBackendConfig {
+  type: "ollama";
+  baseUrl?: string;
+  model: string;
+  apiKeyEnv?: string;
+  apiKey?: string;
+  probe?: boolean;
+  probeTimeoutMs?: number;
+}
+
+export interface LlamaCppBackendConfig {
+  type: "llamacpp";
+  baseUrl?: string;
+  model: string;
+  apiKeyEnv?: string;
+  apiKey?: string;
+  probe?: boolean;
+  probeTimeoutMs?: number;
+}
+
+export type BackendConfig = (
   | CursorBackendConfig
   | OpenAIBackendConfig
   | AnthropicBackendConfig
   | HttpBackendConfig
-  | VllmBackendConfig;
+  | VllmBackendConfig
+  | OllamaBackendConfig
+  | LlamaCppBackendConfig
+) & { nickname?: string };
 
 export interface SpecialistConfig {
   description: string;
@@ -93,6 +116,8 @@ export interface ProviderRunRequest {
   history?: Array<{ role: "user" | "assistant"; content: string }>;
   /** When set, OpenAI-compat backends request SSE and forward token deltas. */
   onDelta?: (delta: string) => void;
+  /** Per-run HTTP/SDK cap. Debate uses a short timeout so one hung speaker cannot block the rest. */
+  timeoutMs?: number;
   cloud?: {
     repos?: Array<{ url: string; startingRef?: string }>;
     autoCreatePR?: boolean;
@@ -122,6 +147,8 @@ export interface ProviderHealth {
   model?: string;
   /** Known ids for GUI dropdowns (Gemini OpenAI-compat). */
   modelChoices?: string[];
+  nickname?: string;
+  hasLogo?: boolean;
 }
 
 export interface AgentProvider {

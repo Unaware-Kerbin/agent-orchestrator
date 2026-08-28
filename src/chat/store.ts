@@ -1,11 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { ensureSecureDir, writeSecureFile } from "../platform.js";
 import { stateDir } from "../state.js";
+import { extractRoutableMessage } from "./router.js";
 import type { ChatMessage, ChatThread, ChatThreadSummary } from "./types.js";
 
 function chatsDir(): string {
   const dir = join(stateDir(), "chats");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ensureSecureDir(dir);
   return dir;
 }
 
@@ -60,7 +62,7 @@ export class ChatStore {
     this.memory.set(thread.id, thread);
     if (persist) {
       const path = threadPath(thread.id);
-      writeFileSync(path, `${JSON.stringify(thread, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      writeSecureFile(path, `${JSON.stringify(thread, null, 2)}\n`);
     }
     return thread;
   }
@@ -116,9 +118,11 @@ export class ChatStore {
     const current = thread.messages[idx]!;
     const next = { ...current, ...patch, id: messageId };
     thread.messages[idx] = next;
-    if (next.runId) thread.lastRunId = next.runId;
-    if (next.agentId) thread.lastAgentId = next.agentId;
-    if (next.speaker && next.role === "assistant") thread.lastBackend = next.speaker;
+    if (next.status !== "error") {
+      if (next.runId) thread.lastRunId = next.runId;
+      if (next.agentId) thread.lastAgentId = next.agentId;
+      if (next.speaker && next.role === "assistant") thread.lastBackend = next.speaker;
+    }
     this.save(thread, persist);
     return next;
   }
@@ -144,6 +148,7 @@ export class ChatStore {
 }
 
 function titleFrom(content: string): string {
-  const line = content.trim().split(/\n/)[0] ?? "New chat";
+  const routed = extractRoutableMessage(content).trim() || content.trim();
+  const line = routed.split(/\n/)[0] ?? "New chat";
   return line.length > 72 ? `${line.slice(0, 69)}…` : line;
 }

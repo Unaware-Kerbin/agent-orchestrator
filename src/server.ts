@@ -1,7 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
+import { compactChatToolError } from "./chat/mcp-error.js";
 import type { ChatService } from "./chat/service.js";
 import type { Orchestrator } from "./orchestrator.js";
+import { probeLlamaCpp, probeOllama } from "./local-servers/status.js";
 import { toRunView } from "./views.js";
 
 function json(data: unknown): string {
@@ -10,6 +12,15 @@ function json(data: unknown): string {
 
 function textResult(data: unknown, isError = false) {
   return { content: [{ type: "text" as const, text: json(data) }], isError };
+}
+
+/**
+ * Speaker skip/429 is thread content (status=error on that chip), not an MCP tool failure.
+ * Late treats isError as “Agent stopped” and would dump this whole JSON.
+ */
+export function mcpChatToolIsError(_thread: unknown): boolean {
+  void _thread;
+  return false;
 }
 
 export function createServer(orchestrator: Orchestrator, chat: ChatService): McpServer {
@@ -84,7 +95,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     "chat_send",
     {
       description:
-        "Send a natural-language message through the same auto-router the GUI uses. Default pin is auto: hardware/vLLM/allowlist questions hit control tools; build/fix/review/plan with two or more ready backends (including Cursor) runs a round-table. Implement/install stays plan-only until the user Approves (pendingApproval on the thread). Q&A and debate text are not blocked. pin=debate forces a round-table; pin=single or a backend id skips debate. File writes never go to vLLM.",
+        "Send a natural-language message through the same auto-router the GUI uses. Default pin is auto: hardware/vLLM/allowlist questions hit control tools; build/fix/review/plan with two or more ready backends (including Cursor) runs a round-table. pin=debate forces every ready local server plus ready Cursor/Gemini/cloud specialists to answer (Late MCP uses this). Implement/install stays plan-only until the user Approves (pendingApproval on the thread). Q&A and debate text are not blocked. pin=single or a backend id skips debate. File writes never go to vLLM. Assistant messages include speaker id, nickname, and a loopback logoUrl when a logo is set.",
       inputSchema: z.object({
         message: z.string().describe("User message, as you would type in the GUI chat"),
         thread_id: z.string().optional().describe("Existing chat id; omit to start a new thread"),
@@ -92,7 +103,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
           .string()
           .optional()
           .describe(
-            "auto (default: debate on build/fix/review/plan when two backends including Cursor are ready), debate (force round-table), single (one speaker), or a backend id (local, cloud, gemini, …). Pinning a backend skips debate.",
+            "auto (default: debate on build/fix/review/plan when two backends including Cursor are ready, or when two local servers are ready), debate (force round-table: every ready local vLLM/Ollama/llama.cpp plus ready Gemini/Cursor/cloud), single (one speaker), or a backend id (local, cloud, gemini, …). Pinning a backend skips debate. Naming a backend still pins that one speaker.",
           ),
         cwd: z.string().optional(),
         pr_url: z.string().optional(),
@@ -115,6 +126,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
         extraContext: args.extra_context,
         wait: args.wait,
       });
+      // chat.send already attaches `busy` for wait:false polling.
       const pending = thread.pendingApproval?.status === "pending" ? thread.pendingApproval : undefined;
       return textResult(
         {
@@ -125,10 +137,10 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
             ? "Implement/install is waiting for human Approve. Debate/Q&A already ran plan-only. Call chat_approve to confirm or reject. Unity/apt/sudo will not run until Approve."
             : undefined,
         },
-        thread.messages.some((m) => m.status === "error"),
+        mcpChatToolIsError(thread),
       );
       } catch (error) {
-        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+        return textResult({ error: compactChatToolError(error) }, true);
       }
     },
   );
@@ -151,9 +163,9 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
           decision: args.decision,
           comment: args.comment,
         });
-        return textResult(thread, thread.messages.some((m) => m.status === "error"));
+        return textResult(thread, mcpChatToolIsError(thread));
       } catch (error) {
-        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+        return textResult({ error: compactChatToolError(error) }, true);
       }
     },
   );
@@ -165,6 +177,24 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
       inputSchema: z.object({}),
     },
     async () => textResult(chat.list()),
+  );
+
+  server.registerTool(
+    "chat_get",
+    {
+      description:
+        "Read one chat thread (messages, speakers, pending approval). Includes busy=true while debate/single is still running so clients can poll instead of blocking on chat_send wait.",
+      inputSchema: z.object({
+        thread_id: z.string().describe("Chat thread id from chat_send"),
+      }),
+    },
+    async (args) => {
+      try {
+        return textResult(chat.view(args.thread_id), false);
+      } catch (error) {
+        return textResult({ error: compactChatToolError(error) }, true);
+      }
+    },
   );
 
   server.registerTool(
@@ -323,7 +353,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     "list_local_models",
     {
       description:
-        "Curated open-weight chat models for local vLLM: which fit this GPU (weights + ~20% KV headroom), which are downloaded under the allowlisted models dir, and every running loopback vLLM instance (backend id, port, image).",
+        "Every curated open-weight chat model for local vLLM (full catalog, not a short slice): fit flags for this GPU (weights + ~20% KV headroom), newest Hub id when a family has several names, downloaded under the allowlisted models dir, and every running loopback vLLM instance (backend id, port, image).",
       inputSchema: z.object({}),
     },
     async () => textResult(orchestrator.localModels.listModels()),
@@ -333,7 +363,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     "recommend_local_models",
     {
       description:
-        "Top models that fit this hardware (detected VRAM, including multi-GPU tensor parallel when supported). Prefers fp16 when it fits; 4-bit AWQ/GPTQ on CUDA/ROCm only. Without an accelerator, only tiny CPU-feasible entries are recommended.",
+        "Every catalog model for local vLLM, with fit flags for the GPUs on this computer (fits / needs tensor parallel / too big). Newest Hub id is marked when a family has several names (Qwen3.8 over Qwen2.5, Gemma 4 over Gemma 2/3, Llama 4/3.3 over 3.1). Nothing is hidden. Without an accelerator, only tiny CPU-feasible entries fit.",
       inputSchema: z.object({}),
     },
     async () => textResult(orchestrator.localModels.recommend()),
@@ -369,7 +399,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     "start_vllm",
     {
       description:
-        "Launch a local OpenAI-compatible server bound to 127.0.0.1 only (never 0.0.0.0). Each catalog model gets its own Docker container, port in 8000–8099, backend id (vllm-<slug> from the catalog id, e.g. vllm-qwen25-7b-instruct), and specialist. Does not stop other orchestrator vLLM containers unless replace=true (restarts this model only). On intel-xpu, if intel/llm-scaler-vllm or intel/vllm:*xpu is local, starts that container (API published as 127.0.0.1:port:8000). Model must already be downloaded. Waits until GET /v1/models is healthy, upserts that backend + specialist, and stores a dummy loopback Bearer in gitignored GUI secrets if needed (never copy a key from vLLM). Cloud agents still cannot reach this server.",
+        "Launch a local OpenAI-compatible server bound to 127.0.0.1 only (never 0.0.0.0). Each catalog model gets its own Docker container, port in 8000–8099, backend id (vllm-<slug> from the catalog id, e.g. vllm-qwen25-7b-instruct), and specialist. Tensor-parallels across every GPU only when the catalog fit needs more than one card; models that fit a single GPU stay at --tensor-parallel-size 1. Pass use_all_gpus=false to pin to one GPU even when the model is larger. Does not stop other orchestrator vLLM containers unless replace=true (restarts this model only). On intel-xpu, if intel/llm-scaler-vllm or intel/vllm:*xpu is local, starts that container (API published as 127.0.0.1:port:8000). Model must already be downloaded. Waits until GET /v1/models is healthy, upserts that backend + specialist, and stores a dummy loopback Bearer in gitignored GUI secrets if needed (never copy a key from vLLM). Cloud agents still cannot reach this server.",
       inputSchema: z.object({
         model_id: z.string().describe("Catalog id or Hugging Face repo already downloaded"),
         port: z.number().int().min(8000).max(8099).optional(),
@@ -391,6 +421,12 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
           .boolean()
           .optional()
           .describe("If true, stop the existing instance of this model before starting. Other running vLLM models are left alone."),
+        use_all_gpus: z
+          .boolean()
+          .optional()
+          .describe(
+            "Allow using every GPU when the catalog fit needs tensor parallel. False: pin to one GPU. Models that already fit one card stay on one GPU even when this is true.",
+          ),
       }),
     },
     async (args) => {
@@ -404,6 +440,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
           image: args.image,
           runtime: args.runtime,
           replace: args.replace,
+          useAllGpus: args.use_all_gpus,
         });
         return textResult(status);
       } catch (error) {
@@ -494,6 +531,48 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
       inputSchema: z.object({}),
     },
     async () => textResult(orchestrator.localModels.vllmStatus()),
+  );
+
+  server.registerTool(
+    "ollama_status",
+    {
+      description:
+        "Probe a loopback Ollama daemon (default http://127.0.0.1:11434). Lists tags when it is running. Does not install Ollama. Non-loopback URLs are rejected.",
+      inputSchema: z.object({
+        base_url: z
+          .string()
+          .optional()
+          .describe("OpenAI-compat base such as http://127.0.0.1:11434/v1; must be 127.0.0.1/localhost"),
+      }),
+    },
+    async (args) => {
+      try {
+        return textResult(await probeOllama({ baseUrl: args.base_url }));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "llamacpp_status",
+    {
+      description:
+        "Probe a loopback llama.cpp llama-server OpenAI API (default http://127.0.0.1:8080/v1). Does not download GGUF files or start a process. Non-loopback URLs are rejected.",
+      inputSchema: z.object({
+        base_url: z
+          .string()
+          .optional()
+          .describe("OpenAI-compat base such as http://127.0.0.1:8080/v1; must be 127.0.0.1/localhost"),
+      }),
+    },
+    async (args) => {
+      try {
+        return textResult(await probeLlamaCpp({ baseUrl: args.base_url }));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
   );
 
   server.registerResource(

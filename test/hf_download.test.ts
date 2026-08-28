@@ -53,3 +53,37 @@ print(json.dumps({"ok": True, "keys": sorted(captured.keys())}))
   assert.equal(payload.ok, true);
   assert.equal((payload.keys ?? []).includes("tqdm_class"), false);
 });
+
+test("hf_download.py redacts tokens and explains gated 401 without a public OAuth callback", () => {
+  const source = readFileSync(helper, "utf8");
+  assert.match(source, /def gated_auth_message/);
+  assert.match(source, /def redact_text/);
+  assert.match(source, /huggingface\.co\/settings\/tokens/);
+  assert.equal(source.includes("oauth/callback"), false);
+  assert.equal(source.includes("0.0.0.0"), false);
+
+  const script = `
+import importlib.util, json, os
+spec = importlib.util.spec_from_file_location("hf_download", ${JSON.stringify(helper)})
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+os.environ["HF_TOKEN"] = "hf_pythonRedactTokenNotReal99"
+msg = mod.gated_auth_message("401 Client Error. Cannot access gated repo", False)
+assert "Settings" in msg and "HF_TOKEN" in msg
+assert "huggingface.co/settings/tokens" in msg
+assert "oauth" not in msg.lower()
+denied = mod.gated_auth_message("401 Client Error. Access restricted", True)
+assert "license" in denied.lower()
+redacted = mod.redact_text("failed token=hf_pythonRedactTokenNotReal99")
+assert "hf_pythonRedactTokenNotReal99" not in redacted
+print(json.dumps({"ok": True, "redacted": redacted}))
+`;
+  const result = spawnSync("python3", ["-c", script], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse((result.stdout ?? "").trim().split(/\n/).pop() ?? "{}") as {
+    ok?: boolean;
+    redacted?: string;
+  };
+  assert.equal(payload.ok, true);
+  assert.equal((payload.redacted ?? "").includes("hf_pythonRedactTokenNotReal99"), false);
+});
