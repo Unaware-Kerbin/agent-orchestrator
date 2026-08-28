@@ -310,6 +310,42 @@ test("how do I install Unity stays Q&A without approval", () => {
   assert.equal(decision.needsWrites, false);
 });
 
+test("two running vLLM models both speak in debate, even when Gemini is ready", () => {
+  const decision = routeChat(
+    ctx({
+      message: "draft a plan for the cache layer",
+      pin: "debate",
+      backends: [
+        backend("vllm-qwen25-7b-instruct", { model: "Qwen/Qwen2.5-7B-Instruct" }),
+        backend("vllm-qwen25-05b-instruct", { model: "Qwen/Qwen2.5-0.5B-Instruct" }),
+        backend("gemini"),
+        backend("cursor-local"),
+      ],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "debate");
+  assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-qwen25-7b-instruct"));
+  assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-qwen25-05b-instruct"));
+  const labels = (decision.speakers ?? []).map((s) => s.label);
+  assert.equal(new Set(labels).size, labels.length, "each local model needs its own bubble");
+});
+
+test("Auto Q&A with two local vLLMs is a round-table, not a single speaker", () => {
+  const decision = routeChat(
+    ctx({
+      message: "what is a stock trading bot?",
+      backends: [
+        backend("vllm-qwen25-7b-instruct", { model: "Qwen/Qwen2.5-7B-Instruct" }),
+        backend("vllm-qwen25-05b-instruct", { model: "Qwen/Qwen2.5-0.5B-Instruct" }),
+      ],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "debate");
+  assert.equal(decision.speakers?.length, 2);
+});
+
 test("Q&A prefers local vLLM and does not require Cursor writes", () => {
   const decision = routeChat(
     ctx({

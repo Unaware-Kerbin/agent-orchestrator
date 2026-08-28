@@ -228,7 +228,7 @@ function specialistFor(
     return pick(["planner", "builder"]) ?? "builder";
   }
   if (backendId.startsWith("vllm") || backendId === "local") {
-    return pick(["vllm-chat"]) ?? matching[0]?.id ?? "vllm-chat";
+    return matching[0]?.id ?? pick(["vllm-chat"]) ?? matching[0]?.id ?? "vllm-chat";
   }
   if (backendId === "gemini") return pick(["gemini-planner"]) ?? matching[0]?.id ?? "gemini-planner";
   if (intent === "review") return pick(["reviewer"]) ?? matching[0]?.id ?? backendId;
@@ -343,23 +343,29 @@ function pickDebateSpeakers(
     }
     return debateRank(a) - debateRank(b);
   });
-  const hasNonVllm = sorted.some((b) => !isVllmBackend(b));
+  const vllms = sorted.filter(isVllmBackend);
+  const others = sorted.filter((b) => !isVllmBackend(b));
+  const maxSpeakers = Math.max(3, vllms.length + 1);
   const chosen: RouterBackend[] = [];
-  let vllmCount = 0;
-  for (const backend of sorted) {
-    if (chosen.length >= 3) break;
-    if (chosen.some((c) => c.id === backend.id)) continue;
-    if (isVllmBackend(backend)) {
-      if (vllmCount >= 1 && hasNonVllm) continue;
-      vllmCount += 1;
-    }
+  for (const backend of vllms) {
+    if (chosen.length >= maxSpeakers) break;
+    chosen.push(backend);
+  }
+  for (const backend of others) {
+    if (chosen.length >= maxSpeakers) break;
+    if (backend.id === "cursor-local" || backend.id === "cursor-cloud") continue;
     chosen.push(backend);
   }
   if (needsWrites || intent === "code") {
     const cursor = writerBackend(ready, preferLocal);
     if (cursor && !chosen.some((c) => c.id === cursor.id)) {
-      if (chosen.length >= 3) chosen[chosen.length - 1] = cursor;
-      else chosen.push(cursor);
+      if (chosen.length >= maxSpeakers) {
+        const drop = [...chosen].map((row, i) => ({ row, i })).reverse().find((x) => !isVllmBackend(x.row));
+        if (drop) chosen[drop.i] = cursor;
+        else chosen.push(cursor);
+      } else {
+        chosen.push(cursor);
+      }
     }
   }
   return chosen.map((b) => asSpeaker(b, intent, ctx, visual3d));
@@ -565,7 +571,9 @@ export function routeChat(ctx: RouterContext): RouteDecision {
   const debateReady =
     ready.length >= 2 &&
     (!needsWrites || Boolean(writerBackend(ready, preferLocal)));
-  const autoDebate = mode === "auto" && DEBATE_INTENTS.has(intent) && debateReady;
+  const multipleLocalModels = ready.filter(isVllmBackend).length >= 2;
+  const autoDebate =
+    mode === "auto" && debateReady && (DEBATE_INTENTS.has(intent) || multipleLocalModels);
 
   if (forceDebate || autoDebate) {
     const speakers = pickDebateSpeakers(intent, ready, ctx, needsWrites, preferLocal, visual3d);

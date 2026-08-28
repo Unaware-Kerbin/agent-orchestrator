@@ -43,7 +43,7 @@ Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json). Reload MCP on
 
 Home is a chat thread. The header (new chat, thread switcher, settings) and composer stay on screen; only messages scroll.
 
-- **Auto** (default) — control tools for hardware/download/start; debate for plan/fix/review when two or more backends are ready; otherwise a single agent.
+- **Auto** (default) — control tools for hardware/download/start; debate for plan/fix/review when two or more backends are ready, and whenever two or more local vLLM servers are running; otherwise a single agent.
 - **Debate** — round-table: each ready model speaks in turn (one bubble per speaker), then a closer synthesizes.
 - **Single** / pin a backend — that backend only.
 
