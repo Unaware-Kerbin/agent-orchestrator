@@ -25,6 +25,8 @@ Chat (GUI or MCP)
 
 ![Watch how Agent Orchestrator works](docs/assets/orchestrator-demo.webp)
 
+This clip is **Debate** on **your computer**: several models each get a turn (local Gemma, Gemini, Cursor, and whoever else is ready). You read the replies. Writes still wait for **Approve**.
+
 ## Install
 
 Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.0](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.0)). Each archive includes Node 22. Extract it, then:
