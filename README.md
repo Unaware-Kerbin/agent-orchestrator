@@ -29,7 +29,7 @@ This clip is **Debate** on **your computer**: several models each get a turn (lo
 
 ## Install
 
-Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.0](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.0)). Each archive includes Node 22. Extract it, then:
+Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.1](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.1)). Each archive includes Node 22. Extract it, then:
 
 | Your computer | File | What you do |
 |---|---|---|
