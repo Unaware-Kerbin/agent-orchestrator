@@ -81,6 +81,7 @@ export function buildPendingApproval(input: {
     repoUrl: input.repoUrl,
     branch: input.branch,
     createdAt: Date.now(),
+    applyPatch: Boolean(input.decision.applyPatch),
   };
 }
 
@@ -97,6 +98,11 @@ export function pendingCardText(pending: PendingApproval): string {
   }
   if (pending.systemWideNote) {
     lines.push("", pending.systemWideNote);
+  } else if (pending.applyPatch) {
+    lines.push(
+      "",
+      "Q&A and debate text already ran plan-only. After Approve, the orchestrator writes listed files inside the allowlisted cwd. No shell commands run.",
+    );
   } else {
     lines.push("", "Q&A and debate text already ran plan-only. File writes and host installs stay blocked until Approve.");
   }

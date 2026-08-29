@@ -130,7 +130,16 @@ export class Orchestrator {
   }
 
   private emitCatalog(): void {
-    void this.buildCatalog().then((catalog) => this.events.emit("catalog", catalog));
+    void this.buildCatalog().then(
+      (catalog) => {
+        try {
+          this.events.emit("catalog", catalog);
+        } catch {
+          /* SSE client gone */
+        }
+      },
+      () => undefined,
+    );
   }
 
   private async buildCatalog() {

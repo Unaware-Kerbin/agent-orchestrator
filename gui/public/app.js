@@ -150,6 +150,7 @@ let token = tokenFromLocation();
 let catalog = { backends: [], specialists: [], workflows: [], writePolicy: { allowedDirectories: [], defaultCwd: "" }, localRuntime: {} };
 let sessionInfo = { mcpUrl: "", bind: "" };
 let runs = [];
+let localModelsQuery = "";
 let localModels = null;
 let localServers = { ollama: null, llamacpp: [], llamaServerBinary: null, ollamaBinary: null };
 let selectedRunId = null;
@@ -345,10 +346,13 @@ function renderThreadList() {
         .slice(0, 3)
         .map((a) => backendDisplayName(a))
         .join(" · ");
-      return `<button type="button" class="thread-item ${t.id === active ? "active" : ""}" data-thread="${escapeHtml(t.id)}" role="listitem">
+      return `<div class="thread-row ${t.id === active ? "active" : ""}" role="listitem">
+        <button type="button" class="thread-item ${t.id === active ? "active" : ""}" data-thread="${escapeHtml(t.id)}">
         <span>${escapeHtml(t.title || "New chat")}</span>
         ${agents ? `<small>${escapeHtml(agents)}</small>` : ""}
-      </button>`;
+      </button>
+        <button type="button" class="thread-delete" data-delete-thread="${escapeHtml(t.id)}" aria-label="Delete chat">Delete</button>
+      </div>`;
     })
     .join("");
 }
@@ -550,7 +554,18 @@ function ensureChatLayout() {
           <textarea id="composer-input" name="message" required placeholder="Troubleshoot this PR, draft a plan, ask what fits your GPUs…"></textarea>
           <button type="submit" id="composer-send">Send</button>
         </div>
-        <p class="hint">Auto | Debate | Single chooses speakers. Implement/install requires Approve before writes or host installs; Q&A and debate text stay unblocked. Repo writes go to Cursor local inside the allowlist.</p>
+        <p class="hint">Auto | Debate | Single chooses speakers. Implement/install requires Approve before writes or host installs; Q&A and debate text stay unblocked. Drag a folder here to grant it (path must exist on this computer). Repo writes go to Cursor local or Approve apply-patch inside the allowlist.</p>
+        <div id="grant-card" class="grant-card hidden">
+          <p class="muted">Grant this folder for writes. It must already exist on this computer (the one running this GUI).</p>
+          <label class="field">Folder path
+            <input id="grant-path" type="text" autocomplete="off" spellcheck="false" placeholder="/home/you/project" />
+          </label>
+          <div class="actions">
+            <button type="button" class="btn" data-grant-folder>Add to allowlist</button>
+            <button type="button" class="btn secondary" data-grant-cancel>Cancel</button>
+          </div>
+          <div id="grant-status"></div>
+        </div>
       </form>
     </div>
   `;
@@ -571,6 +586,62 @@ function ensureChatLayout() {
   renderChatHeader();
   renderMessages();
   renderThreadList();
+  bindChatDrop();
+}
+
+function droppedFilePath(file) {
+  if (file && typeof file.path === "string" && file.path.trim()) return file.path.trim();
+  return "";
+}
+
+function looksLikeAbsPath(text) {
+  const t = String(text ?? "").trim();
+  if (!t || t.includes("\n") || t.length > 1024) return false;
+  if (t.startsWith("/") && !t.startsWith("//")) return true;
+  return /^[A-Za-z]:[\\/]/.test(t);
+}
+
+function bindChatDrop() {
+  const root = $("chat-root");
+  const card = $("grant-card");
+  const pathInput = $("grant-path");
+  if (!root || root.dataset.dropBound === "1") return;
+  root.dataset.dropBound = "1";
+  const showGrant = (path) => {
+    if (!card) return;
+    card.classList.remove("hidden");
+    if (pathInput) pathInput.value = path || pathInput.value || "";
+    pathInput?.focus();
+  };
+  root.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    root.classList.add("drop-over");
+  });
+  root.addEventListener("dragleave", (event) => {
+    if (event.target === root) root.classList.remove("drop-over");
+  });
+  root.addEventListener("drop", (event) => {
+    const types = event.dataTransfer?.types;
+    if (!types?.includes("Files") && !event.dataTransfer?.files?.length) return;
+    event.preventDefault();
+    root.classList.remove("drop-over");
+    const file = event.dataTransfer.files?.[0];
+    showGrant(droppedFilePath(file));
+  });
+  root.addEventListener("paste", (event) => {
+    if (event.target === pathInput) return;
+    const files = event.clipboardData?.files;
+    if (files?.length) {
+      event.preventDefault();
+      showGrant(droppedFilePath(files[0]));
+      return;
+    }
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (!looksLikeAbsPath(text)) return;
+    event.preventDefault();
+    showGrant(text.trim());
+  });
 }
 
 function renderOverview() {
@@ -921,8 +992,7 @@ function renderLocalModels() {
   const starting = instances.some((row) => row.phase === "starting") || phase === "starting";
   const healthy = instances.some((row) => row.healthy || (row.phase === "running" && row.running));
   syncVllmPoll(vllm);
-  const rows = (data.models ?? [])
-    .map((m) => {
+  const catalogRow = (m) => {
       const job = jobs.get(m.id);
       const rec = recIds.has(m.id) ? `<span class="pill ok">recommended</span>` : "";
       const newest = m.newest ? `<span class="pill">newest</span>` : `<span class="pill">previous</span>`;
@@ -985,8 +1055,30 @@ function renderLocalModels() {
           <p class="muted">specialist <a href="#specialists">${escapeHtml(m.specialist)}</a> · backend <a href="#backends">${escapeHtml(m.backendId)}</a>${inst?.port ? ` · 127.0.0.1:${escapeHtml(String(inst.port))}` : ""}</p>
         </td>
       </tr>`;
-    })
-    .join("");
+  };
+  const matchesQuery = (m) => {
+    const q = localModelsQuery.trim().toLowerCase();
+    if (!q) return true;
+    const hay = `${m.id ?? ""} ${m.name ?? ""} ${m.hfRepo ?? ""} ${m.quantization ?? ""}`.toLowerCase();
+    return hay.includes(q);
+  };
+  const downloadedModels = (data.models ?? [])
+    .filter((m) => m.downloaded)
+    .filter(matchesQuery)
+    .slice()
+    .sort((a, b) => {
+      const aRun = a.running ? 0 : 1;
+      const bRun = b.running ? 0 : 1;
+      if (aRun !== bRun) return aRun - bRun;
+      return String(a.name).localeCompare(String(b.name));
+    });
+  const notDownloadedModels = (data.models ?? []).filter((m) => !m.downloaded).filter(matchesQuery);
+  const recommendedModels = (data.recommended ?? []).filter(matchesQuery);
+  const catalogTable = (models, empty) =>
+    `<table>
+        <thead><tr><th>Model</th><th>Size / VRAM</th><th>Fit</th><th></th></tr></thead>
+        <tbody>${models.map(catalogRow).join("") || `<tr><td colspan="4" class="muted">${empty}</td></tr>`}</tbody>
+      </table>`;
   const instanceLines = instances
     .map((row) => {
       const label = row.phase === "starting" ? "starting" : row.healthy || row.running ? "running" : row.phase || "idle";
@@ -1013,7 +1105,7 @@ function renderLocalModels() {
     <div class="page-title">
       <div>
         <h1>Local models</h1>
-        <p>Hardware-aware catalog for vLLM (Hugging Face snapshots). Ollama and llama.cpp are separate loopback OpenAI APIs — register them below or on Backends. Two or more GPUs of the same vendor can tensor-parallel a vLLM model that does not fit on one card (combined VRAM). Start several vLLM models at once (each gets its own 127.0.0.1 port, container, and backend id). Chat Auto uses every ready local server (vLLM, Ollama, llama.cpp) as a round-table speaker.</p>
+        <p>Hardware-aware catalog for vLLM (Hugging Face snapshots). Downloaded snapshots are listed first so you can Start / Stop them without scrolling the full catalog. Ollama and llama.cpp are separate loopback OpenAI APIs — register them below or on Backends. Start several vLLM models at once (each gets its own 127.0.0.1 port, container, and backend id). Chat Auto uses each <strong>running</strong> vLLM as a speaker — leftover YAML rows that are not serving do not join.</p>
       </div>
     </div>
     <div id="local-models-status">${statusFlash}</div>
@@ -1115,9 +1207,16 @@ function renderLocalModels() {
       </article>
     </div>
     <div class="card" style="margin-top:0.85rem">
+      <h2>Find a model</h2>
+      <label class="field" for="model-search">Search catalog (name, id, Hugging Face repo, quantization)
+        <input id="model-search" type="search" value="${escapeHtml(localModelsQuery)}" placeholder="qwen, gemma, 7b…" autocomplete="off" />
+      </label>
+      <p class="muted">${localModelsQuery.trim() ? `Showing matches in recommended, downloaded, and not downloaded.` : "Empty search shows every catalog row."}</p>
+    </div>
+    <div class="card" style="margin-top:0.85rem">
       <h2>Recommended for this machine</h2>
       <ul>${
-        (data.recommended ?? [])
+        recommendedModels
           .map((m) => {
             const fit =
               m.fitKind === "needs_tp" || m.parallel > 1
@@ -1130,19 +1229,25 @@ function renderLocalModels() {
             const gen = m.newest ? "newest" : "previous";
             return `<li><span class="mono">${escapeHtml(m.id)}</span> · ${escapeHtml(m.name)} · ${escapeHtml(m.quantization)} · ${escapeHtml(fit)} · ${escapeHtml(gen)} · ~${escapeHtml(String(m.vramNeededMiB))} MiB${m.parallel > 1 ? ` · TP ${escapeHtml(String(m.parallel))}` : ""}</li>`;
           })
-          .join("") || "<li class='muted'>Nothing in the catalog fits. Use a smaller model, or add GPU VRAM.</li>"
+          .join("") || `<li class='muted'>${localModelsQuery.trim() ? "No recommended models match that search." : "Nothing in the catalog fits. Use a smaller model, or add GPU VRAM."}</li>`
       }</ul>
       <p class="muted">Every catalog snapshot that fits this hardware (no top-N cap), newest generation per family (Gemma 4 over Gemma 2/3, Qwen3.8 over 2.5). Older gens stay in the table below for download. Models dir: <span class="mono">${escapeHtml(data.modelsDir ?? "")}</span>${hfTokenSet ? " · HF token configured" : " · save an HF token above for gated repos"}</p>
     </div>
     <div class="card" style="margin-top:0.85rem">
-      <h2>Catalog</h2>
-      <p class="muted">Full list, including older generations. Gated repos show a gated pill; Gemma 4 is ungated Apache 2.0. Download and Start are in the table.</p>
-      <table>
-        <thead><tr><th>Model</th><th>Size / VRAM</th><th>Fit</th><th></th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="4" class="muted">Catalog unavailable.</td></tr>`}</tbody>
-      </table>
+      <h2>On this computer</h2>
+      <p class="muted">Downloaded weights. Running models are first. Use Stop / Remove from mix here — Chat Auto only talks to a model after Start succeeds.</p>
+      ${catalogTable(downloadedModels, localModelsQuery.trim() ? "No downloaded models match that search." : "Nothing downloaded yet. Download a snapshot below.")}
+    </div>
+    <div class="card" style="margin-top:0.85rem">
+      <h2>Not downloaded</h2>
+      <p class="muted">Full catalog, including older generations. Gated repos show a gated pill; Gemma 4 is ungated Apache 2.0. Download, then it moves to On this computer.</p>
+      ${catalogTable(notDownloadedModels, localModelsQuery.trim() ? "No catalog rows match that search." : "Every catalog snapshot is already on this computer.")}
     </div>
   `;
+  const search = $("model-search");
+  if (search instanceof HTMLInputElement) {
+    search.value = localModelsQuery;
+  }
 }
 
 function renderDispatch() {
@@ -1296,6 +1401,23 @@ async function openNewChat() {
   location.hash = `#chat/${created.id}`;
 }
 
+async function deleteChat(id) {
+  if (!window.confirm("Delete this chat? This cannot be undone.")) return;
+  await api(`/api/chats/${encodeURIComponent(id)}`, { method: "DELETE" });
+  threads = threads.filter((t) => t.id !== id);
+  if (currentThread?.id === id || threadIdFromHash() === id) {
+    currentThread = null;
+    const next = threads[0];
+    if (next) location.hash = `#chat/${next.id}`;
+    else {
+      history.replaceState({}, "", "#chat");
+      await openNewChat();
+    }
+  } else {
+    renderThreadList();
+  }
+}
+
 async function renderChat() {
   const id = threadIdFromHash();
   if (id && currentThread?.id !== id) {
@@ -1441,6 +1563,19 @@ $("shell").addEventListener("click", (event) => {
   }
 });
 
+document.addEventListener("input", (event) => {
+  const el = event.target;
+  if (!(el instanceof HTMLInputElement) || el.id !== "model-search") return;
+  localModelsQuery = el.value;
+  const pos = el.selectionStart;
+  renderLocalModels();
+  const next = $("model-search");
+  if (next instanceof HTMLInputElement) {
+    next.focus();
+    if (typeof pos === "number") next.setSelectionRange(pos, pos);
+  }
+});
+
 document.addEventListener("change", (event) => {
   const select = event.target?.closest?.(".theme-select");
   if (!select) return;
@@ -1484,6 +1619,16 @@ $("main").addEventListener("change", async (event) => {
 });
 
 $("thread-list").addEventListener("click", (event) => {
+  const del = event.target.closest?.("[data-delete-thread]");
+  if (del) {
+    event.preventDefault();
+    event.stopPropagation();
+    const id = del.getAttribute("data-delete-thread");
+    if (id) deleteChat(id).catch((error) => {
+      $("main").insertAdjacentHTML("afterbegin", flash(error.message, "bad"));
+    });
+    return;
+  }
   const btn = event.target.closest?.("[data-thread]");
   if (!btn) return;
   location.hash = `#chat/${btn.getAttribute("data-thread")}`;
@@ -1510,7 +1655,7 @@ $("main").addEventListener("submit", async (event) => {
       $("composer-input").value = "";
       const thread = await api(`/api/chats/${encodeURIComponent(id)}/messages`, {
         method: "POST",
-        body: JSON.stringify({ message, pin, wait: false }),
+        body: JSON.stringify({ message, pin, wait: false, cwd: currentThread?.workspaceDir || undefined }),
       });
       currentThread = thread;
       ensureChatLayout();
@@ -1767,6 +1912,36 @@ $("main").addEventListener("click", async (event) => {
       } catch {
         /* keep local selection */
       }
+    }
+    return;
+  }
+  if (target.closest?.("[data-grant-cancel]")) {
+    $("grant-card")?.classList.add("hidden");
+    return;
+  }
+  if (target.closest?.("[data-grant-folder]")) {
+    const path = $("grant-path")?.value?.trim();
+    const status = $("grant-status");
+    if (!path) {
+      if (status) status.innerHTML = flash("Paste the folder path on this computer.", "bad");
+      return;
+    }
+    try {
+      if (status) status.innerHTML = flash("Granting…", "ok");
+      const result = await api("/api/allowlist", { method: "POST", body: JSON.stringify({ path }) });
+      catalog.writePolicy = { ...catalog.writePolicy, allowedDirectories: result.allowedDirectories };
+      const id = threadIdFromHash() ?? currentThread?.id;
+      if (id) {
+        currentThread = await api(`/api/chats/${encodeURIComponent(id)}/workspace`, {
+          method: "POST",
+          body: JSON.stringify({ path: result.granted ?? path }),
+        });
+        upsertThread(currentThread);
+      }
+      if (status) status.innerHTML = flash(`Granted ${result.granted ?? path}. Chat will use it as cwd.`, "ok");
+      $("grant-card")?.classList.add("hidden");
+    } catch (error) {
+      if (status) status.innerHTML = flash(error.message, "bad");
     }
     return;
   }

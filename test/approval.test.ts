@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ChatService } from "../src/chat/service.js";
+import { WriteAllowlist, canonicalizeDirectory } from "../src/allowlist.js";
 import type { DispatchInput } from "../src/orchestrator.js";
 import type { Orchestrator } from "../src/orchestrator.js";
 
@@ -24,6 +25,14 @@ function mockOrchestrator(cwd: string, dispatches: DispatchInput[]): Orchestrato
     },
     catalog: async () => ({
       backends: [
+        {
+          id: "vllm-local",
+          type: "vllm",
+          ready: true,
+          writesLocalFiles: false,
+          runtime: "local",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
+        },
         {
           id: "cursor-local",
           type: "cursor",
@@ -197,6 +206,187 @@ test("Late MCP wrap asking for interface descriptions does not dump the write al
     const followLast = [...follow.messages].reverse().find((m) => m.role === "assistant");
     assert.doesNotMatch(followLast?.content ?? "", /Write allowlist/i);
     assert.ok(dispatches.length >= 2, "expected a second model dispatch for '?'");
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});
+
+test("vLLM without Cursor writes fenced files after Approve (no Cursor dispatch)", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "orch-patch-chat-"));
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  const dispatches: DispatchInput[] = [];
+  const allow = new WriteAllowlist(join(cwd, "allowlist.json"), [canonicalizeDirectory(cwd)]);
+  const events = new EventEmitter();
+  const orchestrator = {
+    events,
+    defaultCwd: () => cwd,
+    allowlist: allow,
+    catalog: async () => ({
+      backends: [
+        {
+          id: "vllm-local",
+          type: "vllm",
+          ready: true,
+          writesLocalFiles: false,
+          runtime: "local",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
+        },
+      ],
+      specialists: [{ id: "vllm-chat", backend: "vllm-local" }],
+      localRuntime: {
+        vllm: {
+          running: true,
+          healthy: true,
+          backendId: "vllm-local",
+          modelId: "Qwen/Qwen2.5-0.5B-Instruct",
+          instances: [{ backendId: "vllm-local", healthy: true, running: true }],
+        },
+      },
+    }),
+    dispatch: async (input: DispatchInput) => {
+      dispatches.push(input);
+      return {
+        id: `run-${dispatches.length}`,
+        status: "finished" as const,
+        text: `Plan.\nsudo apt-get install pwned-package\n\`\`\`orchestrator-files\n{"files":[{"path":"README.md","content":"hello from patch\\n"}]}\n\`\`\``,
+        specialist: input.specialist,
+        backend: input.backend ?? "vllm-local",
+        prompt: input.task,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        history: [],
+      };
+    },
+    followUp: async () => {
+      throw new Error("followUp should not run in these tests");
+    },
+    localModels: {
+      snapshot: () => ({
+        hardware: { accelerators: [], ramMiB: 8192, primaryBackend: "cpu" },
+        recommended: [],
+        vllm: { running: true },
+        models: [],
+      }),
+    },
+  } as unknown as Orchestrator;
+  try {
+    const chat = new ChatService(orchestrator);
+    const thread = await chat.send({ message: BUILD_MSG, pin: "single", cwd, wait: true });
+    assert.equal(thread.pendingApproval?.status, "pending");
+    assert.equal(thread.pendingApproval?.applyPatch, true);
+    assert.equal(thread.pendingApproval?.backendId, "orchestrator");
+    assert.ok(dispatches.length >= 1);
+    const before = dispatches.length;
+    assert.ok((thread.pendingApproval?.commands ?? []).some((c) => /sudo apt-get install/i.test(c)));
+    const approved = await chat.resolveApproval({ threadId: thread.id, decision: "approve" });
+    assert.equal(dispatches.length, before);
+    assert.equal(approved.pendingApproval, undefined);
+    assert.equal(existsSync(join(cwd, "README.md")), true);
+    assert.equal(readFileSync(join(cwd, "README.md"), "utf8"), "hello from patch\n");
+    assert.match(approved.messages.at(-1)?.content ?? "", /Wrote 1 file/);
+    assert.doesNotMatch(approved.messages.at(-1)?.content ?? "", /pwned-package/);
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});
+
+test("pin vLLM with Cursor ready Approves to Cursor, not apply-patch", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "orch-pin-cursor-"));
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  const dispatches: DispatchInput[] = [];
+  try {
+    const chat = new ChatService(mockOrchestrator(cwd, dispatches));
+    const thread = await chat.send({ message: BUILD_MSG, pin: "vllm-local", cwd, wait: true });
+    assert.equal(thread.pendingApproval?.status, "pending");
+    assert.notEqual(thread.pendingApproval?.applyPatch, true);
+    assert.equal(thread.pendingApproval?.backendId, "cursor-local");
+    const before = dispatches.length;
+    const approved = await chat.resolveApproval({ threadId: thread.id, decision: "approve" });
+    assert.ok(dispatches.length > before);
+    assert.equal(dispatches.at(-1)?.backend, "cursor-local");
+    assert.equal(dispatches.at(-1)?.mode, "agent");
+    assert.equal(approved.pendingApproval, undefined);
+    assert.equal(existsSync(join(cwd, "README.md")), false);
+  } finally {
+    if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;
+  }
+});
+
+test("apply-patch Approve refuses an absolute path in the fence", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "orch-abs-parent-"));
+  const cwd = join(parent, "proj");
+  mkdirSync(cwd);
+  const sibling = join(parent, "SECRET.txt");
+  writeFileSync(sibling, "KEEPME");
+  const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
+  const dispatches: DispatchInput[] = [];
+  const allow = new WriteAllowlist(join(parent, "allowlist.json"), [canonicalizeDirectory(parent)]);
+  const events = new EventEmitter();
+  const orchestrator = {
+    events,
+    defaultCwd: () => cwd,
+    allowlist: allow,
+    catalog: async () => ({
+      backends: [
+        {
+          id: "vllm-local",
+          type: "vllm",
+          ready: true,
+          writesLocalFiles: false,
+          runtime: "local",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
+        },
+      ],
+      specialists: [{ id: "vllm-chat", backend: "vllm-local" }],
+      localRuntime: {
+        vllm: {
+          running: true,
+          healthy: true,
+          backendId: "vllm-local",
+          modelId: "Qwen/Qwen2.5-0.5B-Instruct",
+          instances: [{ backendId: "vllm-local", healthy: true, running: true }],
+        },
+      },
+    }),
+    dispatch: async (input: DispatchInput) => {
+      dispatches.push(input);
+      return {
+        id: `run-${dispatches.length}`,
+        status: "finished" as const,
+        text: `Plan.\n\`\`\`orchestrator-files\n${JSON.stringify({ files: [{ path: sibling, content: "PWNED" }] })}\n\`\`\``,
+        specialist: input.specialist,
+        backend: input.backend ?? "vllm-local",
+        prompt: input.task,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        history: [],
+      };
+    },
+    followUp: async () => {
+      throw new Error("followUp should not run in these tests");
+    },
+    localModels: {
+      snapshot: () => ({
+        hardware: { accelerators: [], ramMiB: 8192, primaryBackend: "cpu" },
+        recommended: [],
+        vllm: { running: true },
+        models: [],
+      }),
+    },
+  } as unknown as Orchestrator;
+  try {
+    const chat = new ChatService(orchestrator);
+    const thread = await chat.send({ message: BUILD_MSG, pin: "single", cwd, wait: true });
+    assert.equal(thread.pendingApproval?.applyPatch, true);
+    const approved = await chat.resolveApproval({ threadId: thread.id, decision: "approve" });
+    assert.equal(readFileSync(sibling, "utf8"), "KEEPME");
+    assert.match(approved.messages.at(-1)?.content ?? "", /absolute|refusing|escapes/i);
   } finally {
     if (prevState === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
     else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prevState;

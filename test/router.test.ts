@@ -64,6 +64,7 @@ function ctx(partial: Partial<RouterContext> & Pick<RouterContext, "message">): 
     pin: partial.pin ?? "auto",
     vllmRunning: partial.vllmRunning,
     vllmModelId: partial.vllmModelId,
+    vllmBackendIds: partial.vllmBackendIds,
     prior: partial.prior,
     followUp: partial.followUp,
     skipBackendIds: partial.skipBackendIds,
@@ -275,6 +276,7 @@ test("build + allowlisted path uses Cursor write closer, not vLLM-only", () => {
   assert.equal(decision.cwd, path);
   assert.equal(decision.closer?.backendId, "cursor-local");
   assert.equal(decision.closer?.writesLocalFiles, true);
+  assert.equal(decision.applyPatch, undefined);
   assert.equal(decision.chip, "Debate");
   const labels = (decision.speakers ?? []).map((s) => s.label);
   assert.equal(new Set(labels).size, labels.length);
@@ -371,6 +373,51 @@ test("Auto Q&A with two local vLLMs is a round-table, not a single speaker", () 
   assert.equal(decision.speakers?.length, 2);
 });
 
+test("a leftover Gemma yaml row does not join chat when only Qwen is running", () => {
+  const backends = [
+    backend("vllm-gemma-4-e2b-it", { ready: false, model: "google/gemma-4-E2B-it" }),
+    backend("vllm-qwen25-7b-instruct", { ready: true, model: "Qwen/Qwen2.5-7B-Instruct" }),
+  ];
+  const qa = routeChat(
+    ctx({
+      message: "what is the color of the sky now?",
+      backends,
+      vllmRunning: true,
+      vllmModelId: "qwen2.5-7b-instruct",
+      vllmBackendIds: ["vllm-qwen25-7b-instruct"],
+    }),
+  );
+  assert.equal(qa.kind, "single");
+  assert.equal(qa.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
+  assert.equal(
+    qa.speakers?.some((s) => s.backendId === "vllm-gemma-4-e2b-it"),
+    false,
+  );
+
+  const named = routeChat(
+    ctx({
+      message: "ask gemma what the sky looks like",
+      backends,
+      vllmRunning: true,
+      vllmBackendIds: ["vllm-qwen25-7b-instruct"],
+    }),
+  );
+  assert.equal(named.kind, "error");
+  assert.equal(named.suggestedAction?.action, "start_vllm");
+
+  const localPin = routeChat(
+    ctx({
+      message: "what is MCP?",
+      pin: "local",
+      backends,
+      vllmRunning: true,
+      vllmBackendIds: ["vllm-qwen25-7b-instruct"],
+    }),
+  );
+  assert.equal(localPin.kind, "single");
+  assert.equal(localPin.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
+});
+
 test("Q&A prefers local vLLM and does not require Cursor writes", () => {
   const decision = routeChat(
     ctx({
@@ -416,7 +463,7 @@ test("Single pin skips debate on a plan", () => {
   assert.equal(decision.speakers?.length, 1);
 });
 
-test("build with two tiny vLLMs and no Cursor asks for CURSOR_API_KEY", () => {
+test("build with two tiny vLLMs and no Cursor uses apply-patch after Approve", () => {
   const decision = routeChat(
     ctx({
       message: "build a stock trading bot here /tmp/demo-app",
@@ -428,9 +475,54 @@ test("build with two tiny vLLMs and no Cursor asks for CURSOR_API_KEY", () => {
       allowedDirectories: ["/tmp/demo-app"],
     }),
   );
+  assert.equal(decision.kind, "debate");
+  assert.equal(decision.applyPatch, true);
+  assert.equal(decision.needsApproval, true);
+  assert.equal(decision.closer?.writesLocalFiles, false);
+  assert.equal(decision.closer?.backendId?.startsWith("vllm"), true);
+});
+
+test("pin vLLM for a build still uses Cursor when Cursor local is ready", () => {
+  const decision = routeChat(
+    ctx({
+      message: "implement a README in this workspace",
+      pin: "vllm-local",
+      backends: [backend("vllm-local", { model: "Qwen/Qwen2.5-0.5B-Instruct" }), backend("cursor-local")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "vllm-local");
+  assert.equal(decision.applyPatch, undefined);
+  assert.equal(decision.closer?.backendId, "cursor-local");
+  assert.equal(decision.needsApproval, true);
+});
+
+test("pin Gemini for a build still uses Cursor when Cursor local is ready", () => {
+  const decision = routeChat(
+    ctx({
+      message: "implement a README in this workspace",
+      pin: "gemini",
+      backends: [backend("vllm-local"), backend("gemini"), backend("cursor-local")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "gemini");
+  assert.equal(decision.applyPatch, undefined);
+  assert.equal(decision.closer?.backendId, "cursor-local");
+});
+
+test("pin Gemini for a build with no writer and no local model asks for Cursor", () => {
+  const decision = routeChat(
+    ctx({
+      message: "implement a README in this workspace",
+      pin: "gemini",
+      backends: [backend("gemini")],
+    }),
+  );
   assert.equal(decision.kind, "error");
-  assert.match(decision.error ?? "", /CURSOR_API_KEY/);
-  assert.equal(decision.suggestedAction?.action, "open_settings");
+  assert.match(decision.error ?? "", /Cursor/);
 });
 
 test("debate speaker labels stay unmerged", () => {
@@ -571,7 +663,7 @@ test("ready Ollama joins Auto debate with vLLM", () => {
       message: "draft a plan for the cache layer",
       backends: [
         backend("vllm-local", { model: "Qwen/Qwen2.5-7B-Instruct" }),
-        backend("ollama", { type: "ollama", model: "llama3.1" }),
+        backend("ollama", { type: "ollama", model: "gemma-2-9b-it" }),
         backend("cursor-local"),
       ],
       vllmRunning: true,
@@ -580,6 +672,22 @@ test("ready Ollama joins Auto debate with vLLM", () => {
   assert.equal(decision.kind, "debate");
   assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
   assert.ok(decision.speakers?.some((s) => s.backendId === "ollama"));
+});
+
+test("Auto Q&A with one running vLLM does not pull in Ollama Gemma", () => {
+  const decision = routeChat(
+    ctx({
+      message: "what is the color of the sky now?",
+      backends: [
+        backend("vllm-qwen25-7b-instruct", { model: "Qwen/Qwen2.5-7B-Instruct" }),
+        backend("ollama", { type: "ollama", model: "gemma-2-9b-it" }),
+      ],
+      vllmRunning: true,
+      vllmBackendIds: ["vllm-qwen25-7b-instruct"],
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
 });
 
 test("plain GUI chat_send is unchanged: wrap extract is identity", () => {
@@ -697,4 +805,46 @@ test("follow-up debate skips backends that already timed out or 429'd", () => {
   assert.equal(decision.speakers?.some((s) => s.backendId === "gemini"), false);
   assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
   assert.ok(decision.speakers?.some((s) => s.backendId === "cursor-local"));
+});
+
+test("write a cli playbook is code intent", () => {
+  assert.equal(detectIntent("Write a cli playbook for this switch to configure a vlan of 2000"), "code");
+});
+
+test("Late wrap playbook without granted cwd does not send Cursor into the orchestrator repo", () => {
+  const question = "Write a cli playbook for this switch to configure a vlan of 2000";
+  const decision = routeChat(
+    ctx({
+      message: lateWrap(question),
+      pin: "debate",
+      backends: [
+        backend("vllm-local", { nickname: "Arc Gemma" }),
+        backend("gemini"),
+        backend("cursor-local"),
+      ],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(extractRoutableMessage(lateWrap(question)), question);
+  assert.equal(decision.kind, "debate");
+  assert.equal(decision.needsWrites, false);
+  assert.notEqual(decision.applyPatch, true);
+});
+
+test("Late wrap playbook with granted cwd uses apply-patch after Approve", () => {
+  const cwd = "/tmp/aruba-test-configs";
+  const question = "Write a cli playbook for this switch to configure a vlan of 2000";
+  const decision = routeChat(
+    ctx({
+      message: lateWrap(question),
+      pin: "debate",
+      backends: [backend("vllm-local"), backend("cursor-local"), backend("gemini")],
+      vllmRunning: true,
+      workspace: { path: cwd, allowed: true, cwd },
+    }),
+  );
+  assert.equal(decision.kind, "debate");
+  assert.equal(decision.needsWrites, true);
+  assert.equal(decision.applyPatch, true);
+  assert.equal(decision.cwd, cwd);
 });

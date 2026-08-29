@@ -2,7 +2,7 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
-import { isPathInside } from "../allowlist.js";
+import { canonicalizeDirectory, isPathInside } from "../allowlist.js";
 import { parseConfigYaml, packageRoot, patchBackendModelYaml, patchBackendNicknameYaml, readConfigYaml, validateConfigYaml, writeConfigYaml } from "../config.js";
 import { isGeminiOpenAiConfig, normalizeGeminiConfigModel } from "../providers/gemini.js";
 import { extractBearerToken, tokensEqual } from "../gui-auth.js";
@@ -53,22 +53,71 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function responseAlive(res: ServerResponse): boolean {
+  return !res.writableEnded && !res.destroyed && res.writable;
+}
+
 function send(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const payload = typeof body === "string" ? body : JSON.stringify(body);
-  const type = typeof body === "string" && !extra["content-type"]
-    ? "text/plain; charset=utf-8"
-    : extra["content-type"] ?? "application/json; charset=utf-8";
-  res.writeHead(status, {
-    "content-type": type,
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
-    "referrer-policy": "no-referrer",
-    "content-security-policy":
-      "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-    ...extra,
-  });
-  res.end(payload);
+  if (!responseAlive(res)) return;
+  try {
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    const payload = typeof body === "string" ? body : JSON.stringify(body);
+    const type = typeof body === "string" && !extra["content-type"]
+      ? "text/plain; charset=utf-8"
+      : extra["content-type"] ?? "application/json; charset=utf-8";
+    res.writeHead(status, {
+      "content-type": type,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "content-security-policy":
+        "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      ...extra,
+    });
+    res.end(payload);
+  } catch {
+    try {
+      res.destroy();
+    } catch {
+      /* client already gone */
+    }
+  }
+}
+
+function sseAlive(res: ServerResponse): boolean {
+  return responseAlive(res);
+}
+
+function sseWrite(client: ServerResponse, chunk: string, clients: Set<ServerResponse>): void {
+  if (!sseAlive(client)) {
+    clients.delete(client);
+    return;
+  }
+  try {
+    client.write(chunk);
+  } catch {
+    clients.delete(client);
+    try {
+      client.destroy();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function sseBroadcast(clients: Set<ServerResponse>, event: string, data: unknown): void {
+  let payload: string;
+  try {
+    payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  } catch (error) {
+    console.error("gui sse stringify failed", error instanceof Error ? error.message : error);
+    return;
+  }
+  for (const client of [...clients]) sseWrite(client, payload, clients);
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -152,36 +201,34 @@ export function startGuiServer(options: {
   const sseClients = new Set<ServerResponse>();
 
   const broadcastRun = (run: OrchestratedRun) => {
-    const payload = `event: run\ndata: ${JSON.stringify(toRunView(run, true))}\n\n`;
-    for (const client of sseClients) client.write(payload);
+    sseBroadcast(sseClients, "run", toRunView(run, true));
   };
   const broadcastCatalog = () => {
-    void orchestrator.catalog().then((catalog) => {
-      const payload = `event: catalog\ndata: ${JSON.stringify(catalog)}\n\n`;
-      for (const client of sseClients) client.write(payload);
-    });
+    void orchestrator.catalog().then(
+      (catalog) => sseBroadcast(sseClients, "catalog", catalog),
+      (error) => console.error("gui catalog broadcast failed", error instanceof Error ? error.message : error),
+    );
   };
 
   const broadcastLocalModels = () => {
-    const payload = `event: local-models\ndata: ${JSON.stringify(orchestrator.localModels.snapshot())}\n\n`;
-    for (const client of sseClients) client.write(payload);
+    try {
+      sseBroadcast(sseClients, "local-models", orchestrator.localModels.snapshot());
+    } catch (error) {
+      console.error("gui local-models broadcast failed", error instanceof Error ? error.message : error);
+    }
   };
   const broadcastVllm = (status: unknown) => {
-    const payload = `event: vllm\ndata: ${JSON.stringify(status)}\n\n`;
-    for (const client of sseClients) client.write(payload);
+    sseBroadcast(sseClients, "vllm", status);
   };
 
   const broadcastChat = (thread: unknown) => {
-    const payload = `event: chat\ndata: ${JSON.stringify(thread)}\n\n`;
-    for (const client of sseClients) client.write(payload);
+    sseBroadcast(sseClients, "chat", thread);
   };
   const broadcastChats = (list: unknown) => {
-    const payload = `event: chats\ndata: ${JSON.stringify(list)}\n\n`;
-    for (const client of sseClients) client.write(payload);
+    sseBroadcast(sseClients, "chats", list);
   };
   const broadcastHeartbeat = (payload: unknown) => {
-    const frame = `event: chat-heartbeat\ndata: ${JSON.stringify(payload)}\n\n`;
-    for (const client of sseClients) client.write(frame);
+    sseBroadcast(sseClients, "chat-heartbeat", payload);
   };
 
   orchestrator.events.on("run", broadcastRun);
@@ -192,16 +239,29 @@ export function startGuiServer(options: {
   orchestrator.events.on("chats", broadcastChats);
   orchestrator.events.on("chat-heartbeat", broadcastHeartbeat);
 
-  const server = createServer(async (req, res) => {
-    try {
-      await handle(req, res);
-    } catch (error) {
-      if (res.headersSent) {
-        res.end();
-        return;
+  const dropSse = (res: ServerResponse, ping?: ReturnType<typeof setInterval>): void => {
+    if (ping) clearInterval(ping);
+    sseClients.delete(res);
+  };
+
+  const server = createServer((req, res) => {
+    req.on("error", () => {
+      dropSse(res);
+    });
+    res.on("error", () => {
+      dropSse(res);
+    });
+    void handle(req, res).catch((error) => {
+      try {
+        if (res.headersSent) {
+          if (responseAlive(res)) res.end();
+          return;
+        }
+        send(res, 500, { error: redactSecretText(error instanceof Error ? error.message : String(error)) });
+      } catch {
+        /* never take down the GUI */
       }
-      send(res, 500, { error: redactSecretText(error instanceof Error ? error.message : String(error)) });
-    }
+    });
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -248,7 +308,19 @@ export function startGuiServer(options: {
           "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         "cache-control": extname(file) === ".html" ? "no-store" : "public, max-age=300",
       });
-      createReadStream(file).pipe(res);
+      const stream = createReadStream(file);
+      stream.on("error", () => {
+        if (!res.headersSent) send(res, 500, { error: "Failed to read file" });
+        else if (responseAlive(res)) {
+          try {
+            res.end();
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+      res.on("error", () => stream.destroy());
+      stream.pipe(res);
       return;
     }
 
@@ -272,18 +344,23 @@ export function startGuiServer(options: {
         "x-content-type-options": "nosniff",
         "x-frame-options": "DENY",
       });
-      res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-      res.write(`event: catalog\ndata: ${JSON.stringify(await orchestrator.catalog())}\n\n`);
-      res.write(`event: local-models\ndata: ${JSON.stringify(orchestrator.localModels.snapshot())}\n\n`);
-      res.write(`event: chats\ndata: ${JSON.stringify(chat.list())}\n\n`);
+      sseWrite(res, `event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`, sseClients);
+      try {
+        sseWrite(res, `event: catalog\ndata: ${JSON.stringify(await orchestrator.catalog())}\n\n`, sseClients);
+        sseWrite(res, `event: local-models\ndata: ${JSON.stringify(orchestrator.localModels.snapshot())}\n\n`, sseClients);
+        sseWrite(res, `event: chats\ndata: ${JSON.stringify(chat.list())}\n\n`, sseClients);
+      } catch (error) {
+        console.error("gui sse hello failed", error instanceof Error ? error.message : error);
+      }
       sseClients.add(res);
       const ping = setInterval(() => {
-        res.write(`event: ping\ndata: {}\n\n`);
+        sseWrite(res, `event: ping\ndata: {}\n\n`, sseClients);
+        if (!sseClients.has(res)) clearInterval(ping);
       }, 15_000);
-      req.on("close", () => {
-        clearInterval(ping);
-        sseClients.delete(res);
-      });
+      ping.unref?.();
+      const onGone = (): void => dropSse(res, ping);
+      req.on("close", onGone);
+      res.on("close", onGone);
       return;
     }
 
@@ -365,6 +442,21 @@ export function startGuiServer(options: {
         return;
       }
       send(res, 200, chat.setPin(decodeURIComponent(chatPinMatch[1] ?? ""), body.pin));
+      return;
+    }
+
+    const chatWorkspaceMatch = /^\/api\/chats\/([^/]+)\/workspace$/.exec(path);
+    if (chatWorkspaceMatch && method === "POST") {
+      if (!isRecord(body) || typeof body.path !== "string") {
+        send(res, 400, { error: "path string required" });
+        return;
+      }
+      try {
+        const granted = orchestrator.allowlist.assertCwd(body.path);
+        send(res, 200, chat.setWorkspaceDir(decodeURIComponent(chatWorkspaceMatch[1] ?? ""), granted));
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : "Invalid workspace path" });
+      }
       return;
     }
 
@@ -562,9 +654,19 @@ export function startGuiServer(options: {
         send(res, 400, { error: "path string required" });
         return;
       }
-      const allowedDirectories = orchestrator.allowlist.add(body.path);
-      void orchestrator.catalog().then((catalog) => orchestrator.events.emit("catalog", catalog));
-      send(res, 200, { allowedDirectories, defaultCwd: orchestrator.defaultCwd() });
+      const dirPath = body.path;
+      try {
+        const allowedDirectories = orchestrator.allowlist.add(dirPath);
+        const granted =
+          allowedDirectories.find((d) => d === canonicalizeDirectory(dirPath)) ?? canonicalizeDirectory(dirPath);
+        void orchestrator.catalog().then(
+          (catalog) => orchestrator.events.emit("catalog", catalog),
+          () => undefined,
+        );
+        send(res, 200, { allowedDirectories, defaultCwd: orchestrator.defaultCwd(), granted });
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : "Invalid path" });
+      }
       return;
     }
 
@@ -1123,7 +1225,14 @@ export function startGuiServer(options: {
     orchestrator.events.off("vllm", broadcastVllm);
     orchestrator.events.off("chat", broadcastChat);
     orchestrator.events.off("chats", broadcastChats);
-    for (const client of sseClients) client.end();
+    orchestrator.events.off("chat-heartbeat", broadcastHeartbeat);
+    for (const client of sseClients) {
+      try {
+        client.end();
+      } catch {
+        /* ignore */
+      }
+    }
     sseClients.clear();
   });
 

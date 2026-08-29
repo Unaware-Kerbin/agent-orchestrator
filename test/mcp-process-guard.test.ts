@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   installMcpProcessGuards,
+  installProcessGuards,
   MCP_PROCESS_GUARD_EXCEPTION,
   MCP_PROCESS_GUARD_REJECTION,
+  processGuardException,
+  processGuardRejection,
 } from "../src/mcp/process-guard.js";
 
 test("mcp:http process guards register and uninstall listeners", () => {
@@ -30,6 +33,20 @@ test("guard handler logs a Cursor-like failure without throwing", () => {
     (last as (reason: unknown) => void)(new Error("cursor sdk late fail"));
     assert.ok(lines.some((l) => l.includes(MCP_PROCESS_GUARD_REJECTION)));
     assert.equal(MCP_PROCESS_GUARD_EXCEPTION.length > 0, true);
+  } finally {
+    stop();
+  }
+});
+
+test("gui process guards use a distinct label and do not throw", () => {
+  const lines: string[] = [];
+  const stop = installProcessGuards("gui", (msg) => lines.push(String(msg)));
+  try {
+    const listeners = process.listeners("unhandledRejection");
+    const last = listeners[listeners.length - 1];
+    (last as (reason: unknown) => void)(new Error("sse write after destroy"));
+    assert.ok(lines.some((l) => l.includes(processGuardRejection("gui"))));
+    assert.equal(processGuardException("gui").includes("gui"), true);
   } finally {
     stop();
   }

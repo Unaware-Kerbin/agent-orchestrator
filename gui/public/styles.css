@@ -374,6 +374,25 @@ pre.out {
   min-height: 0;
   align-content: start;
 }
+.thread-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: stretch;
+  gap: 0.15rem;
+}
+.thread-row.active {
+  background: var(--accent-soft);
+}
+.thread-delete {
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  cursor: pointer;
+  font-size: 0.72rem;
+  padding: 0.35rem 0.4rem;
+  font-family: inherit;
+}
+.thread-delete:hover { color: var(--bad); }
 .thread-item {
   display: grid;
   gap: 0.1rem;
@@ -619,6 +638,17 @@ input[type="file"] {
 }
 .empty-chat h2 { color: var(--text); font-weight: 600; margin-bottom: 0.4rem; }
 
+.composer.drop-over,
+.chat-root.drop-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.grant-card {
+  border-top: 1px solid var(--line);
+  padding: 0.65rem 0.85rem 0.85rem;
+  background: var(--bg-2);
+}
+.grant-card.hidden { display: none; }
 .composer {
   border-top: 1px solid var(--line);
   padding: 0.85rem 1.25rem 1.1rem;

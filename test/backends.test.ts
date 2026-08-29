@@ -371,9 +371,22 @@ test("vllm is ready without a cloud key when probe is disabled", () => {
     const health = provider.health();
     assert.equal(health.ready, true);
     assert.equal(health.needsKey, false);
+    assert.equal(health.writesLocalFiles, false);
     assert.match(health.reason ?? "", /8000\/v1/);
     assert.equal((health.reason ?? "").includes("missing API key"), false);
   });
+});
+
+test("vllm health is not ready until /models probe succeeds", () => {
+  const provider = new VllmProvider("vllm-gemma-4-e2b-it", {
+    type: "vllm",
+    baseUrl: "http://127.0.0.1:8002/v1",
+    model: "google/gemma-4-E2B-it",
+  });
+  const health = provider.health();
+  assert.equal(health.ready, false);
+  assert.equal(health.writesLocalFiles, false);
+  assert.match(health.reason ?? "", /will probe/);
 });
 
 test("vllm probe marks ready on HTTP success and not-ready on ECONNREFUSED", async () => {
@@ -387,6 +400,7 @@ test("vllm probe marks ready on HTTP success and not-ready on ECONNREFUSED", asy
     globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
     const ok = await provider.probe();
     assert.equal(ok.ready, true);
+    assert.equal(ok.writesLocalFiles, false);
     assert.match(ok.reason ?? "", /reachable/);
 
     globalThis.fetch = (async () => {

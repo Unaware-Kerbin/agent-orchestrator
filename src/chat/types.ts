@@ -68,6 +68,7 @@ export interface PendingApproval {
   repoUrl?: string;
   branch?: string;
   createdAt: number;
+  applyPatch?: boolean;
 }
 
 export interface ChatThread {
@@ -80,6 +81,8 @@ export interface ChatThread {
   lastAgentId?: string;
   lastBackend?: string;
   pendingApproval?: PendingApproval;
+  /** Granted folder used as cwd on later turns. */
+  workspaceDir?: string;
   createdAt: number;
   updatedAt: number;
   /** True while respond() is in flight. Not persisted; MCP/Late poll this. */
@@ -128,6 +131,8 @@ export interface RouterContext {
   specialists?: RouterSpecialist[];
   vllmRunning?: boolean;
   vllmModelId?: string;
+  /** Running orchestrator vLLM instance backend ids (not leftover YAML rows). */
+  vllmBackendIds?: string[];
   prior?: { runId: string; agentId?: string; backend: string };
   /** True when this thread already has assistant turns (follow-up). */
   followUp?: boolean;
@@ -166,6 +171,8 @@ export interface RouteDecision {
   note?: string;
   /** Allowlisted cwd for Cursor local writes. */
   cwd?: string;
+  /** Orchestrator apply-patch after Approve (no Cursor). */
+  applyPatch?: boolean;
   needsWrites?: boolean;
   needsHostInstall?: boolean;
   needsApproval?: boolean;

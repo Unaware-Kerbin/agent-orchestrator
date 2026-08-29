@@ -88,3 +88,16 @@ test("Late propose_command JSON is recognized for early flush", () => {
   assert.equal(looksLikeLateToolJson('{"tool":"propose_command","command":"show version"}'), true);
   assert.equal(looksLikeLateToolJson("interface descriptions look empty"), false);
 });
+
+test("Cursor quoting orchestrator source is not Late tool JSON for early flush", () => {
+  const lecture = [
+    "Looking at src/chat/service.ts and timeout.ts, looksLikeLateToolJson matches propose_command.",
+    "I would add tests in test/chat-busy.test.ts.",
+    'The regex is `"tool":"propose_command"`.',
+  ].join("\n");
+  assert.equal(looksLikeLateToolJson(lecture), false);
+  assert.equal(
+    looksLikeLateToolJson('{"tool":"propose_staged_artifact","format":"ansible","intent":"configure VLAN 2000"}'),
+    true,
+  );
+});

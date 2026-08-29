@@ -2,11 +2,14 @@ import type { Orchestrator } from "../orchestrator.js";
 import { canonicalizeDirectory } from "../allowlist.js";
 import type { OrchestratedRun } from "../types.js";
 import { summarizePcapFile } from "../pcap-summary.js";
+import { applyParsedFiles, APPLY_PATCH_INSTRUCTIONS, parseOrchestratorFiles } from "./apply-patch.js";
 import { buildPendingApproval, pendingCardText } from "./approval.js";
+import { latePlaybookPatchFiles, LATE_JSON_SYSTEM, withOrchestratorFilesFence } from "./late-wrap.js";
 import { extractFilesystemPaths, expandUserPath, extractRoutableMessage, isLateDeviceWrap, routeChat, speakerLabel } from "./router.js";
 import { ChatStore } from "./store.js";
 import {
     earlyFlushGraceMs,
+    isCursorSpeaker,
     isSpeakerSkipError,
     LEFTOVER_SPEAKER_SKIP,
     looksLikeLateToolJson,
@@ -88,13 +91,34 @@ export class ChatService {
   }
 
   delete(id: string): boolean {
+    this.stopHeartbeat(id);
+    this.busyCount.delete(id);
     const ok = this.store.delete(id);
     this.orchestrator.events.emit("chats", this.store.list());
     return ok;
   }
 
+  private stillOpen(threadId: string): boolean {
+    return Boolean(this.store.get(threadId));
+  }
+
+  private tryView(id: string): ChatThread | undefined {
+    if (!this.stillOpen(id)) return undefined;
+    try {
+      return this.view(id);
+    } catch {
+      return undefined;
+    }
+  }
+
   setPin(id: string, pin: string): ChatThread {
     const thread = this.store.setPin(id, pin);
+    this.emit(thread);
+    return thread;
+  }
+
+  setWorkspaceDir(id: string, path: string): ChatThread {
+    const thread = this.store.setWorkspaceDir(id, path);
     this.emit(thread);
     return thread;
   }
@@ -104,6 +128,10 @@ export class ChatService {
     if (!message) throw new Error("message is required");
     const thread = input.threadId ? this.store.require(input.threadId) : this.store.create(input.pin ?? "auto");
     if (input.pin) this.store.setPin(thread.id, input.pin);
+    if (input.cwd) {
+      const granted = this.orchestrator.allowlist.tryCwd(input.cwd);
+      if (granted) this.store.setWorkspaceDir(thread.id, granted);
+    }
     this.store.append(thread.id, {
       role: "user",
       speaker: "user",
@@ -111,24 +139,31 @@ export class ChatService {
       content: message,
       status: "finished",
     });
-    this.emit(this.store.require(thread.id));
+    this.emit(this.store.get(thread.id));
 
     this.markBusy(thread.id);
     const work = this.enqueue(thread.id, async () => {
       try {
-        await this.respond(thread.id, { ...input, message });
+        if (!this.stillOpen(thread.id)) return;
+        const latest = this.store.get(thread.id);
+        if (!latest) return;
+        await this.respond(thread.id, { ...input, message, cwd: input.cwd ?? latest.workspaceDir });
       } finally {
         this.unmarkBusy(thread.id);
       }
     });
     if (input.wait === false) {
       void work.catch((error) => {
-        this.fail(thread.id, error);
+        try {
+          this.fail(thread.id, error);
+        } catch {
+          /* thread gone */
+        }
       });
-      return this.view(thread.id);
+      return this.tryView(thread.id) ?? { ...thread, busy: this.isBusy(thread.id) };
     }
     await work;
-    return this.view(thread.id);
+    return this.tryView(thread.id) ?? { ...thread, busy: false };
   }
 
   async runAction(input: {
@@ -180,20 +215,23 @@ export class ChatService {
       const path = typeof input.payload?.path === "string" ? input.payload.path.trim() : "";
       if (!path) throw new Error("path required");
       const dirs = this.orchestrator.allowlist.add(path);
-      this.orchestrator.events.emit("catalog", await this.orchestrator.catalog());
+      void this.orchestrator.catalog().then(
+        (catalog) => this.orchestrator.events.emit("catalog", catalog),
+        () => undefined,
+      );
       const granted = dirs.find((d) => d === canonicalizeDirectory(path)) ?? canonicalizeDirectory(path);
       const threadId = input.threadId;
       this.note(
         threadId,
         `Added ${granted} to the write allowlist. Cursor local can use it as cwd. Re-running your last request.`,
       );
-      if (threadId) {
-        const thread = this.store.require(threadId);
-        const lastUser = [...thread.messages].reverse().find((m) => m.role === "user");
+      if (threadId && this.stillOpen(threadId)) {
+        const thread = this.store.get(threadId);
+        const lastUser = thread ? [...thread.messages].reverse().find((m) => m.role === "user") : undefined;
         if (lastUser?.content.trim()) {
-          await this.respond(threadId, { message: lastUser.content, pin: thread.pin });
+          await this.respond(threadId, { message: lastUser.content, pin: thread!.pin });
         }
-        return this.store.require(threadId);
+        return this.tryView(threadId) ?? { ok: true, detail: { allowedDirectories: dirs } };
       }
       return { ok: true, detail: { allowedDirectories: dirs } };
     }
@@ -225,7 +263,7 @@ export class ChatService {
       `Approved.${comment ? ` ${comment}` : ""} Closer may write only inside the allowlisted cwd. Host packages (Unity Hub, apt, sudo) run only because you approved.`,
     );
     await this.runApprovedCloser(thread.id, pending);
-    return this.store.require(thread.id);
+    return this.tryView(thread.id) ?? thread;
   }
 
   private enqueue(threadId: string, fn: () => Promise<void>): Promise<void> {
@@ -236,7 +274,8 @@ export class ChatService {
   }
 
   private async respond(threadId: string, input: ChatSendInput): Promise<void> {
-    const thread = this.store.require(threadId);
+    const thread = this.store.get(threadId);
+    if (!thread) return;
     const catalog = await this.orchestrator.catalog();
     const backends: RouterBackend[] = (catalog.backends ?? []).map((b) => ({
       id: b.id,
@@ -252,6 +291,17 @@ export class ChatService {
     const vllm = catalog.localRuntime?.vllm;
     const workspace = this.resolveWorkspace(input.message, input.cwd);
     const pcap = await this.pcapAnalyzeContext(input.message, input.extraContext);
+    const vllmBackendIds = [
+      ...new Set(
+        (vllm?.instances ?? [])
+          .filter((row: { healthy?: boolean; running?: boolean; backendId?: string }) => row.healthy || row.running)
+          .map((row: { backendId?: string }) => row.backendId)
+          .filter((id: string | undefined): id is string => Boolean(id)),
+      ),
+    ];
+    if (!vllmBackendIds.length && vllm?.backendId && (vllm.healthy || vllm.running)) {
+      vllmBackendIds.push(vllm.backendId);
+    }
     const decision = routeChat({
       message: input.message,
       pin: input.pin ?? thread.pin,
@@ -259,6 +309,7 @@ export class ChatService {
       specialists: (catalog.specialists ?? []).map((s) => ({ id: s.id, backend: s.backend })),
       vllmRunning: Boolean(vllm?.running),
       vllmModelId: vllm?.modelId,
+      vllmBackendIds,
       prior:
         thread.lastRunId && thread.lastBackend
           ? { runId: thread.lastRunId, agentId: thread.lastAgentId, backend: thread.lastBackend }
@@ -276,6 +327,7 @@ export class ChatService {
       return;
     }
     if (decision.kind === "error") {
+      if (!this.stillOpen(threadId)) return;
       this.store.append(threadId, {
         role: "assistant",
         speaker: "orchestrator",
@@ -287,7 +339,7 @@ export class ChatService {
         error: decision.error,
         suggestedAction: decision.suggestedAction,
       });
-      this.emit(this.store.require(threadId));
+      this.emit(this.store.get(threadId));
       return;
     }
     if (decision.kind === "single") {
@@ -295,6 +347,9 @@ export class ChatService {
       return;
     }
     await this.runDebate(threadId, decision, routedInput, Boolean(decision.needsApproval));
+    } catch (error) {
+      if (!this.stillOpen(threadId)) return;
+      throw error;
     } finally {
       this.releaseTempPcaps(pcap.granted);
     }
@@ -358,6 +413,7 @@ export class ChatService {
       content = error instanceof Error ? error.message : String(error);
       suggestedAction = { label: "Start recommended local model", action: "start_vllm" };
     }
+    if (!this.stillOpen(threadId)) return;
     this.store.append(threadId, {
       role: "assistant",
       speaker: "orchestrator",
@@ -368,7 +424,7 @@ export class ChatService {
       chip: "orchestrator",
       suggestedAction,
     });
-    this.emit(this.store.require(threadId));
+    this.emit(this.store.get(threadId));
   }
 
   private async runSingle(
@@ -377,6 +433,7 @@ export class ChatService {
     input: ChatSendInput,
     holdWrites: boolean,
   ): Promise<void> {
+    if (!this.stillOpen(threadId)) return;
     const speaker = decision.speakers?.[0];
     if (!speaker) throw new Error("Router returned a single turn without a speaker");
     const placeholder = this.beginSpeaker(threadId, speaker, decision, "single", "waiting");
@@ -397,7 +454,7 @@ export class ChatService {
               specialist: speaker.specialist,
               backend: speaker.backendId,
               task: holdWrites
-                ? `${input.message}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.`
+                ? `${input.message}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.${decision.applyPatch ? `\n\n${APPLY_PATCH_INSTRUCTIONS}` : ""}`
                 : input.message,
               cwd: this.cwdForDispatch(decision, speaker, input.cwd),
               prUrl: input.prUrl,
@@ -432,6 +489,7 @@ export class ChatService {
     input: ChatSendInput,
     holdWrites: boolean,
   ): Promise<void> {
+    if (!this.stillOpen(threadId)) return;
     const speakers = decision.speakers ?? [];
     const closer = decision.closer ?? speakers[speakers.length - 1];
     if (speakers.length === 0 || !closer) throw new Error("Router returned a debate without speakers");
@@ -441,9 +499,10 @@ export class ChatService {
     const history = this.historyFor(threadId);
     let lateJson = false;
 
-    for (let round = 1; round <= rounds; round++) {
+    const runWave = async (wave: RouteSpeaker[], round: number): Promise<void> => {
+      if (wave.length === 0) return;
       const snapshot = [...transcript];
-      const turns = speakers.map((speaker) =>
+      const turns = wave.map((speaker) =>
         this.debateTurn({
           threadId,
           speaker,
@@ -474,18 +533,45 @@ export class ChatService {
       } else {
         await all;
       }
+    };
+
+    for (let round = 1; round <= rounds; round++) {
+      if (lateWrap) {
+        const firstWave = speakers.filter((s) => !isCursorSpeaker(s.backendId));
+        const laterWave = speakers.filter((s) => isCursorSpeaker(s.backendId));
+        await runWave(firstWave.length ? firstWave : speakers, round);
+        if (!lateJson) await runWave(firstWave.length ? laterWave : [], round);
+      } else {
+        await runWave(speakers, round);
+      }
       if (lateWrap && lateJson) break;
     }
 
     if (lateWrap) {
       this.skipLeftoverThinking(threadId, LEFTOVER_SPEAKER_SKIP);
       if (holdWrites) {
-        this.holdForApproval(threadId, decision, input, transcript.map((t) => t.text).join("\n\n") || input.message);
+        const turn = extractRoutableMessage(input.message);
+        const files = latePlaybookPatchFiles(
+          turn,
+          transcript.map((t) => t.text),
+        );
+        const plan = withOrchestratorFilesFence(
+          transcript.map((t) => t.text).join("\n\n") || input.message,
+          files,
+        );
+        this.holdForApproval(
+          threadId,
+          { ...decision, applyPatch: Boolean(decision.applyPatch || files.length) },
+          input,
+          plan,
+        );
       }
       return;
     }
 
-    const closerFailed = this.store.require(threadId).messages.some(
+    const debateThread = this.store.get(threadId);
+    if (!debateThread) return;
+    const closerFailed = debateThread.messages.some(
       (m) => m.role === "assistant" && m.speaker === closer.backendId && m.status === "error",
     );
     if (closerFailed) {
@@ -503,7 +589,7 @@ export class ChatService {
         this.orchestrator.dispatch({
           specialist: closer.specialist,
           backend: closer.backendId,
-          task: synthesisPrompt(input.message, transcript, closer, holdWrites),
+          task: synthesisPrompt(input.message, transcript, closer, holdWrites, Boolean(decision.applyPatch)),
           cwd: this.cwdForDispatch(decision, closer, input.cwd),
           prUrl: input.prUrl,
           repoUrl: input.repoUrl,
@@ -541,6 +627,7 @@ export class ChatService {
     transcript: Array<{ label: string; speaker: string; text: string }>;
   }): Promise<string> {
     const { threadId, speaker, decision, input, history, round, rounds, transcript } = opts;
+    if (!this.stillOpen(threadId)) return "";
     const placeholder = this.beginSpeaker(threadId, speaker, decision, "debate", "debating", round);
     const task = debateTurnPrompt({
       user: input.message,
@@ -557,7 +644,7 @@ export class ChatService {
           specialist: speaker.specialist,
           backend: speaker.backendId,
           task,
-          cwd: this.cwdForDispatch(decision, speaker, input.cwd),
+          cwd: this.cwdForDispatch(decision, speaker, input.cwd, isLateDeviceWrap(input.message)),
           prUrl: input.prUrl,
           repoUrl: input.repoUrl,
           branch: input.branch,
@@ -572,7 +659,9 @@ export class ChatService {
         placeholder.id,
       );
       if (!run) return "";
-      this.applyRun(threadId, placeholder.id, run, decision, { systemNote: DEBATE_SYSTEM });
+      this.applyRun(threadId, placeholder.id, run, decision, {
+        systemNote: isLateDeviceWrap(input.message) ? LATE_JSON_SYSTEM : DEBATE_SYSTEM,
+      });
       if (run.status === "error") return "";
       return run.text?.trim() || "";
     } catch (error) {
@@ -620,11 +709,7 @@ export class ChatService {
     const n = (this.busyCount.get(threadId) ?? 1) - 1;
     if (n <= 0) this.busyCount.delete(threadId);
     else this.busyCount.set(threadId, n);
-    try {
-      this.emit(this.store.require(threadId));
-    } catch {
-      /* thread deleted */
-    }
+    this.emit(this.store.get(threadId));
   }
 
   private applyRun(
@@ -634,7 +719,8 @@ export class ChatService {
     decision: RouteDecision,
     _opts?: { systemNote?: string },
   ): void {
-    const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
+    if (!this.stillOpen(threadId)) return;
+    const current = this.store.get(threadId)?.messages.find((m) => m.id === messageId);
     const label = current?.label || current?.nickname || current?.speaker || "Speaker";
     const error = run.status === "error" ? speakerErrorText(label, run.error) : undefined;
     const content = error ?? run.text?.trim() ?? "";
@@ -650,7 +736,7 @@ export class ChatService {
       suggestedAction: suggestedForRunError(run.error, decision),
     });
     this.stopHeartbeatIfIdle(threadId);
-    this.emit(this.store.require(threadId));
+    this.emit(this.store.get(threadId));
   }
 
   private skipLeftoverThinking(threadId: string, reason: string): void {
@@ -668,35 +754,45 @@ export class ChatService {
     error: unknown,
     suggestedAction?: ChatSuggestedAction,
   ): void {
-    const raw = error instanceof Error ? error.message : String(error);
-    const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
-    const label = current?.label || current?.nickname || current?.speaker || "Speaker";
-    const text = speakerErrorText(label, raw);
-    this.store.patchMessage(threadId, messageId, {
-      content: text,
-      status: "error",
-      error: text,
-      thinkingPhase: undefined,
-      thinkingStartedAt: undefined,
-      suggestedAction: suggestedAction ?? suggestedForRunError(raw),
-    });
-    this.stopHeartbeatIfIdle(threadId);
-    this.emit(this.store.require(threadId));
+    if (!this.stillOpen(threadId)) return;
+    try {
+      const raw = error instanceof Error ? error.message : String(error);
+      const current = this.store.get(threadId)?.messages.find((m) => m.id === messageId);
+      const label = current?.label || current?.nickname || current?.speaker || "Speaker";
+      const text = speakerErrorText(label, raw);
+      this.store.patchMessage(threadId, messageId, {
+        content: text,
+        status: "error",
+        error: text,
+        thinkingPhase: undefined,
+        thinkingStartedAt: undefined,
+        suggestedAction: suggestedAction ?? suggestedForRunError(raw),
+      });
+      this.stopHeartbeatIfIdle(threadId);
+      this.emit(this.store.get(threadId));
+    } catch {
+      this.fail(threadId, error);
+    }
   }
 
   private fail(threadId: string, error: unknown): void {
-    const text = error instanceof Error ? error.message : String(error);
-    this.store.append(threadId, {
-      role: "assistant",
-      speaker: "orchestrator",
-      label: "Orchestrator",
-      content: text,
-      status: "error",
-      error: text,
-      phase: "control",
-      suggestedAction: suggestedForRunError(text),
-    });
-    this.emit(this.store.require(threadId));
+    if (!this.stillOpen(threadId)) return;
+    try {
+      const text = error instanceof Error ? error.message : String(error);
+      this.store.append(threadId, {
+        role: "assistant",
+        speaker: "orchestrator",
+        label: "Orchestrator",
+        content: text,
+        status: "error",
+        error: text,
+        phase: "control",
+        suggestedAction: suggestedForRunError(text),
+      });
+      this.emit(this.store.get(threadId));
+    } catch {
+      /* thread gone between stillOpen and append, or SSE emit failed */
+    }
   }
 
   private note(
@@ -704,7 +800,7 @@ export class ChatService {
     content: string,
     extra: Partial<ChatMessage> = {},
   ): ChatThread | undefined {
-    if (!threadId) return undefined;
+    if (!threadId || !this.stillOpen(threadId)) return undefined;
     this.store.append(threadId, {
       role: "assistant",
       speaker: "orchestrator",
@@ -715,7 +811,8 @@ export class ChatService {
       chip: "orchestrator",
       ...extra,
     });
-    const thread = this.store.require(threadId);
+    const thread = this.store.get(threadId);
+    if (!thread) return undefined;
     this.emit(thread);
     return thread;
   }
@@ -734,9 +831,20 @@ export class ChatService {
   }
 
   private writerForApproval(decision: RouteDecision): RouteSpeaker {
+    if (decision.applyPatch) {
+      return {
+        backendId: "orchestrator",
+        specialist: "apply-patch",
+        label: "Apply patch",
+        writesLocalFiles: true,
+      };
+    }
     if (decision.closer?.writesLocalFiles) return decision.closer;
+    if (decision.closer && /cursor/i.test(decision.closer.backendId)) return decision.closer;
     const fromSpeakers = decision.speakers?.find((s) => s.writesLocalFiles);
     if (fromSpeakers) return fromSpeakers;
+    const cursorSpeaker = decision.speakers?.find((s) => /cursor/i.test(s.backendId));
+    if (cursorSpeaker) return cursorSpeaker;
     return {
       backendId: "cursor-local",
       specialist: "builder",
@@ -751,6 +859,7 @@ export class ChatService {
     input: ChatSendInput,
     planText: string,
   ): void {
+    if (!this.stillOpen(threadId)) return;
     const writer = this.writerForApproval(decision);
     let cwd = input.cwd ?? decision.cwd ?? this.orchestrator.defaultCwd();
     try {
@@ -783,27 +892,91 @@ export class ChatService {
       phase: "approval",
       chip: "approval",
     });
-    this.emit(this.store.require(threadId));
+    this.emit(this.store.get(threadId));
+  }
+
+  private async runApplyPatch(threadId: string, pending: PendingApproval): Promise<void> {
+    let placeholderId: string | undefined;
+    try {
+      if (!this.stillOpen(threadId)) return;
+      const cwd = this.orchestrator.allowlist.assertCwd(pending.cwd ?? this.orchestrator.defaultCwd());
+      const speaker: RouteSpeaker = {
+        backendId: "orchestrator",
+        specialist: "apply-patch",
+        label: "Apply patch",
+        writesLocalFiles: true,
+      };
+      const decision: RouteDecision = {
+        kind: "single",
+        pin: pending.pin ?? "auto",
+        intent: "code",
+        chip: speaker.label,
+        needsWrites: true,
+        applyPatch: true,
+      };
+      const placeholder = this.beginSpeaker(threadId, speaker, decision, "single", "waiting");
+      placeholderId = placeholder.id;
+      if (!this.stillOpen(threadId)) return;
+      const hostNote = pending.systemWideInstall
+        ? "\n\nHost package commands were listed only — not executed (no apt, sudo, or Unity installer)."
+        : "";
+      const files = parseOrchestratorFiles(pending.summary);
+      if (!files.length && !pending.systemWideInstall) {
+        throw new Error(
+          'No files to apply. Put a fenced orchestrator-files JSON block in the plan: ```orchestrator-files\n{"files":[{"path":"README.md","content":"..."}]}\n```',
+        );
+      }
+      const written = files.length
+        ? applyParsedFiles({ cwd, files, allowlist: this.orchestrator.allowlist }).written
+        : [];
+      if (!this.stillOpen(threadId)) return;
+      const list = written.length ? written.map((p) => `• ${p}`).join("\n") : "(no files)";
+      this.store.patchMessage(threadId, placeholder.id, {
+        content: `Wrote ${written.length} file(s) inside ${cwd}:\n${list}${hostNote}`,
+        status: "finished",
+        chip: speaker.label,
+        thinkingPhase: undefined,
+        thinkingStartedAt: undefined,
+      });
+      this.stopHeartbeatIfIdle(threadId);
+      this.emit(this.store.get(threadId));
+    } catch (error) {
+      if (placeholderId) this.patchError(threadId, placeholderId, error);
+      else this.fail(threadId, error);
+    } finally {
+      const thread = this.store.get(threadId);
+      if (thread?.pendingApproval?.id === pending.id) {
+        this.store.setPendingApproval(threadId, undefined);
+      }
+    }
   }
 
   private async runApprovedCloser(threadId: string, pending: PendingApproval): Promise<void> {
-    const cwd = this.orchestrator.allowlist.assertCwd(pending.cwd ?? this.orchestrator.defaultCwd());
-    const placeholder = this.beginSpeaker(
-      threadId,
-      {
-        backendId: pending.backendId,
-        specialist: pending.specialist,
-        label: pending.label,
-        writesLocalFiles: true,
-      },
-      { kind: "single", pin: pending.pin ?? "auto", intent: "code", chip: pending.label, needsWrites: true },
-      "single",
-      "waiting",
-    );
-    const hostNote = pending.systemWideInstall
-      ? `\n\nThe user approved host installs (Unity Hub, apt, sudo) in addition to writes inside ${cwd}. Do not install anything outside that approval.`
-      : `\n\nWrites only inside ${cwd}. Do not install host packages (Unity Hub, apt, sudo).`;
+    if (pending.applyPatch || pending.backendId === "orchestrator" || pending.specialist === "apply-patch") {
+      await this.runApplyPatch(threadId, pending);
+      return;
+    }
+    let placeholderId: string | undefined;
     try {
+      if (!this.stillOpen(threadId)) return;
+      const cwd = this.orchestrator.allowlist.assertCwd(pending.cwd ?? this.orchestrator.defaultCwd());
+      const placeholder = this.beginSpeaker(
+        threadId,
+        {
+          backendId: pending.backendId,
+          specialist: pending.specialist,
+          label: pending.label,
+          writesLocalFiles: true,
+        },
+        { kind: "single", pin: pending.pin ?? "auto", intent: "code", chip: pending.label, needsWrites: true },
+        "single",
+        "waiting",
+      );
+      placeholderId = placeholder.id;
+      if (!this.stillOpen(threadId)) return;
+      const hostNote = pending.systemWideInstall
+        ? `\n\nThe user approved host installs (Unity Hub, apt, sudo) in addition to writes inside ${cwd}. Do not install anything outside that approval.`
+        : `\n\nWrites only inside ${cwd}. Do not install host packages (Unity Hub, apt, sudo).`;
       const run = await this.orchestrator.dispatch({
         specialist: pending.specialist,
         backend: pending.backendId,
@@ -817,6 +990,7 @@ export class ChatService {
         mode: "agent",
         onDelta: this.deltaHandler(threadId, placeholder.id),
       });
+      if (!this.stillOpen(threadId)) return;
       this.applyRun(
         threadId,
         placeholder.id,
@@ -830,17 +1004,28 @@ export class ChatService {
         },
       );
     } catch (error) {
-      this.patchError(threadId, placeholder.id, error);
+      if (placeholderId) this.patchError(threadId, placeholderId, error);
+      else this.fail(threadId, error);
     } finally {
-      const thread = this.store.require(threadId);
-      if (thread.pendingApproval?.id === pending.id) {
+      const thread = this.store.get(threadId);
+      if (thread?.pendingApproval?.id === pending.id) {
         this.store.setPendingApproval(threadId, undefined);
       }
     }
   }
 
-  private cwdForDispatch(decision: RouteDecision, speaker: RouteSpeaker, fallback?: string): string | undefined {
+  private cwdForDispatch(
+    decision: RouteDecision,
+    speaker: RouteSpeaker,
+    fallback?: string,
+    lateWrap = false,
+  ): string | undefined {
     if (!speaker.writesLocalFiles) return undefined;
+    if (lateWrap) {
+      const granted = decision.cwd ?? fallback;
+      if (!granted) return undefined;
+      return this.orchestrator.allowlist.tryCwd(granted) ?? undefined;
+    }
     const candidate = decision.cwd ?? fallback ?? this.orchestrator.defaultCwd();
     const allowed = this.orchestrator.allowlist.tryCwd(candidate);
     if (allowed) return allowed;
@@ -898,7 +1083,8 @@ export class ChatService {
   }
 
   private historyFor(threadId: string, excludeMessageId?: string): Array<{ role: "user" | "assistant"; content: string }> {
-    const thread = this.store.require(threadId);
+    const thread = this.store.get(threadId);
+    if (!thread) return [];
     const turns: Array<{ role: "user" | "assistant"; content: string }> = [];
     for (const msg of thread.messages) {
       if (msg.id === excludeMessageId) continue;
@@ -917,9 +1103,14 @@ export class ChatService {
     return parts.length ? parts.join("\n\n") : undefined;
   }
 
-  private emit(thread: ChatThread): void {
-    this.orchestrator.events.emit("chat", this.view(thread.id));
-    this.orchestrator.events.emit("chats", this.store.list());
+  private emit(thread: ChatThread | undefined): void {
+    if (!thread || !this.stillOpen(thread.id)) return;
+    try {
+      this.orchestrator.events.emit("chat", this.view(thread.id));
+      this.orchestrator.events.emit("chats", this.store.list());
+    } catch {
+      /* SSE client gone — chat state is already saved */
+    }
   }
 
   private beginSpeaker(
@@ -930,6 +1121,24 @@ export class ChatService {
     thinkingPhase: ThinkingPhase,
     round?: number,
   ): ChatMessage {
+    if (!this.stillOpen(threadId)) {
+      return {
+        id: crypto.randomUUID(),
+        createdAt: Date.now(),
+        role: "assistant",
+        speaker: speaker.backendId,
+        label: speaker.label,
+        content: "",
+        status: "error",
+        error: "chat deleted",
+        phase,
+        round,
+        chip: decision.chip,
+        nickname: speaker.nickname,
+        hasLogo: speaker.hasLogo,
+        logoUrl: speaker.logoUrl,
+      };
+    }
     const placeholder = this.store.append(threadId, {
       role: "assistant",
       speaker: speaker.backendId,
@@ -945,7 +1154,7 @@ export class ChatService {
       hasLogo: speaker.hasLogo,
       logoUrl: speaker.logoUrl,
     });
-    this.emit(this.store.require(threadId));
+    this.emit(this.store.get(threadId));
     this.startHeartbeat(threadId);
     return placeholder;
   }
@@ -954,21 +1163,26 @@ export class ChatService {
     let assembled = "";
     let lastEmit = 0;
     return (delta: string) => {
-      assembled += delta;
-      const now = Date.now();
-      this.store.patchMessage(
-        threadId,
-        messageId,
-        {
-          content: assembled,
-          status: "streaming",
-          thinkingPhase: "streaming",
-        },
-        false,
-      );
-      if (now - lastEmit >= 80) {
-        lastEmit = now;
-        this.emit(this.store.require(threadId));
+      if (!this.stillOpen(threadId)) return;
+      try {
+        assembled += delta;
+        const now = Date.now();
+        this.store.patchMessage(
+          threadId,
+          messageId,
+          {
+            content: assembled,
+            status: "streaming",
+            thinkingPhase: "streaming",
+          },
+          false,
+        );
+        if (now - lastEmit >= 80) {
+          lastEmit = now;
+          this.emit(this.store.get(threadId));
+        }
+      } catch {
+        /* thread gone */
       }
     };
   }
@@ -1000,7 +1214,11 @@ export class ChatService {
         return;
       }
       const payload: ChatHeartbeatPayload = { threadId, now: Date.now(), thinking };
-      this.orchestrator.events.emit("chat-heartbeat", payload);
+      try {
+        this.orchestrator.events.emit("chat-heartbeat", payload);
+      } catch {
+        /* SSE client gone */
+      }
     };
     tick();
     const timer = setInterval(tick, 1000);
@@ -1028,11 +1246,17 @@ function debateTurnPrompt(input: {
   speaker: RouteSpeaker;
   transcript: Array<{ label: string; text: string }>;
 }): string {
+  const late = isLateDeviceWrap(input.user);
+  const system = late ? LATE_JSON_SYSTEM : DEBATE_SYSTEM;
   const prior =
     input.transcript.length === 0
-      ? "You speak first this round. Give an independent take."
-      : `Round-table so far:\n${input.transcript.map((t) => `### ${t.label}\n${t.text}`).join("\n\n")}\n\nCritique, improve, or dissent. Quote disagreements clearly.`;
-  return `${DEBATE_SYSTEM}
+      ? late
+        ? "You speak first. Reply with one Late JSON object only."
+        : "You speak first this round. Give an independent take."
+      : late
+        ? `A prior speaker said:\n${input.transcript.map((t) => `### ${t.label}\n${t.text}`).join("\n\n")}\n\nIf they already emitted valid Late JSON, repeat that same JSON object with no extra prose. Do not lecture about the repo.`
+        : `Round-table so far:\n${input.transcript.map((t) => `### ${t.label}\n${t.text}`).join("\n\n")}\n\nCritique, improve, or dissent. Quote disagreements clearly.`;
+  return `${system}
 
 You are "${input.speaker.label}" (${input.speaker.backendId}). Round ${input.round} of ${input.rounds}.
 
@@ -1047,11 +1271,18 @@ function synthesisPrompt(
   transcript: Array<{ label: string; text: string }>,
   closer: RouteSpeaker,
   planOnly = false,
+  applyPatch = false,
 ): string {
   const body = transcript.map((t) => `### ${t.label}\n${t.text}`).join("\n\n") || "(no prior turns)";
-  const system = planOnly ? SYNTHESIS_PLAN_ONLY : SYNTHESIS_SYSTEM;
+  const system = planOnly
+    ? applyPatch
+      ? `${SYNTHESIS_PLAN_ONLY}\n${APPLY_PATCH_INSTRUCTIONS}`
+      : SYNTHESIS_PLAN_ONLY
+    : SYNTHESIS_SYSTEM;
   const closerHint = planOnly
-    ? "Write the merged plan only. Do not write files or install host packages."
+    ? applyPatch
+      ? "Write the merged plan only, ending with an orchestrator-files fence. Do not write files or install host packages."
+      : "Write the merged plan only. Do not write files or install host packages."
     : closer.writesLocalFiles
       ? "Then apply the agreed plan by writing files in the workspace cwd. Do not only outline steps."
       : "Text only — do not claim to have edited files.";

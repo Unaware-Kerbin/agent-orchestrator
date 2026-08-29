@@ -236,3 +236,78 @@ test("GET /api/secrets never echoes HF_TOKEN; PUT stores; DELETE clears", async 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("POST /api/allowlist and workspace reject a missing drop path with 400", async () => {
+  const events = new EventEmitter();
+  const missing = new Error("Directory does not exist: /no/such/orchestrator-drop");
+  const orchestrator = {
+    events,
+    catalog: async () => ({ backends: [], specialists: [], workflows: [] }),
+    localModels: {
+      snapshot: () => ({ models: [], recommended: [], jobs: [], hardware: {}, intelDocker: {} }),
+    },
+    store: { list: () => [], get: () => undefined },
+    configPath: "/tmp/agents.config.yaml",
+    config: { backends: {}, specialists: {} },
+    allowlist: {
+      list: () => ["/tmp"],
+      add: (path: string) => {
+        throw new Error(`Directory does not exist: ${path}`);
+      },
+      assertCwd: (path: string) => {
+        throw new Error(`Directory does not exist: ${path}`);
+      },
+    },
+    defaultCwd: () => "/tmp",
+    reloadConfig: () => undefined,
+    dispatch: async () => ({}),
+    followUp: async () => ({}),
+    runWorkflow: async () => ({ workflow: "", status: "ok", summary: "", runs: [] }),
+  };
+  const chat = {
+    list: () => [],
+    create: () => ({}),
+    get: () => ({}),
+    delete: () => false,
+    setPin: () => ({}),
+    setWorkspaceDir: () => {
+      throw missing;
+    },
+    send: async () => ({}),
+    runAction: async () => ({}),
+    resolveApproval: async () => ({}),
+  };
+  const token = "test-token-not-secret-16";
+  const port = await freeLoopbackPort();
+  const { server, listen } = startGuiServer({
+    orchestrator: orchestrator as never,
+    chat: chat as never,
+    token,
+    port,
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listen.port, listen.host, () => resolve());
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  try {
+    const grant = await fetch(`${base}/api/allowlist`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ path: "/no/such/orchestrator-drop" }),
+    });
+    assert.equal(grant.status, 400);
+    const grantBody = (await grant.json()) as { error?: string };
+    assert.match(grantBody.error ?? "", /does not exist/i);
+
+    const workspace = await fetch(`${base}/api/chats/thread-1/workspace`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ path: "/no/such/orchestrator-drop" }),
+    });
+    assert.equal(workspace.status, 400);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+});

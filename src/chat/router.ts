@@ -80,6 +80,7 @@ export function detectIntent(message: string): ChatIntent {
     /\b(implement|patch|refactor|write (?:the )?code|edit (?:the )?(?:file|repo)|apply (?:the )?fix|ship (?:this|it|a feature)|open a pr|pull request|\bprs?\b|fix this (?:bug|pr|failing)|add tests?|commit )\b/i.test(
       text,
     ) ||
+    /\b(?:write|create|generate|draft) (?:a |the )?(?:cli |ansible )?playbook\b/i.test(text) ||
     /\b(build|scaffold)\b/i.test(text) ||
     /\bcreate (?:a |the )?(?:file|readme|project|app|bot|dir(?:ectory)?|folder)\b/i.test(text) ||
     /\bcreate \S+\.\w{1,8}\b/i.test(text) ||
@@ -114,13 +115,43 @@ export function detectVisual3dIntent(message: string): boolean {
   );
 }
 
-export function detectNamedBackend(message: string): string | undefined {
+const LOCAL_FAMILY_NEEDLES: Array<{ re: RegExp; needle: string }> = [
+  { re: /\bgemma\b/, needle: "gemma" },
+  { re: /\bqwen\b/, needle: "qwen" },
+  { re: /\bmistral\b/, needle: "mistral" },
+  { re: /\bphi-?4\b/, needle: "phi" },
+  { re: /\bolmo\b/, needle: "olmo" },
+  { re: /\bgranite\b/, needle: "granite" },
+  { re: /\bdeepseek\b/, needle: "deepseek" },
+  { re: /\bllama\b/, needle: "llama" },
+];
+
+function backendsMatchingFamily(backends: RouterBackend[], needle: string): RouterBackend[] {
+  return backends.filter((b) => `${b.id} ${b.model ?? ""}`.toLowerCase().includes(needle));
+}
+
+export function detectNamedBackend(message: string, backends: RouterBackend[] = []): string | undefined {
   const text = message.toLowerCase();
   if (/\b(cursor cloud|cloud cursor|cloud[- ]builder)\b/.test(text)) return "cursor-cloud";
   if (/\b(cursor local|local cursor)\b/.test(text)) return "cursor-local";
   if (/\b(llama\.cpp|llamacpp|llama-server|llama cpp)\b/.test(text) && !/\bcursor\b/.test(text)) return "llamacpp";
   if (/\bollama\b/.test(text)) return "ollama";
-  if (/\b(vllm|local vllm|local model|qwen|llama|gemma|mistral|phi-?4|olmo|granite|deepseek)\b/.test(text) && !/\bcursor\b/.test(text)) return "local";
+  const families = LOCAL_FAMILY_NEEDLES.filter((row) => row.re.test(text));
+  if (families.length === 1 && backends.length) {
+    const matches = backendsMatchingFamily(backends, families[0]!.needle);
+    const pick = matches.find((b) => b.ready) ?? matches[0];
+    if (pick) return pick.id;
+  }
+  if (families.length > 1 && backends.length) {
+    // Two named locals (e.g. Qwen + Gemma): do not pin the first YAML row.
+    return undefined;
+  }
+  if (
+    (/\b(vllm|local vllm|local model)\b/.test(text) || families.length > 0) &&
+    !/\bcursor\b/.test(text)
+  ) {
+    return "local";
+  }
   if (/\b(gemini|google gemini)\b/.test(text)) return "gemini";
   if (/\b(anthropic|claude)\b/.test(text)) return "anthropic";
   if (/\b(openai|gpt-4|gpt4)\b/.test(text)) return "openai";
@@ -295,7 +326,7 @@ function findBackend(backends: RouterBackend[], id: string): RouterBackend | und
 }
 
 function vllmBackend(backends: RouterBackend[]): RouterBackend | undefined {
-  return backends.find((b) => b.type === "vllm" || b.id.startsWith("vllm"));
+  return backends.find((b) => isVllmBackend(b) && b.ready) ?? backends.find((b) => isVllmBackend(b));
 }
 
 function isOllamaId(id: string): boolean {
@@ -330,12 +361,12 @@ function llamaCppBackend(backends: RouterBackend[]): RouterBackend | undefined {
 function resolvePinTarget(
   pin: string,
   backends: RouterBackend[],
-  vllmRunning: boolean,
+  _vllmRunning: boolean,
 ): { backend?: RouterBackend; error?: string; suggestedAction?: ChatSuggestedAction } {
   const normalized = pin.trim().toLowerCase();
   if (normalized === "local") {
     const vllm = vllmBackend(backends);
-    if (vllm?.ready || vllmRunning) return { backend: vllm };
+    if (vllm?.ready) return { backend: vllm };
     return {
       error: "Local vLLM is not running.",
       suggestedAction: {
@@ -383,17 +414,41 @@ function resolvePinTarget(
   return { error: `Unknown backend "${pin}".` };
 }
 
+function runningVllmIds(ctx: RouterContext): Set<string> {
+  const ids = new Set((ctx.vllmBackendIds ?? []).filter(Boolean));
+  if (ids.size > 0) return ids;
+  if (ctx.vllmRunning && ctx.vllmModelId) {
+    for (const backend of ctx.backends) {
+      if (!isVllmBackend(backend)) continue;
+      const model = (backend.model ?? "").toLowerCase();
+      const needle = ctx.vllmModelId.toLowerCase();
+      if (
+        backend.id === ctx.vllmModelId ||
+        model === needle ||
+        model.endsWith(`/${needle}`) ||
+        backend.id.endsWith(needle.replaceAll("/", "-"))
+      ) {
+        ids.add(backend.id);
+      }
+    }
+  }
+  return ids;
+}
+
 function readyPool(ctx: RouterContext): RouterBackend[] {
   const skip = new Set(ctx.skipBackendIds ?? []);
+  const runningIds = runningVllmIds(ctx);
   const ready = ctx.backends.filter((b) => {
     if (skip.has(b.id)) return false;
-    if ((b.type === "vllm" || b.id.startsWith("vllm")) && ctx.vllmRunning === false) return false;
+    if (isVllmBackend(b) && ctx.vllmRunning === false && !runningIds.has(b.id)) return false;
     return b.ready;
   });
+  // Promote orchestrator-started instances that have not probed yet — never the first YAML row.
   if (ctx.vllmRunning) {
-    const vllm = vllmBackend(ctx.backends);
-    if (vllm && !ready.some((b) => b.id === vllm.id)) {
-      ready.unshift({ ...vllm, ready: true });
+    for (const id of runningIds) {
+      if (skip.has(id) || ready.some((b) => b.id === id)) continue;
+      const backend = findBackend(ctx.backends, id);
+      if (backend && isVllmBackend(backend)) ready.push({ ...backend, ready: true });
     }
   }
   return ready;
@@ -571,16 +626,18 @@ export function routeChat(ctx: RouterContext): RouteDecision {
   const mode: "auto" | "debate" | "single" | "backend" = MODE_PINS.has(pinLower)
     ? (pinLower as "auto" | "debate" | "single")
     : "backend";
-  const named = mode === "auto" ? detectNamedBackend(message) : undefined;
+  const named = mode === "auto" ? detectNamedBackend(message, ctx.backends) : undefined;
   const effectivePin = mode === "backend" ? rawPin : (named ?? pinLower);
   const intent = detectIntent(message);
   const visual3d = detectVisual3dIntent(message);
   const workspace = resolveWorkspaceHint(routed);
   const needsHostInstall = wantsHostInstall(message);
-  const needsWrites = wantsFileWrites(intent, message);
-  const needsApproval = needsWrites || needsHostInstall;
+  const lateWrap = isLateDeviceWrap(ctx.message);
   const preferLocal = Boolean(workspace?.path);
   const writeCwd = workspace?.allowed ? workspace.cwd : undefined;
+  const wantsWrites = wantsFileWrites(intent, message);
+  const needsWrites = lateWrap ? Boolean(wantsWrites && writeCwd) : wantsWrites;
+  const needsApproval = needsWrites || needsHostInstall;
   const approval = { needsWrites, needsHostInstall, needsApproval };
 
   if (intent === "control") {
@@ -634,16 +691,37 @@ export function routeChat(ctx: RouterContext): RouteDecision {
     }
     const speaker = asSpeaker(resolved.backend, intent, ctx, visual3d);
     const sameBackend = ctx.prior?.backend === speaker.backendId && ctx.prior.runId;
+    const readyNow = readyPool(ctx);
+    const pinCursor = writerBackend(readyNow, preferLocal);
+    const pinApplyPatch = Boolean(
+      needsWrites && !speaker.writesLocalFiles && !pinCursor && readyNow.some(isLocalServerBackend),
+    );
+    if (needsWrites && !speaker.writesLocalFiles && !pinCursor && !pinApplyPatch) {
+      const { error, suggestedAction } = cursorKeyError(preferLocal);
+      return {
+        kind: "error",
+        pin: effectivePin,
+        intent,
+        chip: "cursor",
+        error,
+        suggestedAction,
+        cwd: writeCwd,
+        ...approval,
+      };
+    }
+    const writer = pinCursor && needsWrites ? asSpeaker(pinCursor, intent, ctx, visual3d) : undefined;
     return {
       kind: "single",
       pin: effectivePin,
       intent,
       speakers: [speaker],
+      closer: writer,
       chip: speaker.label,
       followUpRunId: sameBackend ? ctx.prior?.runId : undefined,
-      cwd: speaker.writesLocalFiles ? writeCwd : undefined,
+      cwd: speaker.writesLocalFiles || pinApplyPatch || Boolean(writer) ? writeCwd : undefined,
       ...approval,
       needsWrites: speaker.writesLocalFiles ? needsWrites : needsApproval,
+      ...(pinApplyPatch ? { applyPatch: true } : {}),
     };
   }
 
@@ -667,28 +745,35 @@ export function routeChat(ctx: RouterContext): RouteDecision {
     };
   }
 
-  if (needsWrites) {
-    const cursor = writerBackend(ready, preferLocal);
-    if (!cursor) {
-      const { error, suggestedAction } = cursorKeyError(preferLocal);
-      return {
-        kind: "error",
-        pin: pinLower,
-        intent,
-        chip: "cursor",
-        error,
-        suggestedAction,
-        cwd: writeCwd,
-        ...approval,
-      };
-    }
+  const cursorWriter = writerBackend(ready, preferLocal);
+  const applyPatch = Boolean(
+    needsWrites &&
+      ready.some(isLocalServerBackend) &&
+      (!cursorWriter || lateWrap),
+  );
+  if (needsWrites && !cursorWriter && !applyPatch) {
+    const { error, suggestedAction } = cursorKeyError(preferLocal);
+    return {
+      kind: "error",
+      pin: pinLower,
+      intent,
+      chip: "cursor",
+      error,
+      suggestedAction,
+      cwd: writeCwd,
+      ...approval,
+    };
   }
 
   const forceDebate = mode === "debate";
   const debateReady =
     ready.length >= 2 &&
-    (!needsWrites || Boolean(writerBackend(ready, preferLocal)));
-  const multipleLocalModels = ready.filter(isLocalServerBackend).length >= 2;
+    (!needsWrites || Boolean(cursorWriter) || applyPatch);
+  const multipleVllm = ready.filter(isVllmBackend).length >= 2;
+  const multipleOtherLocal =
+    ready.filter(isVllmBackend).length === 0 &&
+    ready.filter((b) => isOllamaBackend(b) || isLlamaCppBackend(b)).length >= 2;
+  const multipleLocalModels = multipleVllm || multipleOtherLocal;
   const autoDebate =
     mode === "auto" && debateReady && (DEBATE_INTENTS.has(intent) || multipleLocalModels);
 
@@ -705,9 +790,12 @@ export function routeChat(ctx: RouterContext): RouteDecision {
         closer,
         rounds: Math.min(Math.max(rounds, 1), MAX_ROUNDS),
         chip: formatChip("debate", speakers, closer),
-        note: "round-table",
-        cwd: closer.writesLocalFiles ? writeCwd : undefined,
+        note: applyPatch
+          ? "round-table · after Approve, the orchestrator writes files inside the granted folder"
+          : "round-table",
+        cwd: closer.writesLocalFiles || applyPatch ? writeCwd : undefined,
         ...approval,
+        ...(applyPatch ? { applyPatch: true } : {}),
       };
     }
   }
@@ -726,7 +814,9 @@ export function routeChat(ctx: RouterContext): RouteDecision {
 
   const sameBackend = ctx.prior?.backend === speaker.backendId && ctx.prior.runId && ctx.followUp;
   let note: string | undefined;
-  if (needsWrites && !speaker.writesLocalFiles) {
+  if (applyPatch) {
+    note = "After you Approve, the orchestrator writes files inside the granted folder. Cursor is not required.";
+  } else if (needsWrites && !speaker.writesLocalFiles) {
     note = "Text only — this backend cannot edit the repo. Set CURSOR_API_KEY so Cursor local can apply the change.";
   }
   if (forceDebate && ready.length < 2) {
@@ -741,8 +831,9 @@ export function routeChat(ctx: RouterContext): RouteDecision {
     chip: speaker.label,
     followUpRunId: sameBackend ? ctx.prior?.runId : undefined,
     note,
-    cwd: speaker.writesLocalFiles ? writeCwd : undefined,
+    cwd: speaker.writesLocalFiles || applyPatch ? writeCwd : undefined,
     ...approval,
+    ...(applyPatch ? { applyPatch: true } : {}),
     suggestedAction:
       speaker.backendId !== "vllm-local" && ctx.vllmRunning === false && !needsWrites
         ? startVllmAction()

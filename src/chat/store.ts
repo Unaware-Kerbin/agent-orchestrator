@@ -94,12 +94,13 @@ export class ChatStore {
   }
 
   append(id: string, message: Omit<ChatMessage, "id" | "createdAt"> & { id?: string; createdAt?: number }): ChatMessage {
-    const thread = this.require(id);
     const full: ChatMessage = {
       id: message.id ?? crypto.randomUUID(),
       createdAt: message.createdAt ?? Date.now(),
       ...message,
     };
+    const thread = this.get(id);
+    if (!thread) return full;
     thread.messages.push(full);
     if (full.speaker && full.role === "assistant" && !thread.agents.includes(full.speaker)) {
       thread.agents.push(full.speaker);
@@ -112,9 +113,30 @@ export class ChatStore {
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<ChatMessage>, persist = true): ChatMessage {
-    const thread = this.require(threadId);
+    const thread = this.get(threadId);
+    if (!thread) {
+      return {
+        role: "assistant",
+        speaker: "",
+        label: "",
+        content: "",
+        createdAt: Date.now(),
+        ...patch,
+        id: messageId,
+      };
+    }
     const idx = thread.messages.findIndex((m) => m.id === messageId);
-    if (idx < 0) throw new Error(`Unknown message ${messageId}`);
+    if (idx < 0) {
+      return {
+        role: "assistant",
+        speaker: "",
+        label: "",
+        content: "",
+        createdAt: Date.now(),
+        ...patch,
+        id: messageId,
+      };
+    }
     const current = thread.messages[idx]!;
     const next = { ...current, ...patch, id: messageId };
     thread.messages[idx] = next;
@@ -133,8 +155,15 @@ export class ChatStore {
     return this.save(thread);
   }
 
-  setPendingApproval(id: string, pending: ChatThread["pendingApproval"] | undefined): ChatThread {
+  setWorkspaceDir(id: string, path: string): ChatThread {
     const thread = this.require(id);
+    thread.workspaceDir = path;
+    return this.save(thread);
+  }
+
+  setPendingApproval(id: string, pending: ChatThread["pendingApproval"] | undefined): ChatThread | undefined {
+    const thread = this.get(id);
+    if (!thread) return undefined;
     if (pending) thread.pendingApproval = pending;
     else delete thread.pendingApproval;
     return this.save(thread);

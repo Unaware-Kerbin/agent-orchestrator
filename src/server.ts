@@ -198,6 +198,26 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
   );
 
   server.registerTool(
+    "chat_delete",
+    {
+      description:
+        "Delete a persisted GUI/MCP chat thread by id. Late will wait for Approve. Does not delete files on disk outside the chat store.",
+      inputSchema: z.object({
+        thread_id: z.string().describe("Chat thread id from chat_send or chat_list"),
+      }),
+    },
+    async (args) => {
+      try {
+        const ok = chat.delete(args.thread_id);
+        if (!ok) return textResult({ error: `Unknown chat ${args.thread_id}` }, true);
+        return textResult({ ok: true, id: args.thread_id });
+      } catch (error) {
+        return textResult({ error: compactChatToolError(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
     "run_workflow",
     {
       description:

@@ -25,7 +25,13 @@ export class VllmProvider implements AgentProvider {
     if (this.lastProbe && Date.now() - this.lastProbe.at < 15_000) {
       return this.lastProbe.health;
     }
-    return this.configHealth();
+    const snapshot = this.configHealth();
+    if (this.config.probe === false) return snapshot;
+    return {
+      ...snapshot,
+      ready: false,
+      reason: `Configured at ${normalizeBaseUrl(this.config.baseUrl ?? DEFAULT_BASE)} (will probe /models; API key optional)`,
+    };
   }
 
   async probe(): Promise<ProviderHealth> {
@@ -49,6 +55,19 @@ export class VllmProvider implements AgentProvider {
         signal: AbortSignal.timeout(timeoutMs),
       });
       void response.arrayBuffer().catch(() => undefined);
+      if (!response.ok) {
+        const health: ProviderHealth = {
+          id: this.id,
+          type: "vllm",
+          ready: false,
+          reason: `vLLM not ready at ${baseUrl} (HTTP ${response.status})`,
+          capabilities: this.capabilities,
+          writesLocalFiles: false,
+          ...this.meta(),
+        };
+        this.lastProbe = { at: Date.now(), health };
+        return health;
+      }
       const health = readyHealth(this.id, "vllm", this.capabilities, {
         ...this.meta(),
         reason: `vLLM reachable at ${baseUrl} (HTTP ${response.status})`,

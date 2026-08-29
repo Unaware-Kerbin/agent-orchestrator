@@ -40,8 +40,25 @@ function readBoundedMs(envName: string, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
+/** Cursor quoting orchestrator sources is not a Late tool reply. */
+export function looksLikeRepoCodeLecture(text: string): boolean {
+  return /src\/chat\/(?:service|timeout)\.ts|test\/chat-(?:busy|timeout)\.test\.ts|export function looksLikeLateToolJson/.test(
+    text,
+  );
+}
+
+function isMostlyLateJson(text: string): boolean {
+  const t = text.trim();
+  if (t.startsWith("{") && LATE_TOOL_RE.test(t)) return true;
+  const fence = t.match(/```(?:json)?\s*(\{[\s\S]*?"tool"\s*:[\s\S]*?\})\s*```/i);
+  if (fence?.[1] && fence[1].length > t.length * 0.35) return true;
+  return false;
+}
+
 export function looksLikeLateToolJson(text: string): boolean {
-  return LATE_TOOL_RE.test(text);
+  if (!LATE_TOOL_RE.test(text)) return false;
+  if (looksLikeRepoCodeLecture(text) && !isMostlyLateJson(text)) return false;
+  return true;
 }
 
 export function timeoutErrorMessage(label: string, timeoutMs: number): string {

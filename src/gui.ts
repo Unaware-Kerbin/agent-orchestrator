@@ -7,6 +7,7 @@ import { createOrchestratorMcpHandler } from "./mcp-http-handler.js";
 import { loadMcpAuthConfig, McpAuth } from "./mcp/auth/index.js";
 import { lateMcpCopyLines } from "./mcp/bind.js";
 import { writeAdvertisedMcpUrl } from "./mcp/advertise.js";
+import { installProcessGuards } from "./mcp/process-guard.js";
 import { openUrl as openInBrowser } from "./platform.js";
 
 const port = Number(process.env.AGENT_ORCHESTRATOR_GUI_PORT ?? "8787");
@@ -30,6 +31,8 @@ try {
   process.exit(1);
 }
 
+installProcessGuards("gui");
+
 const { orchestrator, chat } = createOrchestrator();
 const secret = loadOrCreateGuiToken();
 const mcpHandler = createOrchestratorMcpHandler(orchestrator, chat);
@@ -50,7 +53,7 @@ server.on("error", (error) => {
     process.exit(1);
   }
   console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
+  if (!server.listening) process.exit(1);
 });
 
 const shutdown = (): void => {
