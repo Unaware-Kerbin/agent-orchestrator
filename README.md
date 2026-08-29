@@ -1,6 +1,17 @@
 # Agent Orchestrator
 
-MCP server and localhost GUI that routes work across **Cursor agents** and **external LLM backends** (OpenAI-compatible APIs, Anthropic, local vLLM, Ollama, or a custom HTTP agent).
+Agent Orchestrator is a window on **your computer**. You chat with models that already run here or on a box you started. Other apps (like Late) can use it as MCP.
+
+Writes wait for **Approve**. Keys stay on this computer. Bind is loopback (`127.0.0.1`).
+
+## How it works
+
+1. You start it on this computer (`npm run gui`, or the app from Releases).
+2. You open the local page it prints. That URL is only for this machine.
+3. You type in Chat. **Auto** picks who speaks. Implement/install still waits for **Approve**.
+4. If you want Late (or another client) to use this as the agent, click **Copy MCP URL**. It is `/mcp` on the **same port as the web UI**, not always 8787. The HTML page is not MCP.
+
+That is the whole idea.
 
 ```
 Chat (GUI or MCP)
@@ -9,6 +20,10 @@ Chat (GUI or MCP)
       → External models — text only
       → Local model server on 127.0.0.1 — never public
 ```
+
+## Watch it
+
+![Watch how Agent Orchestrator works](docs/assets/orchestrator-demo.webp)
 
 ## Install
 
