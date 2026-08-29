@@ -384,6 +384,10 @@ export class Orchestrator {
 
   private cwdForBackend(backend: BackendConfig | undefined, declaredCwd: string): string | undefined {
     if (writesLocalFiles(backend)) {
+      const allowed = this.allowlist.tryCwd(declaredCwd);
+      if (allowed) return allowed;
+      const first = this.allowlist.list()[0];
+      if (first) return first;
       return this.allowlist.assertCwd(declaredCwd);
     }
     return undefined;

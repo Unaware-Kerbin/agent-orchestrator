@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { assertNoMachineHome, assertRepoHasNoMachineHome, REPO_ROOT } from "./machine-paths.js";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const THEME_IDS = ["grove", "noir", "linen", "harbor", "ember", "paper"] as const;
 const REQUIRED_VARS = [
   "--bg",
@@ -24,7 +23,7 @@ const REQUIRED_VARS = [
 ];
 
 test("GUI CSS defines data-theme palettes with required variables", () => {
-  const css = readFileSync(join(root, "gui/public/styles.css"), "utf8");
+  const css = readFileSync(join(REPO_ROOT, "gui/public/styles.css"), "utf8");
   for (const id of THEME_IDS) {
     const marker = `[data-theme="${id}"]`;
     const start = css.indexOf(marker);
@@ -40,7 +39,7 @@ test("GUI CSS defines data-theme palettes with required variables", () => {
 });
 
 test("GUI JS lists theme ids, storage key, and Grove fallback", () => {
-  const js = readFileSync(join(root, "gui/public/app.js"), "utf8");
+  const js = readFileSync(join(REPO_ROOT, "gui/public/app.js"), "utf8");
   assert.ok(js.includes('THEME_KEY = "orchestrator.gui.theme"'));
   assert.ok(js.includes('DEFAULT_THEME = "grove"'));
   assert.ok(js.includes("isThemeId(id) ? id : DEFAULT_THEME"));
@@ -50,7 +49,7 @@ test("GUI JS lists theme ids, storage key, and Grove fallback", () => {
 });
 
 test("index.html applies stored theme before stylesheet paint", () => {
-  const html = readFileSync(join(root, "gui/public/index.html"), "utf8");
+  const html = readFileSync(join(REPO_ROOT, "gui/public/index.html"), "utf8");
   const headEnd = html.indexOf("</head>");
   const head = html.slice(0, headEnd);
   const scriptAt = head.indexOf("<script>");
@@ -65,7 +64,7 @@ test("index.html applies stored theme before stylesheet paint", () => {
 });
 
 test("Local models Settings UI pastes HF_TOKEN and links to the Hub token page", () => {
-  const js = readFileSync(join(root, "gui/public/app.js"), "utf8");
+  const js = readFileSync(join(REPO_ROOT, "gui/public/app.js"), "utf8");
   assert.ok(js.includes("https://huggingface.co/settings/tokens"));
   assert.ok(js.includes('data-name="HF_TOKEN"'));
   assert.ok(js.includes('data-clear-secret="HF_TOKEN"'));
@@ -73,9 +72,29 @@ test("Local models Settings UI pastes HF_TOKEN and links to the Hub token page",
   assert.ok(js.includes('method: "DELETE"'));
   assert.equal(js.includes("oauth/callback"), false);
   assert.equal(js.includes("0.0.0.0"), false);
-  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const readme = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
   assert.ok(readme.includes("Gemma Terms of Use"));
   assert.ok(readme.includes("Settings → Local models"));
   assert.ok(readme.includes("huggingface.co/settings/tokens"));
   assert.equal(/\bhf_[A-Za-z0-9]{16,}\b/.test(readme), false);
+});
+
+test("GUI Settings copies session mcpUrl for Late; bound port, not a machine home path", () => {
+  const js = readFileSync(join(REPO_ROOT, "gui/public/app.js"), "utf8");
+  assert.ok(js.includes("data-copy-mcp"));
+  assert.ok(js.includes("mcpUrlForLate"));
+  assert.ok(js.includes("sessionInfo.mcpUrl"));
+  assert.ok(js.includes("Copy MCP URL"));
+  assert.ok(js.includes("Late works") || js.includes("does not need this server"));
+  assert.equal(js.includes("http://${escapeHtml(location.host)}/mcp"), false);
+  assertNoMachineHome(js, "gui/public/app.js");
+  const readme = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
+  assert.match(readme, /printed/i);
+  assertNoMachineHome(readme, "README.md");
+  const envEx = readFileSync(join(REPO_ROOT, ".env.example"), "utf8");
+  assertNoMachineHome(envEx, ".env.example");
+});
+
+test("repo text files do not embed this computer's home path", () => {
+  assertRepoHasNoMachineHome();
 });

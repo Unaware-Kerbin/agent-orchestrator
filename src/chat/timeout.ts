@@ -1,13 +1,31 @@
-/** Per-speaker debate cap. Hung Cursor/Gemini must not block the round-table. */
+/** Per-speaker debate cap for fast local/cloud HTTP models. Hung Gemini must not block the round-table. */
 export const DEFAULT_SPEAKER_TIMEOUT_MS = 25_000;
+/**
+ * Cursor local/cloud need longer than 25s (SDK create + wait). A 25s race
+ * left `cursor-cloud` on “timed out after 25s” / “Run stream is no longer available”.
+ */
+export const DEFAULT_CURSOR_TIMEOUT_MS = 90_000;
 /** After a Late `propose_command` JSON lands, wait this long for other speakers then return. */
 export const DEFAULT_EARLY_FLUSH_GRACE_MS = 2_500;
 
 const LATE_TOOL_RE =
   /"tool"\s*:\s*"(propose_command|propose_api_get|propose_staged_artifact|list_open_sessions|read_scrollback|query_pcap|ask_user)"/;
 
-export function speakerTimeoutMs(): number {
-  return readBoundedMs("AGENT_ORCHESTRATOR_SPEAKER_TIMEOUT_MS", DEFAULT_SPEAKER_TIMEOUT_MS, 50, 120_000);
+export function isCursorSpeaker(backendId?: string): boolean {
+  if (!backendId) return false;
+  const id = backendId.trim().toLowerCase();
+  return id === "cursor" || id.startsWith("cursor-");
+}
+
+export function speakerTimeoutMs(backendId?: string): number {
+  const shared = process.env.AGENT_ORCHESTRATOR_SPEAKER_TIMEOUT_MS;
+  if (shared !== undefined && shared !== "") {
+    return readBoundedMs("AGENT_ORCHESTRATOR_SPEAKER_TIMEOUT_MS", DEFAULT_SPEAKER_TIMEOUT_MS, 50, 180_000);
+  }
+  if (isCursorSpeaker(backendId)) {
+    return readBoundedMs("AGENT_ORCHESTRATOR_CURSOR_TIMEOUT_MS", DEFAULT_CURSOR_TIMEOUT_MS, 50, 180_000);
+  }
+  return DEFAULT_SPEAKER_TIMEOUT_MS;
 }
 
 export function earlyFlushGraceMs(): number {
@@ -31,6 +49,9 @@ export function timeoutErrorMessage(label: string, timeoutMs: number): string {
   return `${label} timed out after ${secs}s — skipped so other speakers can finish.`;
 }
 
+/** Leftover debate rows after another speaker already produced a Late tool JSON. */
+export const LEFTOVER_SPEAKER_SKIP = "skipped so other speakers can finish.";
+
 /** Timeouts, 429s, and quota errors skip one speaker — they are not a thread/tool failure. */
 export function isSpeakerSkipError(text: string): boolean {
   const t = text.trim();
@@ -38,19 +59,35 @@ export function isSpeakerSkipError(text: string): boolean {
   if (/timed out after \d+s/i.test(t)) return true;
   if (/\b429\b/.test(t)) return true;
   if (/rate[- ]limit|RESOURCE_EXHAUSTED|quota exceeded/i.test(t)) return true;
+  if (/skipped so other speakers/i.test(t)) return true;
+  if (/run stream is no longer available/i.test(t)) return true;
   return false;
 }
 
 /** One-line chip for a skipped debate speaker (never a JSON blob). */
 export function speakerSkipLine(label: string, text: string): string {
   const t = text.trim();
+  if (!t || /^(none|null|undefined)$/i.test(t)) {
+    return `${label}: failed (no error detail)`;
+  }
   const secs = t.match(/timed out after (\d+)s/i)?.[1];
   if (secs) return `${label}: timed out after ${secs}s — skipped`;
   if (/\b429\b/.test(t) || /rate[- ]limit|RESOURCE_EXHAUSTED|quota exceeded/i.test(t)) {
     return `${label}: rate-limited (429) — skipped`;
   }
+  if (/run stream is no longer available/i.test(t)) {
+    return `${label}: skipped (stream ended)`;
+  }
   const first = (t.split(/\n/)[0] ?? "skipped").trim().slice(0, 100);
   return `${label}: ${first || "skipped"}`;
+}
+
+/** Empty SDK strings like "none" must not become a blank / “(ERROR) none” chip. */
+export function speakerErrorText(label: string, raw: string | undefined): string {
+  const t = (raw ?? "").trim();
+  if (!t || /^(none|null|undefined)$/i.test(t)) return `${label} failed (no error detail).`;
+  if (isSpeakerSkipError(t) || /skipped/i.test(t)) return speakerSkipLine(label, t);
+  return t;
 }
 
 /** Attach a no-op catch so a later rejection cannot become `unhandledRejection`. */

@@ -25,6 +25,11 @@ import { KNOWN_SECRET_NAMES, deleteSecrets, refreshRuntimeEnv, secretStatus, ups
 import { toRunView } from "../views.js";
 import type { OrchestratedRun } from "../types.js";
 import { handleTempAnalyzeApi, TEMP_ANALYZE_PATH } from "../temp-analyze-http.js";
+import type { McpHttpHandler } from "@modelcontextprotocol/server";
+import { tryHandleMcpRequest } from "../mcp/attach.js";
+import type { McpAuth } from "../mcp/auth/index.js";
+import { loopbackMcpUrl } from "../mcp/bind.js";
+import { isMcpPath } from "../mcp/paths.js";
 
 const HOST = "127.0.0.1";
 const MAX_BODY = 1_000_000;
@@ -41,6 +46,7 @@ export interface GuiListen {
   host: typeof HOST;
   port: number;
   url: string;
+  mcpUrl: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -94,6 +100,7 @@ export function hostAllowed(hostHeader: string | undefined, port: number): boole
   );
 }
 
+/** GUI /api Origin must match this server's port. Missing Origin is allowed. */
 export function originAllowed(origin: string | undefined, port: number): boolean {
   if (!origin) return true;
   try {
@@ -102,6 +109,18 @@ export function originAllowed(origin: string | undefined, port: number): boolean
     const hostOk = url.hostname === HOST || url.hostname === "localhost";
     const portOk = url.port === String(port) || (url.port === "" && port === 80);
     return hostOk && portOk;
+  } catch {
+    return false;
+  }
+}
+
+/** Streamable HTTP /mcp: any loopback Origin (Late UI :5173 / sidecar :7430) or none. */
+export function mcpOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== "http:") return false;
+    return url.hostname === HOST || url.hostname === "localhost" || url.hostname === "::1";
   } catch {
     return false;
   }
@@ -125,9 +144,11 @@ export function startGuiServer(options: {
   chat: ChatService;
   token: string;
   port: number;
+  mcpHandler?: McpHttpHandler;
+  mcpAuth?: McpAuth;
 }): { server: ReturnType<typeof createServer>; listen: GuiListen } {
-  const { orchestrator, chat, token, port } = options;
-  const listen: GuiListen = { host: HOST, port, url: `http://${HOST}:${port}` };
+  const { orchestrator, chat, token, port, mcpHandler, mcpAuth } = options;
+  const listen: GuiListen = { host: HOST, port, url: `http://${HOST}:${port}`, mcpUrl: loopbackMcpUrl(port) };
   const sseClients = new Set<ServerResponse>();
 
   const broadcastRun = (run: OrchestratedRun) => {
@@ -190,13 +211,21 @@ export function startGuiServer(options: {
       send(res, 403, { error: "Invalid Host header" });
       return;
     }
+
+    const url = new URL(req.url ?? "/", `http://${HOST}:${port}`);
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
-    if (!originAllowed(origin, port)) {
+    if (mcpHandler && mcpAuth && isMcpPath(url.pathname)) {
+      if (!mcpOriginAllowed(origin)) {
+        send(res, 403, { error: "Origin not allowed" });
+        return;
+      }
+      if (await tryHandleMcpRequest({ req, res, url, auth: mcpAuth, handler: mcpHandler })) {
+        return;
+      }
+    } else if (!originAllowed(origin, port)) {
       send(res, 403, { error: "Origin not allowed" });
       return;
     }
-
-    const url = new URL(req.url ?? "/", `http://${HOST}:${port}`);
 
     if (url.pathname === "/health" && method === "GET") {
       send(res, 200, { ok: true, bind: `${HOST}:${port}`, pid: process.pid });
@@ -284,7 +313,7 @@ export function startGuiServer(options: {
     const path = url.pathname;
 
     if (path === "/api/session" && method === "GET") {
-      send(res, 200, { ok: true, bind: `${HOST}:${port}` });
+      send(res, 200, { ok: true, bind: `${HOST}:${port}`, mcpUrl: listen.mcpUrl });
       return;
     }
 

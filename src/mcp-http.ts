@@ -8,7 +8,8 @@ import {
   pipeMcpHttpRequest,
   writeMcpHealth,
 } from "./mcp-http-handler.js";
-import { bindMcpLoopbackOnly } from "./mcp/bind.js";
+import { writeAdvertisedMcpUrl } from "./mcp/advertise.js";
+import { bindMcpLoopbackOnly, lateMcpCopyLines, loopbackMcpUrl } from "./mcp/bind.js";
 import { isMcpLivenessGet } from "./mcp/paths.js";
 import { installMcpProcessGuards } from "./mcp/process-guard.js";
 import {
@@ -134,11 +135,14 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 server.listen(port, HOST, () => {
+  const mcpUrl = loopbackMcpUrl(port);
+  writeAdvertisedMcpUrl(mcpUrl, { kind: "http" });
   console.error(`agent-orchestrator MCP Streamable HTTP`);
   console.error(`  bind:  ${HOST}:${port}`);
-  console.error(`  url:   http://${HOST}:${port}/mcp`);
-  console.error(`  health: GET http://${HOST}:${port}/mcp/health  → {"ok":true} (loopback, no tools)`);
-  console.error(`  notes: The GUI on :8787 is not MCP. Late Settings on this computer: this URL.`);
+  console.error(`  url:   ${mcpUrl}`);
+  console.error(`  health: GET ${mcpUrl}/health  → {"ok":true} (loopback, no tools)`);
+  for (const line of lateMcpCopyLines(mcpUrl)) console.error(`  ${line}`);
+  console.error(`  notes: The GUI also serves /mcp on AGENT_ORCHESTRATOR_GUI_PORT (same-process as the web UI).`);
   console.error(`         Temp pcap allowlist: POST ${TEMP_ANALYZE_PATH} with Bearer (GUI token).`);
   console.error(`         Bound to 127.0.0.1 only. You start this process. Late will not start it.`);
 });

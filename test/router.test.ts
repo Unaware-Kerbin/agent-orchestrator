@@ -8,6 +8,7 @@ import {
   detectVisual3dIntent,
   extractFilesystemPaths,
   extractRoutableMessage,
+  isLateDeviceWrap,
   routeChat,
   speakerLabel,
   wantsHostInstall,
@@ -579,6 +580,22 @@ test("ready Ollama joins Auto debate with vLLM", () => {
   assert.equal(decision.kind, "debate");
   assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
   assert.ok(decision.speakers?.some((s) => s.backendId === "ollama"));
+});
+
+test("plain GUI chat_send is unchanged: wrap extract is identity", () => {
+  const msg = "what models fit my Arc GPUs?";
+  assert.equal(isLateDeviceWrap(msg), false);
+  assert.equal(extractRoutableMessage(msg), msg);
+  const decision = routeChat(
+    ctx({
+      message: msg,
+      pin: "auto",
+      backends: [backend("vllm-local")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "control");
+  assert.equal(decision.control, "hardware");
 });
 
 function lateWrap(operatorTurn: string): string {

@@ -69,6 +69,43 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+async function loadSession() {
+  const data = await api("/api/session");
+  sessionInfo = {
+    mcpUrl: typeof data.mcpUrl === "string" ? data.mcpUrl : "",
+    bind: typeof data.bind === "string" ? data.bind : "",
+  };
+  return data;
+}
+
+/** Exact Late Settings URL from this GUI process (127.0.0.1 + bound port). Never a hardcoded GUI default. */
+function mcpUrlForLate() {
+  if (sessionInfo.mcpUrl) return sessionInfo.mcpUrl;
+  const host = location.hostname === "localhost" || location.hostname === "[::1]" ? "127.0.0.1" : location.hostname;
+  const port = location.port;
+  return `http://${host}${port ? `:${port}` : ""}/mcp`;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    document.body.appendChild(el);
+    el.select();
+    try {
+      return document.execCommand("copy");
+    } finally {
+      el.remove();
+    }
+  }
+}
+
 function backendEntry(id) {
   return (catalog.backends ?? []).find((b) => b.id === id);
 }
@@ -111,6 +148,7 @@ function tokenFromLocation() {
 
 let token = tokenFromLocation();
 let catalog = { backends: [], specialists: [], workflows: [], writePolicy: { allowedDirectories: [], defaultCwd: "" }, localRuntime: {} };
+let sessionInfo = { mcpUrl: "", bind: "" };
 let runs = [];
 let localModels = null;
 let localServers = { ollama: null, llamacpp: [], llamaServerBinary: null, ollamaBinary: null };
@@ -725,7 +763,14 @@ async function renderBackends() {
     <div class="cards">${cards}</div>
     <div class="card" style="margin-top:0.85rem">
       <h2>MCP HTTP (any client)</h2>
-      <p class="muted">Streamable HTTP at <span class="mono">http://127.0.0.1:8787/mcp</span>. Requires <span class="mono">Authorization: Bearer</span> (same loopback token as this GUI). Path is <span class="mono">/mcp</span>. Unauthenticated calls return 401. Stdio MCP is unchanged.</p>
+      <p class="muted">Streamable HTTP on this GUI process. Path is <span class="mono">/mcp</span> (also <span class="mono">/MCP</span>). Late does not send the GUI token and does not need this server. Optional dedicated process: <span class="mono">npm run mcp:http</span> (<span class="mono">AGENT_ORCHESTRATOR_MCP_PORT</span>).</p>
+      <label class="field">Late Settings URL (this process)
+        <input id="mcp-url" class="mono" type="text" readonly value="${escapeHtml(mcpUrlForLate())}" />
+      </label>
+      <div class="actions">
+        <button type="button" class="btn" data-copy-mcp>Copy MCP URL</button>
+        <span id="mcp-copy-status" class="muted"></span>
+      </div>
       <p class="muted">Optional ClearPass / ISE (RADIUS) and Active Directory (LDAPS) are off until you set <span class="mono">AGENT_ORCHESTRATOR_MCP_AUTH</span> in <span class="mono">.env</span>. Secrets below never go in YAML.</p>
       <form class="secret-form" data-name="RADIUS_SECRET">
         <label class="field">RADIUS_SECRET (ClearPass / ISE shared secret)
@@ -1372,7 +1417,7 @@ $("gate-form").addEventListener("submit", async (event) => {
   token = $("token-input").value.trim();
   sessionStorage.setItem(TOKEN_KEY, token);
   try {
-    await api("/api/session");
+    await loadSession();
     showShell();
     await loadCatalog();
     await loadThreads();
@@ -1647,6 +1692,14 @@ $("main").addEventListener("submit", async (event) => {
 $("main").addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
+  const copyMcp = target.closest?.("[data-copy-mcp]");
+  if (copyMcp) {
+    const url = mcpUrlForLate();
+    const status = $("mcp-copy-status");
+    const ok = await copyText(url);
+    if (status) status.textContent = ok ? "Copied." : url;
+    return;
+  }
   const clearSecret = target.closest?.("[data-clear-secret]");
   if (clearSecret) {
     const name = clearSecret.getAttribute("data-clear-secret");
@@ -1902,7 +1955,7 @@ async function boot() {
     return;
   }
   try {
-    await api("/api/session");
+    await loadSession();
     showShell();
     await loadCatalog();
     await loadThreads();

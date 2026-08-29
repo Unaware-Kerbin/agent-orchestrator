@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { originAllowed, hostAllowed, startGuiServer } from "../src/gui/http.js";
+import { originAllowed, mcpOriginAllowed, hostAllowed, startGuiServer } from "../src/gui/http.js";
 
 async function freeLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -30,6 +30,15 @@ test("originAllowed accepts 127.0.0.1 and localhost on the GUI port", () => {
   assert.equal(hostAllowed("127.0.0.1:8787", 8787), true);
   assert.equal(hostAllowed("localhost:8787", 8787), true);
   assert.equal(hostAllowed("0.0.0.0:8787", 8787), false);
+});
+
+test("mcpOriginAllowed accepts any loopback Origin; GUI /api stays same-port", () => {
+  assert.equal(mcpOriginAllowed(undefined), true);
+  assert.equal(mcpOriginAllowed("http://127.0.0.1:5173"), true);
+  assert.equal(mcpOriginAllowed("http://localhost:7430"), true);
+  assert.equal(mcpOriginAllowed("http://10.0.0.12:5173"), false);
+  assert.equal(mcpOriginAllowed("https://127.0.0.1:5173"), false);
+  assert.equal(originAllowed("http://127.0.0.1:5173", 8787), false);
 });
 
 test("POST /api/vllm/start returns 202 with jobId without waiting for health", async () => {

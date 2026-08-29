@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bindMcpLoopbackOnly } from "../src/mcp/bind.js";
+import { bindMcpLoopbackOnly, lateMcpCopyLines, loopbackMcpUrl } from "../src/mcp/bind.js";
 import { isMcpHealthPath, isMcpLivenessGet, isMcpLoginPath, isMcpPath, normalizeMcpPath } from "../src/mcp/paths.js";
+import { assertNoMachineHome } from "./machine-paths.js";
 
 test("MCP HTTP bind refuses 0.0.0.0 and non-loopback", () => {
   assert.equal(bindMcpLoopbackOnly(undefined), "127.0.0.1");
@@ -36,5 +37,16 @@ test("GET /mcp/health and GET /mcp without SSE are liveness, not tools/list", ()
   assert.equal(isMcpLivenessGet("GET", "/", undefined), false);
   assert.equal(isMcpLivenessGet("GET", "/", undefined, { standalone: true }), true);
   assert.equal(isMcpLivenessGet("GET", "/", "text/event-stream", { standalone: true }), false);
+});
+
+test("loopback MCP URL is 127.0.0.1 plus the bound port", () => {
+  assert.equal(loopbackMcpUrl(8107), "http://127.0.0.1:8107/mcp");
+  assert.equal(loopbackMcpUrl(8787), "http://127.0.0.1:8787/mcp");
+  assert.equal(loopbackMcpUrl(8790), "http://127.0.0.1:8790/mcp");
+  const lines = lateMcpCopyLines(loopbackMcpUrl(8107));
+  assert.ok(lines.some((l) => l.includes("http://127.0.0.1:8107/mcp")));
+  assert.ok(lines.some((l) => /Late works with MCP off/i.test(l)));
+  for (const line of lines) assertNoMachineHome(line, "lateMcpCopyLines");
+  assert.throws(() => loopbackMcpUrl(0), /1–65535/);
 });
 

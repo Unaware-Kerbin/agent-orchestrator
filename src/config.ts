@@ -262,7 +262,7 @@ export function writeConfigYaml(text: string, path = resolveConfigPath()): Orche
 export function defaultWorkspaceCwd(config: OrchestratorConfig): string {
   const fromConfig = config.workspace?.cwd?.trim();
   if (fromConfig) return resolve(fromConfig);
-  return PACKAGE_ROOT;
+  return process.cwd();
 }
 
 export function packageRoot(): string {

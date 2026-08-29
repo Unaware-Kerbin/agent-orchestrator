@@ -6,14 +6,15 @@ import { buildPendingApproval, pendingCardText } from "./approval.js";
 import { extractFilesystemPaths, expandUserPath, extractRoutableMessage, isLateDeviceWrap, routeChat, speakerLabel } from "./router.js";
 import { ChatStore } from "./store.js";
 import {
-  earlyFlushGraceMs,
-  isSpeakerSkipError,
-  looksLikeLateToolJson,
-  raceTimeout,
-  sleep,
-  speakerSkipLine,
-  speakerTimeoutMs,
-  timeoutErrorMessage,
+    earlyFlushGraceMs,
+    isSpeakerSkipError,
+    LEFTOVER_SPEAKER_SKIP,
+    looksLikeLateToolJson,
+    raceTimeout,
+    sleep,
+    speakerErrorText,
+    speakerTimeoutMs,
+    timeoutErrorMessage,
 } from "./timeout.js";
 import type {
   ChatHeartbeatPayload,
@@ -382,7 +383,7 @@ export class ChatService {
     try {
       const history = this.historyFor(threadId, placeholder.id);
       const onDelta = this.deltaHandler(threadId, placeholder.id);
-      const timeoutMs = speakerTimeoutMs();
+      const timeoutMs = speakerTimeoutMs(speaker.backendId);
       const work =
         decision.followUpRunId && !holdWrites
           ? this.orchestrator.followUp({
@@ -466,7 +467,7 @@ export class ChatService {
           if (lateJson) {
             const grace = earlyFlushGraceMs();
             if (grace > 0) await sleep(grace);
-            this.skipLeftoverThinking(threadId, timeoutErrorMessage("speaker", speakerTimeoutMs()));
+            this.skipLeftoverThinking(threadId, LEFTOVER_SPEAKER_SKIP);
             break;
           }
         }
@@ -477,7 +478,7 @@ export class ChatService {
     }
 
     if (lateWrap) {
-      this.skipLeftoverThinking(threadId, timeoutErrorMessage("speaker", speakerTimeoutMs()));
+      this.skipLeftoverThinking(threadId, LEFTOVER_SPEAKER_SKIP);
       if (holdWrites) {
         this.holdForApproval(threadId, decision, input, transcript.map((t) => t.text).join("\n\n") || input.message);
       }
@@ -496,7 +497,7 @@ export class ChatService {
 
     const placeholder = this.beginSpeaker(threadId, closer, decision, "synthesis", "waiting");
     try {
-      const timeoutMs = speakerTimeoutMs();
+      const timeoutMs = speakerTimeoutMs(closer.backendId);
       const run = await this.dispatchTimed(
         threadId,
         this.orchestrator.dispatch({
@@ -548,7 +549,7 @@ export class ChatService {
       speaker,
       transcript,
     });
-    const timeoutMs = speakerTimeoutMs();
+    const timeoutMs = speakerTimeoutMs(speaker.backendId);
     try {
       const run = await this.dispatchTimed(
         threadId,
@@ -633,14 +634,10 @@ export class ChatService {
     decision: RouteDecision,
     _opts?: { systemNote?: string },
   ): void {
-    const error = run.status === "error" ? run.error : undefined;
     const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
     const label = current?.label || current?.nickname || current?.speaker || "Speaker";
-    const content = error
-      ? isSpeakerSkipError(error)
-        ? speakerSkipLine(label, error)
-        : error
-      : run.text?.trim() || "";
+    const error = run.status === "error" ? speakerErrorText(label, run.error) : undefined;
+    const content = error ?? run.text?.trim() ?? "";
     this.store.patchMessage(threadId, messageId, {
       content,
       status: error ? "error" : "finished",
@@ -674,7 +671,7 @@ export class ChatService {
     const raw = error instanceof Error ? error.message : String(error);
     const current = this.store.require(threadId).messages.find((m) => m.id === messageId);
     const label = current?.label || current?.nickname || current?.speaker || "Speaker";
-    const text = isSpeakerSkipError(raw) || /skipped/i.test(raw) ? speakerSkipLine(label, raw) : raw;
+    const text = speakerErrorText(label, raw);
     this.store.patchMessage(threadId, messageId, {
       content: text,
       status: "error",
@@ -844,9 +841,10 @@ export class ChatService {
 
   private cwdForDispatch(decision: RouteDecision, speaker: RouteSpeaker, fallback?: string): string | undefined {
     if (!speaker.writesLocalFiles) return undefined;
-    const candidate = decision.cwd ?? fallback;
-    if (!candidate) return fallback;
-    return this.orchestrator.allowlist.assertCwd(candidate);
+    const candidate = decision.cwd ?? fallback ?? this.orchestrator.defaultCwd();
+    const allowed = this.orchestrator.allowlist.tryCwd(candidate);
+    if (allowed) return allowed;
+    return this.orchestrator.allowlist.list()[0] ?? candidate;
   }
 
   private async pcapAnalyzeContext(
@@ -1091,7 +1089,7 @@ function suggestedForRunError(error?: string, decision?: RouteDecision): ChatSug
   if (/vllm not running|vllm not reachable|not running at/i.test(error)) {
     return { label: "Start recommended local model", action: "start_vllm" };
   }
-  if (/CURSOR_API_KEY/i.test(error)) {
+  if (/CURSOR_API_KEY|Cursor not configured/i.test(error)) {
     return { label: "Open backends", action: "open_settings", payload: { page: "backends" } };
   }
   if (/not inside an allowed directory/i.test(error)) {

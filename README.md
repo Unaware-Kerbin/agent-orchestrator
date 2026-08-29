@@ -26,9 +26,9 @@ Put API keys in `.env` or in the GUI **Backends** page — never in `agents.conf
 npm run gui
 ```
 
-Open the token URL from stderr (`http://127.0.0.1:8787?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored). Port **8787 is the GUI only** — it is not MCP.
+Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored). The GUI also serves Streamable HTTP at **`/mcp` on that same port** (no GUI token). Copy that exact URL from stderr or GUI Settings → **Copy MCP URL** — it is the port this process bound, not always 8787. On listen it writes `.orchestrator/mcp.gui.url` (and last-writer `mcp.url`) plus `~/.config/agent-orchestrator/` (or `$XDG_CONFIG_HOME`) so a client like Late can find a non-default port. Dedicated `npm run mcp:http` writes `mcp.http.url` separately so it does not hide the GUI URL.
 
-**HTTP MCP** is a separate process: `npm run mcp:http` → `http://127.0.0.1:8790/mcp` (also `/MCP`). Stdio MCP is unchanged (`npm start` / Cursor `.cursor/mcp.json`).
+**HTTP MCP** for Late is whichever `/mcp` URL the process printed. Stdio MCP is unchanged (`npm start` / Cursor `.cursor/mcp.json`).
 
 ### Windows
 
@@ -55,17 +55,17 @@ State stays in `.orchestrator` under the repo (or `AGENT_ORCHESTRATOR_STATE_DIR`
 
 | Command | Purpose |
 | --- | --- |
-| `npm run gui` | Control plane on `127.0.0.1:8787` (web UI + token). Not MCP. |
+| `npm run gui` | Control plane on loopback GUI port (`AGENT_ORCHESTRATOR_GUI_PORT`, default 8787: web UI + `/mcp`) |
 | `npm run gui:stop` | Stop that process |
 | `npm run gui:restart` | Stop then start |
 | `npm start` | Stdio MCP server |
-| `npm run mcp:http` | Streamable HTTP MCP on `127.0.0.1:8790/mcp` |
+| `npm run mcp:http` | Dedicated Streamable HTTP MCP (`AGENT_ORCHESTRATOR_MCP_PORT`, default 8790 `/mcp`) |
 
-The GUI on port 8787 is **not** MCP. On this computer, start `npm run mcp:http` and point Late at `http://127.0.0.1:8790/mcp`. For another machine, start HTTP yourself (`AGENT_ORCHESTRATOR_MCP_HOST=0.0.0.0 AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http`) and use `http://THAT_IP:8790/mcp`. Late will not start this process.
+Late Settings is optional. Paste the printed `/mcp` URL, or leave Late’s address empty and let it read the advertised file. That URL uses the port this process actually bound — not a hardcoded 8787. `/MCP` is the same route. Late will not start this process and works with MCP off.
 
-If port 8787 is already in use, the GUI is already running — use `gui:stop` or open the existing token URL. Stopping a local model container does **not** stop the GUI.
+If the GUI port is already in use, the GUI is already running — use `gui:stop` or open the existing token URL. Stopping a local model container does **not** stop the GUI.
 
-Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json) (stdio). Reload MCP once after clone. `list_agents` re-reads env and GUI secrets without a full IDE restart. HTTP clients (Late) use `http://127.0.0.1:8790/mcp` after `npm run mcp:http`.
+Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json) (stdio). Reload MCP once after clone. `list_agents` re-reads env and GUI secrets without a full IDE restart. HTTP clients (Late) use the printed `/mcp` URL.
 
 ## Chat
 
@@ -92,6 +92,8 @@ While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so
 
 Keys live in `.env` and `.orchestrator/secrets.env` (gitignored). On POSIX the orchestrator creates secret/state files as mode `0600` and directories as `0700`, then `chmod`s again after overwrite (Node’s `mode` option only applies when creating a new file). **Windows does not honor Unix permission bits** — Node can only toggle the read-only flag, not user vs group vs others. If other accounts use the machine, restrict the repo folder with NTFS ACLs (your user only). **Reload env** picks up a key added after start.
 
+**Cursor** (`cursor-local` and `cursor-cloud`) uses the env name `CURSOR_API_KEY`. Paste it in GUI **Settings → Backends**, or set it in `.orchestrator/secrets.env` / `.env`. Get a key from [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations). Never commit the value. If it is missing, chat shows **Cursor not configured** (one line, no stack). Local Cursor uses the MCP process working directory when that path is on the write allowlist — not a hardcoded home path.
+
 Nicknames are stored on each backend in `agents.config.yaml` (`nickname: Arc Qwen`). Custom logos are PNG/JPEG/WebP files under `.orchestrator/logos/` (gitignored, 512 KiB max; SVG/HTML rejected by magic bytes). Chat bubbles and Settings use the nickname and logo when set.
 
 The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per browser/profile so people sharing a machine can keep their own look. It is not stored in git.
@@ -100,9 +102,9 @@ The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per brows
 
 | Property | Behavior |
 | --- | --- |
-| Bind | GUI is **`127.0.0.1:8787` only**. HTTP MCP defaults to `127.0.0.1:8790`; a remote box may set `AGENT_ORCHESTRATOR_MCP_HOST=0.0.0.0`. Local model HTTP is loopback. |
-| Auth | GUI `/api/*` requires the session token. Streamable HTTP MCP on :8790 does not use that token. |
-| Origin | Non-loopback `Host` / `Origin` is rejected. |
+| Bind | GUI and HTTP MCP bind **`127.0.0.1` only** (ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT`, defaults 8787 / 8790). Local model HTTP is loopback. |
+| Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not use that token. |
+| Origin | Non-loopback `Host` is rejected. GUI `/api` Origin must match this port. Streamable HTTP `/mcp` allows any loopback Origin (Late UI / sidecar) or none. |
 | Secrets | Never logged or shown in full. Not committed. POSIX files `0600`; Windows needs NTFS ACLs. |
 | Writes | Realpath + allowlist; `..` and symlink escapes fail. |
 
@@ -171,17 +173,17 @@ Ready vLLM, Ollama, and llama.cpp backends all participate in Auto debate when t
 
 ## HTTP MCP (any client)
 
-**8787 is the GUI.** Streamable HTTP MCP is **`http://127.0.0.1:8790/mcp`** (`npm run mcp:http`). `/MCP` is the same route. Late does not send a GUI token.
+The GUI serves Streamable HTTP at **`http://127.0.0.1:<gui-port>/mcp`** on the same process as the web UI (`AGENT_ORCHESTRATOR_GUI_PORT`). A dedicated process is **`npm run mcp:http`** → `http://127.0.0.1:<mcp-port>/mcp` (`AGENT_ORCHESTRATOR_MCP_PORT`). `/MCP` is the same route. Late does not send a GUI token. Copy the URL that process printed (or GUI Settings → Copy MCP URL). Late works with MCP off.
 
 ```http
 POST /mcp HTTP/1.1
-Host: 127.0.0.1:8790
+Host: 127.0.0.1:<mcp-or-gui-port>
 Accept: application/json, text/event-stream
 Content-Type: application/json
 MCP-Protocol-Version: 2025-03-26
 ```
 
-**Late:** Settings → MCP on. Address `http://127.0.0.1:8790/mcp`. Save, then Check. `http://localhost:8787` is the web UI, not this. List/status tools run; starts and writes still wait for Approve. You start `npm run mcp:http`; Late will not start it.
+**Late:** Settings → MCP is optional. If you turn it on, Address = the printed `/mcp` URL from this process (GUI Settings can copy it). Save, then Check. List/status tools run; starts and writes still wait for Approve. You start the GUI or `npm run mcp:http`; Late will not start it and still chats when MCP is off.
 
 Stdio remains `tsx src/index.ts` for Cursor.
 
@@ -215,7 +217,7 @@ AGENT_ORCHESTRATOR_RADIUS_ALLOWED_FILTER_IDS=mcp-users
 # RADIUS_SECRET in GUI secrets (writeSecureFile / POSIX 0600)
 ```
 
-Login: not used by Late. HTTP MCP for Late is `http://127.0.0.1:8790/mcp` with no GUI token. A remote box may bind `0.0.0.0`.
+Login: not used by Late. HTTP MCP for Late is the printed `/mcp` URL with no GUI token.
 
 ## MCP tools
 

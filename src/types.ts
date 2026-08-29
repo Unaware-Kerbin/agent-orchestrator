@@ -116,7 +116,7 @@ export interface ProviderRunRequest {
   history?: Array<{ role: "user" | "assistant"; content: string }>;
   /** When set, OpenAI-compat backends request SSE and forward token deltas. */
   onDelta?: (delta: string) => void;
-  /** Per-run HTTP/SDK cap. Debate uses a short timeout so one hung speaker cannot block the rest. */
+  /** Per-run HTTP/SDK cap. Cursor speakers use a longer default than Gemini/vLLM. */
   timeoutMs?: number;
   cloud?: {
     repos?: Array<{ url: string; startingRef?: string }>;

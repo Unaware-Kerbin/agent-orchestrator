@@ -13,7 +13,7 @@ export function createOrchestrator(): {
   refreshRuntimeEnv();
   const configPath = resolveConfigPath();
   const config = loadConfig(configPath);
-  const allowlist = WriteAllowlist.load([defaultWorkspaceCwd(config), packageRoot()]);
+  const allowlist = WriteAllowlist.load([defaultWorkspaceCwd(config), process.cwd(), packageRoot()]);
   const orchestrator = new Orchestrator(config, allowlist, configPath);
   const chat = new ChatService(orchestrator);
   return { orchestrator, allowlist, configPath, chat };

@@ -3,6 +3,10 @@ import { createOrchestrator } from "./bootstrap.js";
 import { loadOrCreateGuiToken } from "./gui-auth.js";
 import { bindLoopbackOnly, startGuiServer } from "./gui/http.js";
 import { clearGuiPid, guiAddrInUseMessage, guiPidPath, stopOurGui, writeGuiPid } from "./gui-process.js";
+import { createOrchestratorMcpHandler } from "./mcp-http-handler.js";
+import { loadMcpAuthConfig, McpAuth } from "./mcp/auth/index.js";
+import { lateMcpCopyLines } from "./mcp/bind.js";
+import { writeAdvertisedMcpUrl } from "./mcp/advertise.js";
 import { openUrl as openInBrowser } from "./platform.js";
 
 const port = Number(process.env.AGENT_ORCHESTRATOR_GUI_PORT ?? "8787");
@@ -28,7 +32,16 @@ try {
 
 const { orchestrator, chat } = createOrchestrator();
 const secret = loadOrCreateGuiToken();
-const { server, listen } = startGuiServer({ orchestrator, chat, token: secret.token, port });
+const mcpHandler = createOrchestratorMcpHandler(orchestrator, chat);
+const mcpAuth = new McpAuth(loadMcpAuthConfig(secret.token));
+const { server, listen } = startGuiServer({
+  orchestrator,
+  chat,
+  token: secret.token,
+  port,
+  mcpHandler,
+  mcpAuth,
+});
 
 server.on("error", (error) => {
   const err = error as NodeJS.ErrnoException;
@@ -42,6 +55,7 @@ server.on("error", (error) => {
 
 const shutdown = (): void => {
   clearGuiPid(process.pid);
+  void mcpHandler.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1500).unref();
 };
@@ -51,14 +65,17 @@ process.on("SIGTERM", shutdown);
 server.listen(listen.port, listen.host, () => {
   writeGuiPid(process.pid);
   const openUrl = `${listen.url}/?token=${encodeURIComponent(secret.token)}`;
+  const mcpUrl = listen.mcpUrl;
+  writeAdvertisedMcpUrl(mcpUrl, { kind: "gui" });
   console.error(`Agent Orchestrator GUI`);
   console.error(`  bind:   ${listen.host}:${listen.port} (loopback only)`);
   console.error(`  pid:    ${process.pid} (${guiPidPath()})`);
   console.error(`  open:   ${openUrl}`);
+  for (const line of lateMcpCopyLines(mcpUrl)) console.error(`  ${line}`);
   console.error(`  token:  ${secret.path}${secret.created ? " (created)" : ""}`);
   console.error(`  notes:  MCP stdio is unchanged. This UI is a local extra surface.`);
   console.error(`          Do not tunnel, proxy, or bind this process off localhost.`);
-  console.error(`          Streamable HTTP MCP is a separate process: npm run mcp:http on :8790.`);
+  console.error(`          Dedicated MCP process: npm run mcp:http (AGENT_ORCHESTRATOR_MCP_PORT).`);
   console.error(`          Stop: npm run gui:stop   Restart: npm run gui:restart`);
   console.error(`          Docker stop of an orch-vllm-* container does not stop this GUI.`);
 
