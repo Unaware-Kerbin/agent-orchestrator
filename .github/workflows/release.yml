@@ -1,0 +1,63 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Package
+        shell: bash
+        run: bash scripts/pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-orchestrator-${{ matrix.os }}
+          path: |
+            release/*.tar.gz
+            release/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            Portable GUI + Streamable HTTP `/mcp` (loopback only). Each archive includes Node 22.
+
+            - **Linux / macOS:** extract, then `./bin/agent-orchestrator-gui`
+            - **Windows:** extract, then `bin\agent-orchestrator-gui.cmd`
+            - Copy the printed `/mcp` URL for Late. Stop with `--stop`.
+
+            Bind stays `127.0.0.1`. This does not start vLLM.

@@ -10,6 +10,20 @@ Chat (GUI or MCP)
       → Local model server on 127.0.0.1 — never public
 ```
 
+## Install
+
+Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.0](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.0)). Each archive includes Node 22. Extract it, then:
+
+| Your computer | File | What you do |
+|---|---|---|
+| Linux | `agent-orchestrator-…-linux-….tar.gz` | Extract, run `./bin/agent-orchestrator-gui` |
+| Mac | `agent-orchestrator-…-mac-….tar.gz` | Extract, run `./bin/agent-orchestrator-gui` |
+| Windows | `agent-orchestrator-…-win-….zip` | Extract, run `bin\agent-orchestrator-gui.cmd` |
+
+That starts the loopback GUI and Streamable HTTP **`/mcp` on the same port**. Copy the printed URL for Late. Stop with `--stop`. Bind stays `127.0.0.1`. This does not start vLLM.
+
+Or install from source below.
+
 ## Quick start
 
 Requires Node.js 22.13+.

@@ -4,7 +4,9 @@
   "description": "MCP orchestrator that routes work to Cursor agents and external LLM agents",
   "type": "module",
   "bin": {
-    "agent-orchestrator": "./dist/index.js"
+    "agent-orchestrator": "./dist/index.js",
+    "agent-orchestrator-gui": "./dist/gui.js",
+    "agent-orchestrator-mcp": "./dist/mcp-http.js"
   },
   "scripts": {
     "start": "tsx src/index.ts",
@@ -16,7 +18,8 @@
     "gui:restart": "tsx src/gui.ts --restart",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "pack": "bash scripts/pack.sh"
   },
   "engines": {
     "node": ">=22.13.0"
