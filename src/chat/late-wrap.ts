@@ -25,8 +25,14 @@ export function vlanIdFromText(text: string): string | undefined {
   return String(n);
 }
 
+/** VLAN lines for ansible.netcommon.cli_config (connection enters config context). */
 export function aosCxVlanCli(vlanId: string): string {
   return `vlan ${vlanId}\nname VLAN${vlanId}`;
+}
+
+/** Full session draft for Late format=cli Push (includes configure mode). */
+export function aosCxVlanStagingCli(vlanId: string): string {
+  return `configure terminal\nvlan ${vlanId}\n name VLAN${vlanId}\nexit`;
 }
 
 export function aosCxVlanPlaybookYaml(intent: string, vlanId?: string): string {
