@@ -159,6 +159,11 @@ let threads = [];
 let currentThread = null;
 let sending = false;
 let vllmPollTimer = null;
+let updateCheck = null;
+let updatePick = null;
+let updateBusy = false;
+let updateFlash = "";
+let updateFlashKind = "ok";
 
 function dockerLaunchFromSnapshot(data) {
   const snap = data ?? localModels ?? {};
@@ -265,7 +270,7 @@ function pageId() {
 }
 
 function settingsPages() {
-  return ["overview", "specialists", "backends", "runs", "dispatch", "local-models", "allowlist", "config"];
+  return ["overview", "specialists", "backends", "runs", "dispatch", "local-models", "allowlist", "updates", "config"];
 }
 
 function setActiveNav() {
@@ -531,6 +536,7 @@ function ensureChatLayout() {
               <a href="#backends" data-page="backends">Backends</a>
               <a href="#local-models" data-page="local-models">Local models</a>
               <a href="#allowlist" data-page="allowlist">Allowlist</a>
+              <a href="#updates" data-page="updates">Updates</a>
               <a href="#specialists" data-page="specialists">Specialists</a>
               <a href="#config" data-page="config">Config</a>
               <a href="#dispatch" data-page="dispatch">Run workflow</a>
@@ -700,6 +706,10 @@ function renderOverview() {
         <h2>Theme</h2>
         <p class="muted">Look for this browser. Stored locally, not in git.</p>
         ${themePickerMarkup("theme-select-overview")}
+      </article>
+      <article class="card">
+        <h2>Updates</h2>
+        <p class="muted">Ask GitHub if this app or Late has a newer file. Cloud AI is not required. <a href="#updates">Open Updates</a></p>
       </article>
     </div>
     <div class="card" style="margin-top:0.85rem">
@@ -1328,6 +1338,94 @@ function renderAllowlist() {
   `;
 }
 
+function updateProductLine(client) {
+  const local = client.localVersion || "unknown";
+  const remote = client.remoteVersion ? `GitHub ${client.remoteVersion}` : "no GitHub release";
+  if (client.newer) return `${local} on your computer → ${remote}`;
+  return `${local} on your computer · ${remote}`;
+}
+
+function updateClientCard(id) {
+  const client = id === "late" ? updateCheck?.late : updateCheck?.orchestrator;
+  const title = id === "late" ? "Late" : "Orchestrator";
+  if (!client) {
+    return `<article class="card">
+      <h2>${title}</h2>
+      <p class="muted">Press Check for updates. I will ask GitHub for Late and Agent Orchestrator.</p>
+    </article>`;
+  }
+  const pillHtml = client.newer
+    ? `<span class="pill warn">newer on GitHub</span>`
+    : client.error
+      ? `<span class="pill bad">could not check</span>`
+      : `<span class="pill ok">current</span>`;
+  const asset = client.asset?.name
+    ? `<p class="mono muted">${escapeHtml(client.asset.name)}</p>`
+    : client.newer
+      ? `<p class="muted">GitHub tag has no matching file for this computer. I will not build from the tag.</p>`
+      : "";
+  const err = client.error ? `<p class="muted">${escapeHtml(client.error)}</p>` : "";
+  const link = client.releaseUrl
+    ? `<p class="muted"><a href="${escapeHtml(client.releaseUrl)}" target="_blank" rel="noopener noreferrer">Open the GitHub page</a></p>`
+    : "";
+  return `<article class="card">
+    <h2>${title} ${pillHtml}</h2>
+    <p>${escapeHtml(updateProductLine(client))}</p>
+    ${asset}
+    ${err}
+    ${link}
+    <p class="muted">${client.unsigned ? "These files are not signed on Mac or Windows." : "Same files as Releases. I will not run them as root."}</p>
+  </article>`;
+}
+
+function updateConfirmCopy(choice) {
+  const names = choice === "both" ? "Late and Agent Orchestrator" : choice === "late" ? "Late" : "Agent Orchestrator";
+  const note = updateCheck?.unsignedNote ? ` ${updateCheck.unsignedNote} This is on your computer.` : "";
+  return `Download ${names} from GitHub onto your computer? Late uses the AppImage / .deb / .dmg / .exe already on the release. Orchestrator uses the portable archive.${note}`;
+}
+
+function renderUpdates() {
+  $("main").classList.remove("chat-main");
+  const checked = Boolean(updateCheck);
+  const confirmOpen = Boolean(updatePick);
+  $("main").innerHTML = `
+    <div class="page-title">
+      <div>
+        <h1>${confirmOpen ? "Download on your computer?" : "Updates"}</h1>
+        <p>GitHub releases for Late and Agent Orchestrator. Nothing downloads until you confirm. This check does not need Cloud AI.</p>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:0.85rem">
+      <p class="muted">This talks to github.com only. Cloud AI stays off. Bind stays 127.0.0.1. Keys never leave this computer.</p>
+      <div class="actions">
+        <button type="button" class="btn" data-update-check${updateBusy ? " disabled" : ""}>${updateBusy ? "Checking…" : "Check for updates"}</button>
+      </div>
+      <div id="update-status">${updateFlash ? flash(updateFlash, updateFlashKind) : updateCheck ? flash(updateCheck.message, "ok") : ""}</div>
+    </div>
+    <div class="cards">
+      ${updateClientCard("late")}
+      ${updateClientCard("orchestrator")}
+    </div>
+    <div class="card" style="margin-top:0.85rem">
+      <h2>What should I update?</h2>
+      <p class="muted">${checked ? "Late and Orchestrator on your computer match GitHub unless a card says newer. You can still pick Late, Orchestrator, or both." : "Check first. Then you can pick Update Late, Update Orchestrator, or Update both."}</p>
+      <div class="actions">
+        <button type="button" class="btn" data-update-pick="late"${checked && !updateBusy ? "" : " disabled"}>Update Late</button>
+        <button type="button" class="btn" data-update-pick="orchestrator"${checked && !updateBusy ? "" : " disabled"}>Update Orchestrator</button>
+        <button type="button" class="btn" data-update-pick="both"${checked && !updateBusy ? "" : " disabled"}>Update both</button>
+      </div>
+    </div>
+    <div id="update-confirm" class="grant-card${confirmOpen ? "" : " hidden"}">
+      <h3>Download on your computer?</h3>
+      <p class="muted">${confirmOpen ? escapeHtml(updateConfirmCopy(updatePick)) : ""}</p>
+      <div class="actions">
+        <button type="button" class="btn" data-update-confirm>Download</button>
+        <button type="button" class="btn secondary" data-update-cancel>Back</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderConfig(state = {}) {
   $("main").classList.remove("chat-main");
   $("main").innerHTML = `
@@ -1450,6 +1548,7 @@ async function render() {
     await loadLocalServers();
     renderLocalModels();
   } else if (page === "allowlist") renderAllowlist();
+  else if (page === "updates") renderUpdates();
   else if (page === "config") {
     const cfg = await api("/api/config");
     renderConfig({ yaml: cfg.yaml });
@@ -1480,7 +1579,7 @@ function connectEvents() {
   });
   events.addEventListener("catalog", (ev) => {
     catalog = JSON.parse(ev.data);
-    if (["overview", "specialists", "backends", "allowlist", "dispatch", "local-models"].includes(pageId())) {
+    if (["overview", "specialists", "backends", "allowlist", "updates", "dispatch", "local-models"].includes(pageId())) {
       render();
     } else if (pageId() === "chat") {
       renderChatHeader();
@@ -1545,6 +1644,17 @@ $("gate-form").addEventListener("submit", async (event) => {
     await loadThreads();
     connectEvents();
     await render();
+    void api("/api/updates")
+      .then((data) => {
+        updateCheck = data;
+        if (data?.updateLate || data?.updateOrchestrator || data?.bothNewer) {
+          updateFlash = data.message || "GitHub has a newer file. Open Settings → Updates.";
+          updateFlashKind = "ok";
+        }
+      })
+      .catch(() => {
+        /* start check must not block chat or MCP */
+      });
   } catch (error) {
     showGate(error.message);
   }
@@ -1993,6 +2103,61 @@ $("main").addEventListener("click", async (event) => {
     }
     return;
   }
+  if (target.closest?.("[data-update-check]")) {
+    updateBusy = true;
+    updatePick = null;
+    updateFlash = "Asking GitHub…";
+    updateFlashKind = "ok";
+    renderUpdates();
+    try {
+      updateCheck = await api("/api/updates");
+      updateFlash = updateCheck.message;
+      updateFlashKind = "ok";
+    } catch (error) {
+      updateCheck = null;
+      updateFlash = error.message;
+      updateFlashKind = "bad";
+    } finally {
+      updateBusy = false;
+      if (pageId() === "updates") renderUpdates();
+    }
+    return;
+  }
+  if (target.getAttribute?.("data-update-pick")) {
+    if (!updateCheck) return;
+    updatePick = target.getAttribute("data-update-pick");
+    renderUpdates();
+    return;
+  }
+  if (target.closest?.("[data-update-cancel]")) {
+    updatePick = null;
+    renderUpdates();
+    return;
+  }
+  if (target.closest?.("[data-update-confirm]")) {
+    const choice = updatePick;
+    if (!choice) return;
+    updateBusy = true;
+    updateFlash = "Saving the GitHub file on your computer…";
+    updateFlashKind = "ok";
+    renderUpdates();
+    try {
+      const result = await api("/api/updates/apply", {
+        method: "POST",
+        body: JSON.stringify({ choice, which: choice, confirm: true, confirmed: true }),
+      });
+      updatePick = null;
+      updateFlash = result.message;
+      updateFlashKind = "ok";
+    } catch (error) {
+      updateFlash = error.message;
+      updateFlashKind = "bad";
+    } finally {
+      updateBusy = false;
+      if (pageId() === "updates") renderUpdates();
+    }
+    return;
+  }
   if (target.id === "reload-env") {
     try {
       const result = await api("/api/env/reload", { method: "POST", body: "{}" });
@@ -2136,6 +2301,17 @@ async function boot() {
     await loadThreads();
     connectEvents();
     await render();
+    void api("/api/updates")
+      .then((data) => {
+        updateCheck = data;
+        if (data?.updateLate || data?.updateOrchestrator || data?.bothNewer) {
+          updateFlash = data.message || "GitHub has a newer file. Open Settings → Updates.";
+          updateFlashKind = "ok";
+        }
+      })
+      .catch(() => {
+        /* start check must not block chat or MCP */
+      });
   } catch {
     sessionStorage.removeItem(TOKEN_KEY);
     token = "";

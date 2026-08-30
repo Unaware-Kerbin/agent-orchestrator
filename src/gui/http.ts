@@ -30,6 +30,7 @@ import { tryHandleMcpRequest } from "../mcp/attach.js";
 import type { McpAuth } from "../mcp/auth/index.js";
 import { loopbackMcpUrl } from "../mcp/bind.js";
 import { isMcpPath } from "../mcp/paths.js";
+import { applyConfirmedUpdates, checkInstalledReleases, parseUpdateChoice } from "../update-apply.js";
 
 const HOST = "127.0.0.1";
 const MAX_BODY = 1_000_000;
@@ -391,6 +392,33 @@ export function startGuiServer(options: {
 
     if (path === "/api/session" && method === "GET") {
       send(res, 200, { ok: true, bind: `${HOST}:${port}`, mcpUrl: listen.mcpUrl });
+      return;
+    }
+
+    if (path === "/api/updates" && method === "GET") {
+      try {
+        send(res, 200, await checkInstalledReleases());
+      } catch (error) {
+        send(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/updates/apply" && method === "POST") {
+      const confirmed = isRecord(body) && (body.confirm === true || body.confirmed === true);
+      if (!confirmed) {
+        send(res, 400, {
+          error: "Say yes first. I will not change files on your computer until you confirm.",
+        });
+        return;
+      }
+      const rawChoice = isRecord(body) ? (body.choice ?? body.which) : undefined;
+      try {
+        const which = parseUpdateChoice(rawChoice);
+        send(res, 200, await applyConfirmedUpdates({ which, confirmed: true }));
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
       return;
     }
 

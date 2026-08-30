@@ -311,3 +311,66 @@ test("POST /api/allowlist and workspace reject a missing drop path with 400", as
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   }
 });
+
+test("POST /api/updates/apply without confirm does not download", async () => {
+  const events = new EventEmitter();
+  const orchestrator = {
+    events,
+    catalog: async () => ({ backends: [], specialists: [], workflows: [] }),
+    localModels: {
+      snapshot: () => ({ models: [], recommended: [], jobs: [], hardware: {}, intelDocker: {} }),
+    },
+    store: { list: () => [], get: () => undefined },
+    configPath: "/tmp/agents.config.yaml",
+    config: { backends: {}, specialists: {} },
+    allowlist: { list: () => [] },
+    defaultCwd: () => "/",
+    reloadConfig: () => undefined,
+    dispatch: async () => ({}),
+    followUp: async () => ({}),
+    runWorkflow: async () => ({ workflow: "", status: "ok", summary: "", runs: [] }),
+  };
+  const chat = {
+    list: () => [],
+    create: () => ({}),
+    get: () => ({}),
+    delete: () => false,
+    setPin: () => ({}),
+    send: async () => ({}),
+    runAction: async () => ({}),
+    resolveApproval: async () => ({}),
+  };
+  const token = "test-token-not-secret-16";
+  const port = await freeLoopbackPort();
+  const { server, listen } = startGuiServer({
+    orchestrator: orchestrator as never,
+    chat: chat as never,
+    token,
+    port,
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listen.port, listen.host, () => resolve());
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  try {
+    const denied = await fetch(`${base}/api/updates/apply`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ choice: "both", confirm: false }),
+    });
+    assert.equal(denied.status, 400);
+    const deniedBody = (await denied.json()) as { error?: string };
+    assert.match(deniedBody.error ?? "", /Say yes first/i);
+
+    const missing = await fetch(`${base}/api/updates/apply`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ choice: "both" }),
+    });
+    assert.equal(missing.status, 400);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+});

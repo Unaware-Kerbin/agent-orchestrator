@@ -13,6 +13,10 @@ Writes wait for **Approve**. Keys stay on this computer. Bind is loopback (`127.
 
 That is the whole idea.
 
+![How Agent Orchestrator works on your computer](docs/assets/how-it-works.webp)
+
+Chat on this computer, then **Copy MCP URL** for Late. The address is `127.0.0.1` on the port this process printed.
+
 ```
 Chat (GUI or MCP)
   → Auto router (control tools | single agent | multi-agent debate)
@@ -61,6 +65,10 @@ Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…`). The se
 
 **HTTP MCP** for Late is whichever `/mcp` URL the process printed. Stdio MCP is unchanged (`npm start` / Cursor `.cursor/mcp.json`).
 
+![Copy the /mcp URL — the HTML page is not MCP](docs/assets/http-mcp.webp)
+
+The HTML root is the GUI. `/mcp` on that same port is Streamable HTTP (a JSON body, not the chat page). Paste the printed `/mcp` URL into Late.
+
 ### Windows
 
 Same Node 22.13+ and `npm` commands work in PowerShell or cmd. Loopback bind and GUI auth are unchanged (`127.0.0.1` only).
@@ -108,7 +116,19 @@ Home is a chat thread. The header (new chat, thread switcher, settings) and comp
 
 While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so the UI does not look hung.
 
-**Writes and installs wait for Approve.** Implement/install stays plan-only until you click **Approve** on the pending-actions card. After that, Cursor may write **only inside the write allowlist**. Host-wide installs (package managers, game engines, `sudo`) are called out and still wait. External models never edit files.
+![Debate: several models each get a turn](docs/assets/chat.webp)
+
+This clip is **Debate** on **your computer**: paste a prompt (do not drip-type). Local Gemma and Cursor each spoke. Gemini hit a 25s timeout in this take. Writes still wait for **Approve**.
+
+![Delete a chat](docs/assets/chat-delete.webp)
+
+**Delete** next to a thread removes that chat. It cannot be undone.
+
+**Writes and installs wait for Approve.** Implement/install stays plan-only until you click **Approve** on the pending-actions card. After that, Cursor may write **only inside the write allowlist**. If Cursor is missing, **Approve** still writes with Node apply-patch in that granted folder. Host-wide installs (package managers, game engines, `sudo`) are called out and still wait. External models never edit files.
+
+![Approve before a write](docs/assets/apply-patch.webp)
+
+Grant a folder that already exists on this computer, then **Approve**. This capture had Cursor ready, so the writer is Cursor local (not Node apply-patch). The file still lands only inside the granted path.
 
 ## Settings
 
@@ -117,9 +137,14 @@ While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so
 | Backends | Ready/not-ready, paste keys (masked), Gemini model id, nicknames, custom logos |
 | Local models | Detect GPU VRAM, recommend weights that fit, download, start/stop/remove local servers. **Hugging Face token** (gated Gemma/Llama/Mistral): paste a Hub read token; status is configured/not; value is never returned |
 | Allowlist | Directories Cursor may write to |
+| Updates | Check GitHub for this app and Late. Ask before download. Cloud AI is not required. |
 | Config | Edit `agents.config.yaml` (validated; no live keys) |
 | Run workflow | Optional named pipelines |
 | Theme | Appearance for this browser. Stored in localStorage (`orchestrator.gui.theme`), not in git. |
+
+![Check for updates on your computer](docs/assets/updates.webp)
+
+**Updates:** **Check for updates** asks GitHub for Late and this app. Then pick Late, Orchestrator, or both. Nothing downloads until you confirm **Download on your computer?** Cloud AI is not required.
 
 Keys live in `.env` and `.orchestrator/secrets.env` (gitignored). On POSIX the orchestrator creates secret/state files as mode `0600` and directories as `0700`, then `chmod`s again after overwrite (Node’s `mode` option only applies when creating a new file). **Windows does not honor Unix permission bits** — Node can only toggle the read-only flag, not user vs group vs others. If other accounts use the machine, restrict the repo folder with NTFS ACLs (your user only). **Reload env** picks up a key added after start.
 
@@ -141,13 +166,23 @@ The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per brows
 
 Do not tunnel the GUI or vLLM. Cloud Cursor agents cannot reach localhost; the orchestrator passes **text** between local and cloud.
 
+![GUI on loopback only](docs/assets/security.webp)
+
+The rail says `127.0.0.1`. Local vLLM is the same bind. This page is only for **your computer**.
+
 ## Write allowlist
 
-Default: this workspace (`WORKSPACE_CWD` / `workspace.cwd`). Add more via Settings → Allowlist or `add_allowed_dir`. Chat offers one-click add when you name an absolute path that is not listed.
+Default: this workspace (`WORKSPACE_CWD` / `workspace.cwd`). Add more via Settings → Allowlist or `add_allowed_dir`. Chat offers one-click add when you name an absolute path that is not listed. Drag a folder onto Chat (or paste a path). The path must already exist on **this computer** (the one running the GUI).
+
+![Grant a folder on this computer](docs/assets/write-allowlist.webp)
 
 ## Local models (vendor-agnostic)
 
 `list_hardware` probes **whatever accelerators are present** (NVIDIA CUDA, AMD ROCm, Intel XPU, or CPU if none). Recommendations use **measured VRAM**, not a single vendor. Missing NVIDIA is not treated as “CPU only” when another GPU exists.
+
+![Search the local models catalog](docs/assets/local-models.webp)
+
+Search the catalog by name (this clip types `gemma`). Recommended rows say whether a snapshot fits **this computer**.
 
 A catalog model **fits** a single GPU when estimated weights plus ~20% KV-cache headroom are ≤ that GPU’s VRAM. `start_vllm` uses **every GPU on this computer** by default (`vllm serve --tensor-parallel-size N`). Pass `use_all_gpus=false` to stay on one card. A larger model can still *fit* via tensor parallel when weight shards fit in combined VRAM. Remaining memory on each card is used for the KV cache (`--gpu-memory-utilization 0.9`). The catalog is **not** tied to one vendor: it includes Qwen 2.5/3/3.5/3.8, Gemma 2 and Gemma 4 Instruct, Llama 3.1/3.3/4 Scout, Mistral 7B and Small 3.2, Phi-4, OLMo 2/3, IBM Granite 3.3/4.2, and DeepSeek-R1 Qwen distills. **Recommendations** list every catalog snapshot (no top-8 cap) with fit flags for this computer (fits / needs tensor parallel / too big). Newest Hub id is marked when a family has several names (Gemma 4 over Gemma 2/3, Qwen3.8 over Qwen2.5). Older generations stay downloadable. FP16 rows work on CUDA, ROCm, and Intel XPU; AWQ/GPTQ rows are CUDA/ROCm only. Official Gemma 2 ([Gemma Terms of Use](https://ai.google.dev/gemma/terms)) and Llama (Llama Community License / Llama 4 Community License) Hugging Face repos are **gated**. Gemma 4 Instruct is **ungated Apache-2.0**. Community Llama AWQ snapshots in the catalog are ungated on Hugging Face but still under the Llama Community License. You can still download any other `org/name` snapshot that vLLM can load.
 
@@ -205,6 +240,10 @@ Ready vLLM, Ollama, and llama.cpp backends all participate in Auto debate when t
 ## HTTP MCP (any client)
 
 The GUI serves Streamable HTTP at **`http://127.0.0.1:<gui-port>/mcp`** on the same process as the web UI (`AGENT_ORCHESTRATOR_GUI_PORT`). A dedicated process is **`npm run mcp:http`** → `http://127.0.0.1:<mcp-port>/mcp` (`AGENT_ORCHESTRATOR_MCP_PORT`). `/MCP` is the same route. Late does not send a GUI token. Copy the URL that process printed (or GUI Settings → Copy MCP URL). Late works with MCP off.
+
+![Copy MCP URL vs the HTML root](docs/assets/http-mcp.webp)
+
+Paste that `/mcp` URL. Opening the HTML page in a browser is the GUI, not MCP.
 
 ```http
 POST /mcp HTTP/1.1
