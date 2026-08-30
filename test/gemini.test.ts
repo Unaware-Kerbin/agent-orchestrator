@@ -102,3 +102,73 @@ test("resolveGeminiChatModel ignores composer override and remaps retired ids", 
   );
   assert.equal(resolveGeminiChatModel("gemini-3.5-flash", undefined, ["gemini-3.5-flash", "gemini-3.6-flash"]), "gemini-3.5-flash");
 });
+
+test("Gemini OpenAI-compat retries a 429 once then succeeds", async () => {
+  const seen: number[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    seen.push(Date.now());
+    if (seen.length === 1) {
+      return new Response(JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "four" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const { OpenAIProvider } = await import("../src/providers/openai.js");
+    const provider = new OpenAIProvider("gemini", {
+      type: "openai",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      model: "gemini-3.6-flash",
+      apiKey: "test-key",
+      apiKeyEnv: "GEMINI_API_KEY",
+    });
+    const result = await provider.run({ prompt: "In one sentence, what is 2+2?", timeoutMs: 8000 });
+    assert.equal(result.status, "finished");
+    assert.match(result.text ?? "", /four/);
+    assert.equal(seen.length, 2);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("Gemini drops empty history turns so wrap isolation cannot 400 contents", async () => {
+  let body: { messages?: Array<{ role: string; content: string }> } = {};
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body ?? "{}")) as typeof body;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const { OpenAIProvider } = await import("../src/providers/openai.js");
+    const provider = new OpenAIProvider("gemini", {
+      type: "openai",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      model: "gemini-3.6-flash",
+      apiKey: "test-key",
+      apiKeyEnv: "GEMINI_API_KEY",
+    });
+    const result = await provider.run({
+      prompt: "",
+      history: [
+        { role: "user", content: "" },
+        { role: "assistant", content: "prior" },
+      ],
+    });
+    assert.equal(result.status, "finished");
+    const messages = body.messages ?? [];
+    assert.equal(messages.some((m) => m.content === ""), false);
+    assert.equal(messages.at(-1)?.content, "(empty operator turn)");
+    assert.equal(messages.some((m) => m.content === "prior"), true);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});

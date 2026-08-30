@@ -27,14 +27,24 @@ const DEBATE_INTENTS = new Set<ChatIntent>(["code", "review", "reason"]);
  * device output. Intent/control must use that turn — the wrapper mentions
  * "allowlist" / vLLM tools and must not become the chat reply.
  */
-/** Late MCP wraps the operator turn after SYSTEM + untrusted device output. */
-export function isLateDeviceWrap(message: string): boolean {
+/** Preamble only — not enough to route. Missing END must fail closed. */
+export function lateWrapHasPreamble(message: string): boolean {
   return /^SYSTEM:/m.test(message) && /UNTRUSTED DEVICE OUTPUT follows/i.test(message);
+}
+
+export function lateWrapMissingEnd(message: string): boolean {
+  return lateWrapHasPreamble(message) && !/END UNTRUSTED DEVICE OUTPUT/i.test(message);
+}
+
+/** Complete Late wrap: SYSTEM + untrusted header + END fence. */
+export function isLateDeviceWrap(message: string): boolean {
+  return lateWrapHasPreamble(message) && /END UNTRUSTED DEVICE OUTPUT/i.test(message);
 }
 
 export function extractRoutableMessage(message: string): string {
   const text = message.trim();
   if (!text) return text;
+  if (lateWrapMissingEnd(text)) return "";
   if (!isLateDeviceWrap(text)) return text;
 
   const endRe = /END UNTRUSTED DEVICE OUTPUT[^\n]*/gi;
@@ -43,16 +53,19 @@ export function extractRoutableMessage(message: string): string {
   while ((match = endRe.exec(text))) {
     last = match.index + match[0].length;
   }
-  let rest = last >= 0 ? text.slice(last).trim() : "";
-  if (!rest) {
-    const header = text.match(/UNTRUSTED DEVICE OUTPUT follows[^\n]*/i);
-    if (header && header.index !== undefined) {
-      const body = text.slice(header.index + header[0].length).trim();
-      const paras = body.split(/\n\s*\n/);
-      rest = (paras[paras.length - 1] ?? "").trim();
-    }
-  }
-  return rest || text;
+  if (last < 0) return "";
+  return text.slice(last).trim();
+}
+
+/** Device scrollback between BEGIN/END. Empty when the wrap is incomplete. */
+export function extractUntrustedDeviceOutput(message: string): string {
+  if (!isLateDeviceWrap(message)) return "";
+  const begin = message.match(/BEGIN UNTRUSTED DEVICE OUTPUT[^\n]*/i);
+  const end = message.match(/END UNTRUSTED DEVICE OUTPUT[^\n]*/i);
+  if (!begin || !end || begin.index === undefined || end.index === undefined) return "";
+  const start = begin.index + begin[0].length;
+  if (end.index <= start) return "";
+  return message.slice(start, end.index).trim();
 }
 
 export function detectIntent(message: string): ChatIntent {
@@ -440,7 +453,11 @@ function readyPool(ctx: RouterContext): RouterBackend[] {
   const runningIds = runningVllmIds(ctx);
   const ready = ctx.backends.filter((b) => {
     if (skip.has(b.id)) return false;
-    if (isVllmBackend(b) && ctx.vllmRunning === false && !runningIds.has(b.id)) return false;
+    // Probe-ready vLLM stays eligible even when the docker manager is stopped —
+    // the operator may have started that /v1 themselves (Late does not).
+    if (isVllmBackend(b) && !b.ready && ctx.vllmRunning === false && !runningIds.has(b.id)) {
+      return false;
+    }
     return b.ready;
   });
   // Promote orchestrator-started instances that have not probed yet — never the first YAML row.
@@ -619,9 +636,18 @@ function allowlistAction(path: string): ChatSuggestedAction {
 }
 
 export function routeChat(ctx: RouterContext): RouteDecision {
+  const rawPin = (ctx.pin?.trim() || "auto").trim();
+  if (lateWrapMissingEnd(ctx.message)) {
+    return {
+      kind: "error",
+      pin: rawPin.toLowerCase() || "auto",
+      intent: "general",
+      chip: "late-wrap",
+      error: "Late wrap is missing END UNTRUSTED DEVICE OUTPUT. Refusing to route.",
+    };
+  }
   const message = extractRoutableMessage(ctx.message);
   const routed = { ...ctx, message };
-  const rawPin = (ctx.pin?.trim() || "auto").trim();
   const pinLower = rawPin.toLowerCase();
   const mode: "auto" | "debate" | "single" | "backend" = MODE_PINS.has(pinLower)
     ? (pinLower as "auto" | "debate" | "single")

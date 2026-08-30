@@ -119,55 +119,67 @@ export class CursorProvider implements AgentProvider {
     }
     const timeoutMs = request.timeoutMs ?? DEFAULT_CURSOR_TIMEOUT_MS;
     const timeoutMessage = `Cursor timed out after ${Math.round(timeoutMs / 1000)}s`;
+    const deadline = started + timeoutMs;
 
-    let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
-    const work = (async () => {
-      agent = request.resumeAgentId
-        ? await this.resume(request.resumeAgentId, apiKey)
-        : await this.create(request, apiKey);
-      const prompt = request.system ? `${request.system}\n\n---\n\n${request.prompt}` : request.prompt;
-      const run = await agent.send(prompt, request.mode ? { mode: request.mode } : undefined);
-      return await run.wait();
-    })();
+    const attempt = async (): Promise<ProviderRunResult> => {
+      let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
+      const remaining = Math.max(50, deadline - Date.now());
+      const work = (async () => {
+        agent = request.resumeAgentId
+          ? await this.resume(request.resumeAgentId, apiKey)
+          : await this.create(request, apiKey);
+        const prompt = request.system ? `${request.system}\n\n---\n\n${request.prompt}` : request.prompt;
+        const run = await agent.send(prompt, request.mode ? { mode: request.mode } : undefined);
+        return await run.wait();
+      })();
 
-    try {
-      const result = await awaitOrTimeout(work, timeoutMs, timeoutMessage);
-      if (agent) this.live.set(agent.agentId, { agent, lastUsed: Date.now() });
+      try {
+        const result = await awaitOrTimeout(work, remaining, timeoutMessage);
+        if (agent) this.live.set(agent.agentId, { agent, lastUsed: Date.now() });
 
-      if (result.status === "error") {
+        if (result.status === "error") {
+          return {
+            status: "error",
+            text: result.result ?? "",
+            error: formatCursorError(result.error?.message ?? result.error ?? "Cursor run failed"),
+            agentId: agent?.agentId,
+            providerRunId: result.id,
+            durationMs: Date.now() - started,
+          };
+        }
+
         return {
-          status: "error",
+          status: result.status,
           text: result.result ?? "",
-          error: formatCursorError(result.error?.message ?? result.error ?? "Cursor run failed"),
           agentId: agent?.agentId,
           providerRunId: result.id,
           durationMs: Date.now() - started,
         };
+      } catch (error) {
+        const message = formatCursorError(error);
+        const timedOut = /timed out after \d+s/i.test(message);
+        if (timedOut) {
+          if (agent) this.live.set(agent.agentId, { agent, lastUsed: Date.now() });
+        } else {
+          this.safeClose(agent);
+        }
+        return {
+          status: "error",
+          text: "",
+          error: message,
+          agentId: agent?.agentId,
+          durationMs: Date.now() - started,
+        };
       }
+    };
 
-      return {
-        status: result.status,
-        text: result.result ?? "",
-        agentId: agent?.agentId,
-        providerRunId: result.id,
-        durationMs: Date.now() - started,
-      };
-    } catch (error) {
-      const message = formatCursorError(error);
-      const timedOut = /timed out after \d+s/i.test(message);
-      if (timedOut) {
-        if (agent) this.live.set(agent.agentId, { agent, lastUsed: Date.now() });
-      } else {
-        this.safeClose(agent);
-      }
-      return {
-        status: "error",
-        text: "",
-        error: message,
-        agentId: agent?.agentId,
-        durationMs: Date.now() - started,
-      };
+    let result = await attempt();
+    if (result.status === "error" && /\b429\b|rate[- ]limit|RESOURCE_EXHAUSTED/i.test(result.error ?? "")) {
+      const waitMs = Math.min(800, Math.max(0, deadline - Date.now() - 1));
+      if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+      if (Date.now() < deadline) result = await attempt();
     }
+    return result;
   }
 
   async followUp(agentId: string, message: string): Promise<ProviderRunResult> {

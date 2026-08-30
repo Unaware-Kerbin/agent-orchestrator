@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ensureSecureDir, writeSecureFile } from "../platform.js";
 import { stateDir } from "../state.js";
-import { extractRoutableMessage } from "./router.js";
+import { extractRoutableMessage, lateWrapHasPreamble } from "./router.js";
 import type { ChatMessage, ChatThread, ChatThreadSummary } from "./types.js";
 
 function chatsDir(): string {
@@ -177,7 +177,8 @@ export class ChatStore {
 }
 
 function titleFrom(content: string): string {
-  const routed = extractRoutableMessage(content).trim() || content.trim();
-  const line = routed.split(/\n/)[0] ?? "New chat";
+  const routed = extractRoutableMessage(content).trim();
+  const source = routed || (lateWrapHasPreamble(content) ? "New chat" : content.trim());
+  const line = source.split(/\n/)[0] ?? "New chat";
   return line.length > 72 ? `${line.slice(0, 69)}…` : line;
 }

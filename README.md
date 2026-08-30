@@ -29,7 +29,7 @@ Chat (GUI or MCP)
 
 ![Watch how Agent Orchestrator works](docs/assets/orchestrator-demo.webp)
 
-This clip is **Debate** on **your computer**: several models each get a turn (local Gemma, Gemini, Cursor, and whoever else is ready). You read the replies. Writes still wait for **Approve**.
+This clip is **Debate** on **your computer**: local Gemma, Cursor local, and Cursor cloud each get a turn. Gemini returned 429 and was skipped. You read the replies. Writes still wait for **Approve**.
 
 ## Install
 
@@ -63,7 +63,7 @@ npm run gui
 
 Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored). The GUI also serves Streamable HTTP at **`/mcp` on that same port** (no GUI token). Copy that exact URL from stderr or GUI Settings → **Copy MCP URL** — it is the port this process bound, not always 8787. On listen it writes `.orchestrator/mcp.gui.url` (and last-writer `mcp.url`) plus `~/.config/agent-orchestrator/` (or `$XDG_CONFIG_HOME`) so a client like Late can find a non-default port. Dedicated `npm run mcp:http` writes `mcp.http.url` separately so it does not hide the GUI URL.
 
-**HTTP MCP** for Late is whichever `/mcp` URL the process printed. Stdio MCP is unchanged (`npm start` / Cursor `.cursor/mcp.json`).
+**Late** uses only the printed Streamable HTTP `/mcp` URL (same port as the GUI, or `npm run mcp:http`). Do not put this program in Cursor `mcpServers` for Late — that skips Late Approve and must not receive API keys. `npm start` / [`.cursor/mcp.json`](.cursor/mcp.json) is stdio for **this repo’s Cursor IDE**, not the Late operator path.
 
 ![Copy the /mcp URL — the HTML page is not MCP](docs/assets/http-mcp.webp)
 
@@ -79,7 +79,7 @@ copy .env.example .env
 npm run gui
 ```
 
-Open the token URL from stderr. Stop with `npm run gui:stop`. MCP stdio: `npm start`, or Cursor via [`.cursor/mcp.json`](.cursor/mcp.json) (`node` + `tsx/dist/cli.mjs`, not a Unix `.bin` shim).
+Open the token URL from stderr. Stop with `npm run gui:stop`. Late still uses the printed `/mcp` URL. `npm start` is stdio for this checkout’s Cursor IDE only (`node` + `tsx/dist/cli.mjs`, not a Unix `.bin` shim) — not the Late operator path.
 
 Local models are **user-installed** Windows binaries talking to `127.0.0.1`:
 
@@ -104,7 +104,7 @@ Late Settings is optional. Paste the printed `/mcp` URL, or leave Late’s addre
 
 If the GUI port is already in use, the GUI is already running — use `gui:stop` or open the existing token URL. Stopping a local model container does **not** stop the GUI.
 
-Cursor: this repo includes [`.cursor/mcp.json`](.cursor/mcp.json) (stdio). Reload MCP once after clone. `list_agents` re-reads env and GUI secrets without a full IDE restart. HTTP clients (Late) use the printed `/mcp` URL.
+This checkout’s [`.cursor/mcp.json`](.cursor/mcp.json) is **Cursor IDE for developing this repo**, not the Late operator path. It does not pass API keys. Late pastes the printed `/mcp` URL and keeps Approve. `list_agents` re-reads env and GUI secrets without a full IDE restart.
 
 ## Chat
 
@@ -118,7 +118,7 @@ While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so
 
 ![Debate: several models each get a turn](docs/assets/chat.webp)
 
-This clip is **Debate** on **your computer**: paste a prompt (do not drip-type). Local Gemma and Cursor each spoke. Gemini hit a 25s timeout in this take. Writes still wait for **Approve**.
+This clip is **Debate** on **your computer**: paste a prompt (do not drip-type). Local Gemma, Cursor local, and Cursor cloud each spoke. Gemini returned 429 and was skipped. Writes still wait for **Approve**.
 
 ![Delete a chat](docs/assets/chat-delete.webp)
 
@@ -128,7 +128,7 @@ This clip is **Debate** on **your computer**: paste a prompt (do not drip-type).
 
 ![Approve before a write](docs/assets/apply-patch.webp)
 
-Grant a folder that already exists on this computer, then **Approve**. This capture had Cursor ready, so the writer is Cursor local (not Node apply-patch). The file still lands only inside the granted path.
+Grant a folder that already exists on this computer, then **Approve**. This capture created `notes.txt` (not `.env`) with Cursor local. The file still lands only inside the granted path.
 
 ## Settings
 
@@ -142,9 +142,13 @@ Grant a folder that already exists on this computer, then **Approve**. This capt
 | Run workflow | Optional named pipelines |
 | Theme | Appearance for this browser. Stored in localStorage (`orchestrator.gui.theme`), not in git. |
 
+![Ready backends on this computer](docs/assets/backends.webp)
+
+Ready vs not-ready. Keys stay masked. Nicknames and logos are optional. **Reload env** picks up a key added after start.
+
 ![Check for updates on your computer](docs/assets/updates.webp)
 
-**Updates:** **Check for updates** asks GitHub for Late and this app. Then pick Late, Orchestrator, or both. Nothing downloads until you confirm **Download on your computer?** Cloud AI is not required.
+**Updates:** **Check for updates** asks GitHub for Late and this app. Then pick **Update Late**, **Update Orchestrator**, or **Update both**. Nothing downloads until you confirm **Download on your computer?** Cloud AI is not required.
 
 Keys live in `.env` and `.orchestrator/secrets.env` (gitignored). On POSIX the orchestrator creates secret/state files as mode `0600` and directories as `0700`, then `chmod`s again after overwrite (Node’s `mode` option only applies when creating a new file). **Windows does not honor Unix permission bits** — Node can only toggle the read-only flag, not user vs group vs others. If other accounts use the machine, restrict the repo folder with NTFS ACLs (your user only). **Reload env** picks up a key added after start.
 
@@ -154,12 +158,15 @@ Nicknames are stored on each backend in `agents.config.yaml` (`nickname: Arc Qwe
 
 The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per browser/profile so people sharing a machine can keep their own look. It is not stored in git.
 
+![Theme on this browser](docs/assets/theme.webp)
+
 ## Security
 
 | Property | Behavior |
 | --- | --- |
 | Bind | GUI and HTTP MCP bind **`127.0.0.1` only** (ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT`, defaults 8787 / 8790). Local model HTTP is loopback. |
-| Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not use that token. |
+| Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not (Late never sends it). Loopback Host + Origin are the boundary — any process on this computer can call mutating tools (`chat_approve`, `dispatch`, `add_allowed_dir`). Pairing a token on `/mcp` would break Late unless Late starts sending one. Do not tunnel `/mcp`. Late Approve is Late’s sidecar when Late is the client. |
+| GUI token | Open the printed `?token=` URL. The token is stored in sessionStorage and stripped from the address bar. EventSource `/api/events` still uses a query token because the browser cannot set `Authorization` on EventSource. Logo URLs use the same query form. Loopback only. |
 | Origin | Non-loopback `Host` is rejected. GUI `/api` Origin must match this port. Streamable HTTP `/mcp` allows any loopback Origin (Late UI / sidecar) or none. |
 | Secrets | Never logged or shown in full. Not committed. POSIX files `0600`; Windows needs NTFS ACLs. |
 | Writes | Realpath + allowlist; `..` and symlink escapes fail. |
@@ -255,7 +262,7 @@ MCP-Protocol-Version: 2025-03-26
 
 **Late:** Settings → MCP is optional. If you turn it on, Address = the printed `/mcp` URL from this process (GUI Settings can copy it). Save, then Check. List/status tools run; starts and writes still wait for Approve. You start the GUI or `npm run mcp:http`; Late will not start it and still chats when MCP is off.
 
-Stdio remains `tsx src/index.ts` for Cursor.
+Stdio (`tsx src/index.ts`) is for this repo’s Cursor IDE only. Late still uses the printed `/mcp` URL.
 
 ### Optional ClearPass / ISE / Active Directory
 
@@ -305,6 +312,8 @@ Login: not used by Late. HTTP MCP for Late is the printed `/mcp` URL with no GUI
 
 ## Default specialists
 
+![Specialists on this computer](docs/assets/specialists.webp)
+
 | Id | Typical backend | Role |
 | --- | --- | --- |
 | `planner` | Anthropic | Implementation plan |
@@ -339,7 +348,11 @@ Gemini uses Google’s OpenAI-compatible endpoint. Set **one** current model id 
 
 `${ENV_NAME}` in YAML expands from the process environment.
 
-### Use from another repo
+### Cursor IDE only (not Late)
+
+Do **not** add this to Cursor `mcpServers` when you use Late. Late’s path is the printed `/mcp` URL; Cursor `mcpServers` skips Late Approve and must not receive vault keys.
+
+If you open **this** repo in Cursor to develop the orchestrator, stdio looks like:
 
 ```json
 {
@@ -353,15 +366,16 @@ Gemini uses Google’s OpenAI-compatible endpoint. Set **one** current model id 
       ],
       "env": {
         "AGENT_ORCHESTRATOR_CONFIG": "/absolute/path/to/this-repo/agents.config.yaml",
-        "WORKSPACE_CWD": "${workspaceFolder}",
-        "CURSOR_API_KEY": "${env:CURSOR_API_KEY}"
+        "WORKSPACE_CWD": "${workspaceFolder}"
       }
     }
   }
 }
 ```
 
-On Windows use the same `node` + `tsx/dist/cli.mjs` form with `C:\…` paths (or `${workspaceFolder}` in Cursor). Do not point `command` at `node_modules/.bin/tsx` — that shim is a Unix shell script.
+On Windows use the same `node` + `tsx/dist/cli.mjs` form with `C:\…` paths (or `${workspaceFolder}` in Cursor). Do not point `command` at `node_modules/.bin/tsx` — that shim is a Unix shell script. Do not put `CURSOR_API_KEY` or other provider keys in this block.
+
+Late: paste the printed `/mcp` URL in Late Settings. Leave Cursor `mcpServers` empty for that workflow.
 
 ## What is not in git
 

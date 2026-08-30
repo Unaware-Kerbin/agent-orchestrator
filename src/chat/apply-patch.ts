@@ -5,7 +5,7 @@ import { isPathInside, resolveContainedPath, type WriteAllowlist } from "../allo
 export type PatchFile = { path: string; content: string };
 
 const FENCE_RE = /```orchestrator-files\s*\n([\s\S]*?)```/gi;
-const BLOCKED = /(^|[\\/])(\.orchestrator|write-allowlist\.json)([\\/]|$)/i;
+const BLOCKED = /(^|[\\/])(\.orchestrator|write-allowlist\.json|\.env|\.git)([\\/]|$)/i;
 
 export function parseOrchestratorFiles(plan: string): PatchFile[] {
   const fromFence = parseFences(plan);

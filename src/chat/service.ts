@@ -4,7 +4,14 @@ import type { OrchestratedRun } from "../types.js";
 import { summarizePcapFile } from "../pcap-summary.js";
 import { applyParsedFiles, APPLY_PATCH_INSTRUCTIONS, parseOrchestratorFiles } from "./apply-patch.js";
 import { buildPendingApproval, pendingCardText } from "./approval.js";
-import { latePlaybookPatchFiles, LATE_JSON_SYSTEM, withOrchestratorFilesFence } from "./late-wrap.js";
+import {
+  attachOperatorPatchFiles,
+  debateVisibleUserMessage,
+  latePlaybookPatchFiles,
+  LATE_JSON_SYSTEM,
+  speakerSeesUntrustedOutput,
+  withOrchestratorFilesFence,
+} from "./late-wrap.js";
 import { extractFilesystemPaths, expandUserPath, extractRoutableMessage, isLateDeviceWrap, routeChat, speakerLabel } from "./router.js";
 import { ChatStore } from "./store.js";
 import {
@@ -445,7 +452,7 @@ export class ChatService {
         decision.followUpRunId && !holdWrites
           ? this.orchestrator.followUp({
               runId: decision.followUpRunId,
-              message: input.message,
+              message: debateVisibleUserMessage(input.message, speaker.backendId),
               wait: true,
               timeoutMs,
               onDelta,
@@ -454,13 +461,13 @@ export class ChatService {
               specialist: speaker.specialist,
               backend: speaker.backendId,
               task: holdWrites
-                ? `${input.message}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.${decision.applyPatch ? `\n\n${APPLY_PATCH_INSTRUCTIONS}` : ""}`
-                : input.message,
-              cwd: this.cwdForDispatch(decision, speaker, input.cwd),
+                ? `${debateVisibleUserMessage(input.message, speaker.backendId)}\n\nPlan only: do not write files or install host packages (Unity Hub, apt, sudo). List proposed cwd, specialist, and commands.${decision.applyPatch ? `\n\n${APPLY_PATCH_INSTRUCTIONS}` : ""}`
+                : debateVisibleUserMessage(input.message, speaker.backendId),
+              cwd: this.cwdForDispatch(decision, speaker, input.cwd, isLateDeviceWrap(input.message)),
               prUrl: input.prUrl,
               repoUrl: input.repoUrl,
               branch: input.branch,
-              extraContext: this.mergeContext(input.extraContext, history),
+              extraContext: this.mergeContextForSpeaker(speaker.backendId, input.extraContext, history),
               wait: true,
               timeoutMs,
               mode: this.dispatchMode(decision, speaker, holdWrites, false),
@@ -589,12 +596,18 @@ export class ChatService {
         this.orchestrator.dispatch({
           specialist: closer.specialist,
           backend: closer.backendId,
-          task: synthesisPrompt(input.message, transcript, closer, holdWrites, Boolean(decision.applyPatch)),
-          cwd: this.cwdForDispatch(decision, closer, input.cwd),
+          task: synthesisPrompt(
+            debateVisibleUserMessage(input.message, closer.backendId),
+            transcript,
+            closer,
+            holdWrites,
+            Boolean(decision.applyPatch),
+          ),
+          cwd: this.cwdForDispatch(decision, closer, input.cwd, isLateDeviceWrap(input.message)),
           prUrl: input.prUrl,
           repoUrl: input.repoUrl,
           branch: input.branch,
-          extraContext: this.mergeContext(input.extraContext, history),
+          extraContext: this.mergeContextForSpeaker(closer.backendId, input.extraContext, history),
           wait: true,
           timeoutMs,
           mode: this.dispatchMode(decision, closer, holdWrites, true),
@@ -630,7 +643,8 @@ export class ChatService {
     if (!this.stillOpen(threadId)) return "";
     const placeholder = this.beginSpeaker(threadId, speaker, decision, "debate", "debating", round);
     const task = debateTurnPrompt({
-      user: input.message,
+      user: debateVisibleUserMessage(input.message, speaker.backendId),
+      late: isLateDeviceWrap(input.message),
       round,
       rounds,
       speaker,
@@ -648,7 +662,7 @@ export class ChatService {
           prUrl: input.prUrl,
           repoUrl: input.repoUrl,
           branch: input.branch,
-          extraContext: this.mergeContext(input.extraContext, history),
+          extraContext: this.mergeContextForSpeaker(speaker.backendId, input.extraContext, history),
           wait: true,
           timeoutMs,
           mode: speaker.writesLocalFiles ? "plan" : undefined,
@@ -861,20 +875,21 @@ export class ChatService {
   ): void {
     if (!this.stillOpen(threadId)) return;
     const writer = this.writerForApproval(decision);
-    let cwd = input.cwd ?? decision.cwd ?? this.orchestrator.defaultCwd();
-    try {
-      cwd = this.orchestrator.allowlist.assertCwd(cwd);
-    } catch {
-      try {
-        cwd = this.orchestrator.allowlist.assertCwd(this.orchestrator.defaultCwd());
-      } catch {
-        cwd = this.orchestrator.defaultCwd();
-      }
-    }
+    const lateWrap = isLateDeviceWrap(input.message);
+    const cwd = resolveWriterCwd({
+      writesLocalFiles: true,
+      lateWrap,
+      granted: decision.cwd,
+      fallback: input.cwd,
+      defaultCwd: this.orchestrator.defaultCwd(),
+      tryCwd: (path) => this.orchestrator.allowlist.tryCwd(path),
+    });
+    const turn = extractRoutableMessage(input.message);
+    const attached = attachOperatorPatchFiles(planText, turn);
     const pending = buildPendingApproval({
-      decision: { ...decision, closer: writer, cwd },
+      decision: { ...decision, closer: writer, cwd, applyPatch: Boolean(decision.applyPatch || attached.files.length) },
       userMessage: input.message,
-      planText,
+      planText: attached.plan,
       cwd,
       extraContext: input.extraContext,
       prUrl: input.prUrl,
@@ -899,7 +914,7 @@ export class ChatService {
     let placeholderId: string | undefined;
     try {
       if (!this.stillOpen(threadId)) return;
-      const cwd = this.orchestrator.allowlist.assertCwd(pending.cwd ?? this.orchestrator.defaultCwd());
+      const cwd = this.assertPendingWriteCwd(pending);
       const speaker: RouteSpeaker = {
         backendId: "orchestrator",
         specialist: "apply-patch",
@@ -959,7 +974,7 @@ export class ChatService {
     let placeholderId: string | undefined;
     try {
       if (!this.stillOpen(threadId)) return;
-      const cwd = this.orchestrator.allowlist.assertCwd(pending.cwd ?? this.orchestrator.defaultCwd());
+      const cwd = this.assertPendingWriteCwd(pending);
       const placeholder = this.beginSpeaker(
         threadId,
         {
@@ -1020,16 +1035,31 @@ export class ChatService {
     fallback?: string,
     lateWrap = false,
   ): string | undefined {
-    if (!speaker.writesLocalFiles) return undefined;
-    if (lateWrap) {
-      const granted = decision.cwd ?? fallback;
-      if (!granted) return undefined;
-      return this.orchestrator.allowlist.tryCwd(granted) ?? undefined;
+    return resolveWriterCwd({
+      writesLocalFiles: speaker.writesLocalFiles,
+      lateWrap,
+      granted: decision.cwd,
+      fallback,
+      defaultCwd: this.orchestrator.defaultCwd(),
+      tryCwd: (path) => this.orchestrator.allowlist.tryCwd(path),
+    });
+  }
+
+  /** Late wrap never falls back to the orchestrator workspace. Granted cwd must still resolve. */
+  private assertPendingWriteCwd(pending: PendingApproval): string {
+    const late = isLateDeviceWrap(pending.userMessage);
+    const raw = pending.cwd?.trim();
+    if (late && !raw) {
+      throw new Error("No granted cwd to write. Drop or Approve a folder on the MCP host first.");
     }
-    const candidate = decision.cwd ?? fallback ?? this.orchestrator.defaultCwd();
-    const allowed = this.orchestrator.allowlist.tryCwd(candidate);
-    if (allowed) return allowed;
-    return this.orchestrator.allowlist.list()[0] ?? candidate;
+    if (raw) {
+      try {
+        return this.orchestrator.allowlist.assertCwd(raw);
+      } catch (error) {
+        if (late) throw error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    return this.orchestrator.allowlist.assertCwd(this.orchestrator.defaultCwd());
   }
 
   private async pcapAnalyzeContext(
@@ -1101,6 +1131,18 @@ export class ChatService {
       .join("\n\n");
     const parts = [extra?.trim(), prior ? `Prior chat:\n${prior}` : ""].filter(Boolean);
     return parts.length ? parts.join("\n\n") : undefined;
+  }
+
+  private mergeContextForSpeaker(
+    backendId: string,
+    extra: string | undefined,
+    history: Array<{ role: string; content: string }>,
+  ): string | undefined {
+    if (speakerSeesUntrustedOutput(backendId)) return this.mergeContext(extra, history);
+    return this.mergeContext(
+      extra ? debateVisibleUserMessage(extra, backendId) : extra,
+      history.map((t) => ({ ...t, content: debateVisibleUserMessage(t.content, backendId) })),
+    );
   }
 
   private emit(thread: ChatThread | undefined): void {
@@ -1239,14 +1281,35 @@ export class ChatService {
   }
 }
 
-function debateTurnPrompt(input: {
+/** Never silently pick another allowlisted folder when the candidate is outside. */
+export function resolveWriterCwd(input: {
+  writesLocalFiles: boolean;
+  lateWrap?: boolean;
+  granted?: string;
+  fallback?: string;
+  defaultCwd?: string;
+  tryCwd: (path: string) => string | undefined;
+}): string | undefined {
+  if (!input.writesLocalFiles) return undefined;
+  if (input.lateWrap) {
+    const granted = input.granted ?? input.fallback;
+    if (!granted) return undefined;
+    return input.tryCwd(granted);
+  }
+  const candidate = input.granted ?? input.fallback ?? input.defaultCwd;
+  if (!candidate) return undefined;
+  return input.tryCwd(candidate);
+}
+
+export function debateTurnPrompt(input: {
   user: string;
+  late?: boolean;
   round: number;
   rounds: number;
   speaker: RouteSpeaker;
   transcript: Array<{ label: string; text: string }>;
 }): string {
-  const late = isLateDeviceWrap(input.user);
+  const late = input.late === true || isLateDeviceWrap(input.user);
   const system = late ? LATE_JSON_SYSTEM : DEBATE_SYSTEM;
   const prior =
     input.transcript.length === 0

@@ -31,6 +31,7 @@ export class HttpProvider implements AgentProvider {
     try {
       const response = await fetch(this.config.url, {
         method: this.config.method ?? "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           ...this.config.headers,

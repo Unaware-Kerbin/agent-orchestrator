@@ -43,6 +43,13 @@ test("assertSafeRelPath rejects escapes and orchestrator internals", () => {
   assert.throws(() => assertSafeRelPath("C:/Windows/notepad.exe"), /absolute/);
   assert.throws(() => assertSafeRelPath("."), /empty/);
   assert.throws(() => assertSafeRelPath("src/ok.txt\0../x"), /control/);
+  assert.throws(() => assertSafeRelPath(".env"), /refusing/);
+  assert.throws(() => assertSafeRelPath("secret/.env"), /refusing/);
+  assert.throws(() => assertSafeRelPath(".git/config"), /refusing/);
+  assert.equal(assertSafeRelPath(".github/workflows/ci.yml"), ".github/workflows/ci.yml");
+  assert.equal(assertSafeRelPath(".gitignore"), ".gitignore");
+  assert.equal(assertSafeRelPath("src/environment.ts"), "src/environment.ts");
+  assert.equal(assertSafeRelPath("docs/git-setup.md"), "docs/git-setup.md");
 });
 
 test("applyParsedFiles writes utf8 inside the allowlist and rejects outside", () => {

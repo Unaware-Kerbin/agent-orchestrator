@@ -103,26 +103,39 @@ export async function runOpenAiChat(
   }
   const baseUrl = normalizeBaseUrl(config.baseUrl ?? options.defaultBaseUrl);
   const messages: Array<{ role: string; content: string }> = [];
-  if (request.system) messages.push({ role: "system", content: request.system });
-  for (const turn of request.history ?? []) messages.push(turn);
-  messages.push({ role: "user", content: request.prompt });
+  if (request.system?.trim()) messages.push({ role: "system", content: request.system });
+  for (const turn of request.history ?? []) {
+    if (typeof turn.content === "string" && turn.content.trim()) messages.push(turn);
+  }
+  messages.push({ role: "user", content: request.prompt?.trim() ? request.prompt : "(empty operator turn)" });
   const gemini = config.type === "openai" && isGeminiOpenAiConfig(id, config);
   const model = chatModelFor(id, config, request.model, gemini ? options.liveGeminiIds : undefined);
   const stream = typeof request.onDelta === "function";
   const body: Record<string, unknown> = { model, messages };
   if (stream) body.stream = true;
   const timeoutMs = request.timeoutMs ?? 30_000;
+  const deadline = started + timeoutMs;
+  const payloadJson = JSON.stringify(body);
 
-  try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+  const postOnce = (remainingMs: number) =>
+    fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      body: payloadJson,
+      signal: AbortSignal.timeout(Math.max(1, remainingMs)),
     });
+
+  try {
+    let response = await postOnce(timeoutMs);
+    if (response.status === 429) {
+      const waitMs = Math.min(800, Math.max(0, deadline - Date.now() - 1));
+      if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+      const remaining = deadline - Date.now();
+      if (remaining > 0) response = await postOnce(remaining);
+    }
     const contentType = response.headers.get("content-type") ?? "";
     if (!response.ok) {
       const payload: unknown = await response.json().catch(() => ({ error: response.statusText }));
