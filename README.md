@@ -381,6 +381,10 @@ Late: paste the printed `/mcp` URL in Late Settings. Leave Cursor `mcpServers` e
 
 `.env`, `.orchestrator/` (GUI token, secrets, chats, logos, allowlist, model weights, vLLM state), `gui.secret` / `secrets.env` if copied to the repo root, `node_modules/`, and logs. See `.gitignore`.
 
+## Changes
+
+What shipped in each tag: [CHANGELOG.md](CHANGELOG.md).
+
 ## Licenses
 
 This repository is [MIT](LICENSE). npm dependencies keep their own licenses under `node_modules` after `npm install` (including `@cursor/sdk` and `@modelcontextprotocol/server`). Model weights you download are **not** in this repo and remain under their upstream terms (Gemma Terms of Use, Llama Community License, Apache-2.0, MIT, and others as listed on each Hugging Face card).
