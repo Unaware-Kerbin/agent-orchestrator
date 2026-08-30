@@ -33,7 +33,7 @@ This clip is **Debate** on **your computer**: local Gemma, Cursor local, and Cur
 
 ## Install
 
-Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.1](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.1)). Each archive includes Node 22. Extract it, then:
+Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.2](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.2)). Each archive includes Node 22. Extract it, then:
 
 | Your computer | File | What you do |
 |---|---|---|
