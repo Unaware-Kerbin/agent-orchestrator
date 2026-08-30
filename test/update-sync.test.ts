@@ -1,42 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  allowedCdnRedirectUrl,
   allowedDownloadHost,
+  allowedFirstDownloadUrl,
   applyTargetFromChoice,
   buildAppStatus,
   checkBothReleases,
   compareSemver,
   isNewerThan,
   localVersionOverride,
+  parseAssetDigest,
   parseSemver,
   pickReleaseAsset,
+  pinDigestString,
+  sha256HexMatches,
   stripTag,
   type GithubAsset,
   type GithubFetch,
 } from "../src/update-sync.js";
 
-function asset(name: string): GithubAsset {
-  return { name, browser_download_url: `https://github.com/Unaware-Kerbin/late/releases/download/v0.2.0/${name}`, size: 10 };
+function asset(name: string, tag = "v0.2.0"): GithubAsset {
+  return { name, browser_download_url: `https://github.com/Unaware-Kerbin/late/releases/download/${tag}/${name}`, size: 10 };
 }
 
-function lateAssets(): GithubAsset[] {
+function lateAssets(tag = "v0.2.0"): GithubAsset[] {
   return [
-    asset("Late-0.2.0-linux-amd64.deb"),
-    asset("Late-0.2.0-linux-x86_64.AppImage"),
-    asset("Late-0.2.0-mac-arm64.dmg"),
-    asset("Late-0.2.0-win-x64.exe"),
+    asset("Late-0.2.0-linux-amd64.deb", tag),
+    asset("Late-0.2.0-linux-x86_64.AppImage", tag),
+    asset("Late-0.2.0-mac-arm64.dmg", tag),
+    asset("Late-0.2.0-win-x64.exe", tag),
   ];
 }
 
-function orchAssets(): GithubAsset[] {
+function orchAssets(tag = "v0.2.0"): GithubAsset[] {
   return [
     {
       name: "agent-orchestrator-0.2.0-linux-x64.tar.gz",
-      browser_download_url: "https://github.com/Unaware-Kerbin/agent-orchestrator/releases/download/v0.2.0/agent-orchestrator-0.2.0-linux-x64.tar.gz",
+      browser_download_url: `https://github.com/Unaware-Kerbin/agent-orchestrator/releases/download/${tag}/agent-orchestrator-0.2.0-linux-x64.tar.gz`,
     },
     {
       name: "agent-orchestrator-0.2.0-win-x64.zip",
-      browser_download_url: "https://github.com/Unaware-Kerbin/agent-orchestrator/releases/download/v0.2.0/agent-orchestrator-0.2.0-win-x64.zip",
+      browser_download_url: `https://github.com/Unaware-Kerbin/agent-orchestrator/releases/download/${tag}/agent-orchestrator-0.2.0-win-x64.zip`,
     },
   ];
 }
@@ -107,8 +112,8 @@ test("no update when both remotes match local", async () => {
     platform: "linux",
     arch: "x64",
     fetchImpl: mockFetch({
-      late: { status: 200, tag: "v0.1.9", assets: lateAssets() },
-      orch: { status: 200, tag: "v0.1.1", assets: orchAssets() },
+      late: { status: 200, tag: "v0.1.9", assets: lateAssets("v0.1.9") },
+      orch: { status: 200, tag: "v0.1.1", assets: orchAssets("v0.1.1") },
     }),
   });
   assert.equal(check.anyNewer, false);
@@ -127,8 +132,8 @@ test("Late only", async () => {
     arch: "x64",
     prefer: "appimage",
     fetchImpl: mockFetch({
-      late: { status: 200, tag: "v0.1.9", assets: lateAssets() },
-      orch: { status: 200, tag: "v0.1.1", assets: orchAssets() },
+      late: { status: 200, tag: "v0.1.9", assets: lateAssets("v0.1.9") },
+      orch: { status: 200, tag: "v0.1.1", assets: orchAssets("v0.1.1") },
     }),
   });
   assert.equal(check.lateOnly, true);
@@ -147,8 +152,8 @@ test("orchestrator only", async () => {
     platform: "linux",
     arch: "x64",
     fetchImpl: mockFetch({
-      late: { status: 200, tag: "v0.1.9", assets: lateAssets() },
-      orch: { status: 200, tag: "v0.1.1", assets: orchAssets() },
+      late: { status: 200, tag: "v0.1.9", assets: lateAssets("v0.1.9") },
+      orch: { status: 200, tag: "v0.1.1", assets: orchAssets("v0.1.1") },
     }),
   });
   assert.equal(check.orchestratorOnly, true);
@@ -165,7 +170,7 @@ test("both", async () => {
     platform: "linux",
     arch: "x64",
     fetchImpl: mockFetch({
-      late: { status: 200, tag: "v0.1.9", assets: lateAssets() },
+      late: { status: 200, tag: "v0.2.0", assets: lateAssets() },
       orch: { status: 200, tag: "v0.2.0", assets: orchAssets() },
     }),
   });
@@ -173,6 +178,19 @@ test("both", async () => {
   assert.equal(check.anyNewer, true);
   assert.deepEqual(applyTargetFromChoice("both", check), ["late", "orchestrator"]);
   assert.equal(check.late.asset?.name.includes("AppImage"), true);
+});
+
+test("asset URL that does not match the release tag is not downloadable", () => {
+  const status = buildAppStatus({
+    id: "late",
+    localVersion: "0.1.0",
+    release: { tag_name: "v0.1.9", assets: lateAssets() },
+    error: null,
+    platform: "linux",
+    arch: "x64",
+  });
+  assert.equal(status.newer, true);
+  assert.equal(status.asset, null);
 });
 
 test("404 does not throw and is not an update", async () => {
@@ -206,6 +224,57 @@ test("allowedDownloadHost refuses custom GitHub URLs, userinfo, and raw CDN", ()
     false,
   );
   assert.equal(allowedDownloadHost("https://127.0.0.1/secret"), false);
+  assert.equal(allowedDownloadHost("http://github.com/Unaware-Kerbin/late/releases/download/v0.1.9/x.bin"), false);
+  assert.equal(allowedDownloadHost("https://objects.githubusercontent.com/evil/pwn"), false);
+  assert.equal(allowedDownloadHost("https://objects.githubusercontent.com/github-production-user-asset/x"), false);
+});
+
+test("first hop and CDN redirect stay on the chosen asset", () => {
+  const file = "Late-0.1.9-linux-x64.AppImage";
+  const first = `https://github.com/Unaware-Kerbin/late/releases/download/v0.1.9/${file}`;
+  assert.equal(allowedFirstDownloadUrl(first, file), true);
+  assert.equal(allowedFirstDownloadUrl(first, "other.bin"), false);
+  assert.equal(
+    allowedFirstDownloadUrl("https://objects.githubusercontent.com/github-production-release-asset/1/2", file),
+    false,
+  );
+  const cdn = `https://release-assets.githubusercontent.com/github-production-release-asset/1/2?rscd=attachment%3B%20filename%3D${file}`;
+  assert.equal(allowedCdnRedirectUrl(cdn, file, false), true);
+  assert.equal(allowedCdnRedirectUrl(cdn, "other.bin", true), false);
+  assert.equal(
+    allowedCdnRedirectUrl("https://release-assets.githubusercontent.com/github-production-release-asset/1/2", file, false),
+    false,
+  );
+  assert.equal(
+    allowedCdnRedirectUrl("https://release-assets.githubusercontent.com/github-production-release-asset/1/2", file, true),
+    true,
+  );
+  assert.equal(
+    allowedCdnRedirectUrl("http://release-assets.githubusercontent.com/github-production-release-asset/1/2", file, true),
+    false,
+  );
+});
+
+test("parseAssetDigest pins sha256 and sha256HexMatches fails closed", () => {
+  assert.equal(parseAssetDigest("sha256:277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"), "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9");
+  assert.equal(parseAssetDigest(null, "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"), "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9");
+  assert.equal(parseAssetDigest(null), null);
+  assert.throws(() => parseAssetDigest("md5:abc"), /SHA-256/);
+  assert.equal(pinDigestString("277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"), "sha256:277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9");
+  assert.equal(
+    sha256HexMatches(
+      "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9",
+      "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9",
+    ),
+    true,
+  );
+  assert.equal(
+    sha256HexMatches(
+      "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    ),
+    false,
+  );
 });
 
 test("Electron 44 is not Late: do not skip or force a GitHub update", () => {

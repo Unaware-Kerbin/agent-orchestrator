@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,19 +7,33 @@ import {
   applyUpdates,
   archiveHasUnsafeMember,
   archiveListingHasLink,
+  archiveMemberEscapesDest,
   assertGithubDownloadUrl,
+  downloadAsset,
   parseUpdateChoice,
   safeAssetFileName,
   safeExtractStem,
   toGuiCheck,
+  verifyFileDigest,
 } from "../src/update-apply.js";
-import { checkBothReleases, type GithubAsset, type GithubFetch } from "../src/update-sync.js";
+import {
+  allowedCdnRedirectUrl,
+  allowedDownloadHost,
+  checkBothReleases,
+  parseAssetDigest,
+  type GithubAsset,
+  type GithubFetch,
+} from "../src/update-sync.js";
 
-function asset(name: string, repo: "late" | "agent-orchestrator"): GithubAsset {
+const BYTES_DIGEST = "sha256:277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9";
+const BYTES_SHA = "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9";
+
+function asset(name: string, repo: "late" | "agent-orchestrator", digest?: string): GithubAsset {
   return {
     name,
     browser_download_url: `https://github.com/Unaware-Kerbin/${repo}/releases/download/v0.2.0/${name}`,
     size: 10,
+    digest,
   };
 }
 
@@ -60,8 +74,23 @@ test("parseUpdateChoice and download URL stay on the two repos", () => {
   assert.equal(archiveHasUnsafeMember("foo/bar\n"), false);
   assert.equal(archiveHasUnsafeMember("linux-x64/bin/node\n"), false);
   assert.equal(archiveHasUnsafeMember("../etc/passwd\n"), true);
+  assert.equal(archiveHasUnsafeMember("C:/Windows/system32/evil\n"), true);
+  assert.equal(archiveMemberEscapesDest("foo/bar", "/tmp/updates"), false);
+  assert.equal(archiveMemberEscapesDest("../etc/passwd", "/tmp/updates"), true);
   assert.equal(archiveListingHasLink("linux-x64/bin/node\n"), false);
   assert.equal(archiveListingHasLink("lrwxrwxrwx 0 0 0 0 Jan 1 foo -> /etc\n"), true);
+  assert.equal(parseAssetDigest("sha256:277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"), "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9");
+  assert.throws(() => parseAssetDigest("md5:abc"), /SHA-256/);
+  assert.equal(
+    allowedCdnRedirectUrl("https://evil.example/github-production-release-asset/x", "Late.AppImage", true),
+    false,
+  );
+  assert.equal(
+    allowedDownloadHost("https://github.com/Unaware-Kerbin/late/releases/download/v0.2.0/other.bin", "Late.AppImage", {
+      hop: "first",
+    }),
+    false,
+  );
 });
 
 test("toGuiCheck always offers Late, this app, and both", async () => {
@@ -145,11 +174,11 @@ test("applyUpdates downloads both when newer", async () => {
     const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
     process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
     const fetchImpl = mockFetch({
-      late: { status: 200, tag: "v0.2.0", assets: [asset("Late-0.2.0-linux-x64.AppImage", "late")] },
+      late: { status: 200, tag: "v0.2.0", assets: [asset("Late-0.2.0-linux-x64.AppImage", "late", BYTES_DIGEST)] },
       orch: {
         status: 200,
         tag: "v0.2.0",
-        assets: [asset("agent-orchestrator-0.2.0-linux-x64.tar.gz", "agent-orchestrator")],
+        assets: [asset("agent-orchestrator-0.2.0-linux-x64.tar.gz", "agent-orchestrator", BYTES_DIGEST)],
       },
     });
     const downloaded: string[] = [];
@@ -173,4 +202,140 @@ test("applyUpdates downloads both when newer", async () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+function assetWithDigest(name: string, repo: "late" | "agent-orchestrator", digest: string): GithubAsset {
+  return { ...asset(name, repo), digest };
+}
+
+test("applyUpdates does not download when GitHub omitted the digest", async () => {
+  await withLocalVersions("0.1.0", "0.1.0", async () => {
+    const downloaded: string[] = [];
+    const result = await applyUpdates({
+      choice: "late",
+      confirm: true,
+      fetchImpl: mockFetch({
+        late: { status: 200, tag: "v0.2.0", assets: [asset("Late-0.2.0-linux-x64.AppImage", "late")] },
+        orch: { status: 200, tag: "v0.1.1", assets: [asset("agent-orchestrator-0.1.1-linux-x64.tar.gz", "agent-orchestrator")] },
+      }),
+      download: async (url) => {
+        downloaded.push(url);
+      },
+    });
+    assert.equal(downloaded.length, 0);
+    assert.equal(result.applied.length, 0);
+    assert.match(result.skipped.map((row) => row.reason).join(" "), /digest/i);
+  });
+});
+
+test("applyUpdates fails closed when the pinned digest does not match", async () => {
+  await withLocalVersions("0.1.0", "0.1.1", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "orch-digest-"));
+    const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
+    try {
+      const result = await applyUpdates({
+        choice: "late",
+        confirm: true,
+        fetchImpl: mockFetch({
+          late: {
+            status: 200,
+            tag: "v0.2.0",
+            assets: [assetWithDigest("Late-0.2.0-linux-x64.AppImage", "late", "sha256:0000000000000000000000000000000000000000000000000000000000000000")],
+          },
+          orch: { status: 200, tag: "v0.1.1", assets: [asset("agent-orchestrator-0.1.1-linux-x64.tar.gz", "agent-orchestrator")] },
+        }),
+        download: async (_url, dest) => {
+          writeFileSync(dest, "bytes");
+        },
+      });
+      assert.equal(result.applied.length, 0);
+      assert.match(result.skipped.map((row) => row.reason).join(" "), /did not match|digest/i);
+      assert.equal(existsSync(join(dir, "updates", "Late-0.2.0-linux-x64.AppImage")), false);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+      else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("applyUpdates keeps a file when the pinned digest matches", async () => {
+  await withLocalVersions("0.1.0", "0.1.1", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "orch-digest-ok-"));
+    const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
+    try {
+      const result = await applyUpdates({
+        choice: "late",
+        confirm: true,
+        fetchImpl: mockFetch({
+          late: {
+            status: 200,
+            tag: "v0.2.0",
+            assets: [assetWithDigest("Late-0.2.0-linux-x64.AppImage", "late", `sha256:${BYTES_SHA}`)],
+          },
+          orch: { status: 200, tag: "v0.1.1", assets: [asset("agent-orchestrator-0.1.1-linux-x64.tar.gz", "agent-orchestrator")] },
+        }),
+        download: async (_url, dest) => {
+          writeFileSync(dest, "bytes");
+        },
+      });
+      assert.deepEqual(result.applied, ["late"]);
+      assert.match(result.saved[0]?.note ?? "", /did not run the installer or use root/i);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+      else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("downloadAsset refuses http and off-asset CDN redirects", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-dl-"));
+  const dest = join(dir, "Late-0.2.0-linux-x64.AppImage");
+  const first = "https://github.com/Unaware-Kerbin/late/releases/download/v0.2.0/Late-0.2.0-linux-x64.AppImage";
+  const mockHttp = (async () =>
+    new Response(null, { status: 302, headers: { location: "http://evil.example/x" } })) as typeof fetch;
+  await assert.rejects(
+    () => downloadAsset(first, dest, mockHttp, { fileName: "Late-0.2.0-linux-x64.AppImage" }),
+    /https|redirect/i,
+  );
+  const mockWrong = (async (_url: string | URL | Request) => {
+    const href = String(_url);
+    if (href.startsWith("https://github.com/")) {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location:
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?rscd=attachment%3B%20filename%3Dother.bin",
+        },
+      });
+    }
+    return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+  }) as typeof fetch;
+  await assert.rejects(
+    () => downloadAsset(first, dest, mockWrong, { fileName: "Late-0.2.0-linux-x64.AppImage" }),
+    /redirect|chosen|GitHub/i,
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("verifyFileDigest fails closed on mismatch and unlinks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-hash-"));
+  const file = join(dir, "x.bin");
+  writeFileSync(file, "bytes");
+  await assert.rejects(
+    () => verifyFileDigest(file, "sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+    /digest/i,
+  );
+  await verifyFileDigest(file, `sha256:${BYTES_SHA}`).then(
+    () => {
+      throw new Error("mismatch should have unlinked the file");
+    },
+    () => undefined,
+  );
+  writeFileSync(file, "bytes");
+  await verifyFileDigest(file, `sha256:${BYTES_SHA}`);
+  rmSync(dir, { recursive: true, force: true });
 });

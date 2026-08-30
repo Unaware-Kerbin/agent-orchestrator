@@ -17,6 +17,8 @@ export interface GithubAsset {
   name: string;
   browser_download_url: string;
   size?: number;
+  digest?: string;
+  sha256?: string;
 }
 
 export interface GithubRelease {
@@ -30,6 +32,8 @@ export interface ChosenAsset {
   name: string;
   url: string;
   size: number;
+  /** Pinned `sha256:` hex from the GitHub release API, or null if GitHub omitted it. */
+  digest: string | null;
 }
 
 export interface AppUpdateStatus {
@@ -114,6 +118,110 @@ export function hostArch(value = process.arch): HostArch {
   return value === "arm64" ? "arm64" : "x64";
 }
 
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const GITHUB_CDN_PATH = /^\/github-production-release-asset(?:-[0-9a-f]+)?\//i;
+
+/** SHA-256 hex, or null if GitHub omitted digest/sha256. Throws if a digest field is present but not SHA-256. */
+export function parseAssetDigest(digest: unknown, sha256?: unknown): string | null {
+  const fromField = (value: unknown): string | null | undefined => {
+    if (value == null || value === "") return null;
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const m = /^(?:sha256:)?([0-9a-fA-F]{64})$/.exec(trimmed);
+    const captured = m?.[1];
+    if (!captured) return undefined;
+    const hex = captured.toLowerCase();
+    return SHA256_HEX.test(hex) ? hex : undefined;
+  };
+  const primary = fromField(digest);
+  if (primary) return primary;
+  if (primary === undefined) throw new Error("Release file digest is not a SHA-256 pin.");
+  const secondary = fromField(sha256);
+  if (secondary) return secondary;
+  if (secondary === undefined) throw new Error("Release file digest is not a SHA-256 pin.");
+  return null;
+}
+
+export function pinDigestString(hex: string | null): string | null {
+  return hex ? `sha256:${hex}` : null;
+}
+
+export function digestHex(pin: string | null | undefined): string | null {
+  if (!pin) return null;
+  const m = /^sha256:([0-9a-f]{64})$/.exec(pin);
+  return m?.[1] ?? null;
+}
+
+export function sha256HexMatches(actualHex: string, expectedHex: string): boolean {
+  if (!SHA256_HEX.test(actualHex) || !SHA256_HEX.test(expectedHex)) return false;
+  if (actualHex.length !== expectedHex.length) return false;
+  let diff = 0;
+  for (let i = 0; i < actualHex.length; i++) {
+    diff |= actualHex.charCodeAt(i) ^ expectedHex.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export function contentDispositionFileName(value: string): string | null {
+  const text = String(value);
+  const star = /filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;]+)/i.exec(text);
+  let raw: string | null = null;
+  if (star) {
+    try {
+      raw = decodeURIComponent((star[1] ?? "").trim().replace(/^"+|"+$/g, ""));
+    } catch {
+      raw = null;
+    }
+  } else {
+    const quoted = /filename\s*=\s*"([^"]+)"/i.exec(text);
+    const bare = /filename\s*=\s*([^;]+)/i.exec(text);
+    raw = (quoted?.[1] ?? bare?.[1] ?? "").trim() || null;
+  }
+  if (!raw) return null;
+  const base = raw.replaceAll("\\", "/").split("/").pop() ?? "";
+  if (!base || base === "." || base === ".." || base.includes("\0")) return null;
+  return base;
+}
+
+function pathSegments(pathname: string): string[] {
+  return pathname.split("/").filter((s) => s !== "");
+}
+
+export function githubAssetDownloadUrl(app: AppId, tag: string, fileName: string): string | null {
+  const { owner, repo } = UPDATE_REPOS[app];
+  const tagSeg = tag.trim();
+  const file = fileName.trim();
+  if (!tagSeg || tagSeg === "." || tagSeg === ".." || tagSeg.includes("/") || tagSeg.includes("\\") || tagSeg.includes("\0") || tagSeg.includes("..")) {
+    return null;
+  }
+  if (!file || file === "." || file === ".." || file.includes("/") || file.includes("\\") || file.includes("\0")) return null;
+  return `https://github.com/${owner}/${repo}/releases/download/${tagSeg}/${file}`;
+}
+
+export function urlsPointAtSameGithubDownload(apiUrl: string, official: string): boolean {
+  try {
+    const a = new URL(apiUrl);
+    const b = new URL(official);
+    if (a.protocol !== "https:" || b.protocol !== "https:") return false;
+    if (a.username || a.password || b.username || b.password) return false;
+    if (a.hostname.toLowerCase() !== "github.com" || b.hostname.toLowerCase() !== "github.com") return false;
+    return decodeURIComponent(a.pathname) === decodeURIComponent(b.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function cdnDeclaredFileName(u: URL): string | null {
+  for (const key of ["response-content-disposition", "rscd", "filename"]) {
+    const v = u.searchParams.get(key);
+    if (!v) continue;
+    const n = key === "filename" ? contentDispositionFileName(`filename=${v}`) ?? v.replaceAll("\\", "/").split("/").pop() ?? null : contentDispositionFileName(v);
+    if (n) return n;
+  }
+  return null;
+}
+
 function asAssets(raw: unknown): GithubAsset[] {
   if (!Array.isArray(raw)) return [];
   const out: GithubAsset[] = [];
@@ -121,10 +229,18 @@ function asAssets(raw: unknown): GithubAsset[] {
     if (!row || typeof row !== "object") continue;
     const rec = row as Record<string, unknown>;
     if (typeof rec.name !== "string" || typeof rec.browser_download_url !== "string") continue;
+    let digest: string | undefined;
+    try {
+      const hex = parseAssetDigest(rec.digest, rec.sha256);
+      digest = pinDigestString(hex) ?? undefined;
+    } catch {
+      continue;
+    }
     out.push({
       name: rec.name,
       browser_download_url: rec.browser_download_url,
       size: typeof rec.size === "number" ? rec.size : undefined,
+      digest,
     });
   }
   return out;
@@ -230,6 +346,18 @@ export function buildAppStatus(opts: {
         })
       : null;
   const newer = Boolean(parsed && remoteVersion && localUsable && isNewerThan(remoteVersion, localUsable));
+  let asset: ChosenAsset | null = null;
+  if (picked && tag) {
+    const official = githubAssetDownloadUrl(opts.id, tag, picked.name);
+    if (official && urlsPointAtSameGithubDownload(picked.browser_download_url, official)) {
+      asset = {
+        name: picked.name,
+        url: official,
+        size: picked.size ?? 0,
+        digest: picked.digest ?? null,
+      };
+    }
+  }
   return {
     id: opts.id,
     label: meta.label,
@@ -238,9 +366,7 @@ export function buildAppStatus(opts: {
     remoteTag: tag,
     releaseUrl: typeof opts.release?.html_url === "string" ? opts.release.html_url : null,
     newer,
-    asset: picked
-      ? { name: picked.name, url: picked.browser_download_url, size: picked.size ?? 0 }
-      : null,
+    asset,
     error,
     unsigned,
   };
@@ -264,22 +390,78 @@ export function githubReleaseUrl(app: AppId): string {
   return `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
 }
 
-export function allowedDownloadHost(url: string): boolean {
+function httpsNoUserinfo(u: URL): boolean {
+  if (u.protocol !== "https:") return false;
+  if (u.username || u.password) return false;
+  if (u.port && u.port !== "443") return false;
+  return true;
+}
+
+function githubDownloadSegments(u: URL): { repo: "late" | "agent-orchestrator"; tag: string; file: string } | null {
+  if (u.hostname.toLowerCase() !== "github.com") return null;
+  const parts = pathSegments(u.pathname).map((s) => {
+    try {
+      return decodeURIComponent(s);
+    } catch {
+      return s;
+    }
+  });
+  if (parts.length !== 6) return null;
+  if (parts[0] !== "Unaware-Kerbin") return null;
+  if (parts[1] !== "late" && parts[1] !== "agent-orchestrator") return null;
+  if (parts[2] !== "releases" || parts[3] !== "download") return null;
+  const tag = parts[4];
+  const file = parts[5];
+  if (!tag || tag === "." || tag === ".." || tag.includes("..")) return null;
+  if (!file || file === "." || file === ".." || file.includes("\0")) return null;
+  return { repo: parts[1], tag, file };
+}
+
+function isGithubReleaseCdn(u: URL): boolean {
+  const host = u.hostname.toLowerCase();
+  if (host !== "objects.githubusercontent.com" && host !== "release-assets.githubusercontent.com") return false;
+  return GITHUB_CDN_PATH.test(u.pathname);
+}
+
+/** API latest JSON or a github.com Unaware-Kerbin release file. CDN hops need expectedFileName (or digestPinned). */
+export function allowedDownloadHost(
+  url: string,
+  expectedFileName?: string,
+  opts?: { digestPinned?: boolean; hop?: "first" | "cdn" | "any" },
+): boolean {
   try {
     const u = new URL(url);
-    if (u.protocol !== "https:") return false;
-    if (u.username || u.password) return false;
+    if (!httpsNoUserinfo(u)) return false;
     const host = u.hostname.toLowerCase();
+    const hop = opts?.hop ?? "any";
     if (host === "api.github.com") {
+      if (hop === "cdn" || hop === "first") return false;
       return /^\/repos\/Unaware-Kerbin\/(late|agent-orchestrator)\/releases\/latest$/.test(u.pathname);
     }
     if (host === "github.com") {
-      return /^\/Unaware-Kerbin\/(late|agent-orchestrator)\/releases\/download\//.test(u.pathname);
+      if (hop === "cdn") return false;
+      const segs = githubDownloadSegments(u);
+      if (!segs) return false;
+      if (expectedFileName && segs.file !== expectedFileName) return false;
+      return true;
     }
-    return host === "objects.githubusercontent.com" || host === "release-assets.githubusercontent.com";
+    if (hop === "first") return false;
+    if (!isGithubReleaseCdn(u)) return false;
+    if (!expectedFileName) return hop !== "cdn" || Boolean(opts?.digestPinned);
+    const declared = cdnDeclaredFileName(u);
+    if (declared) return declared === expectedFileName;
+    return hop === "cdn" ? Boolean(opts?.digestPinned) : true;
   } catch {
     return false;
   }
+}
+
+export function allowedFirstDownloadUrl(url: string, expectedFileName: string): boolean {
+  return allowedDownloadHost(url, expectedFileName, { hop: "first" });
+}
+
+export function allowedCdnRedirectUrl(url: string, expectedFileName: string, digestPinned: boolean): boolean {
+  return allowedDownloadHost(url, expectedFileName, { hop: "cdn", digestPinned });
 }
 
 export async function fetchGithubRelease(app: AppId, fetchImpl: GithubFetch): Promise<FetchResult> {

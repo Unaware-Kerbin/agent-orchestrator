@@ -2,11 +2,12 @@
  * Live GitHub I/O + confirm-to-download for the loopback GUI.
  * Semver / "newer" meaning lives in update-sync.ts (same file Late copies).
  */
-import { createWriteStream, existsSync, readFileSync } from "node:fs";
+import { createWriteStream, existsSync, readFileSync, createReadStream } from "node:fs";
 import { mkdir, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { isPathInside } from "./allowlist.js";
 import { packageRoot } from "./config.js";
@@ -14,13 +15,18 @@ import { ensureSecureDir } from "./platform.js";
 import { stateDir } from "./state.js";
 import {
   UNSIGNED_MAC_WIN,
+  allowedCdnRedirectUrl,
   allowedDownloadHost,
+  allowedFirstDownloadUrl,
   applyTargetFromChoice,
   checkBothReleases,
+  contentDispositionFileName,
+  digestHex,
   githubReleaseUrl,
   hostArch,
   hostPlatform,
   localVersionOverride,
+  sha256HexMatches,
   type AppId,
   type GithubFetch,
   type UpdateCheck,
@@ -55,7 +61,6 @@ export type UpdateApplyResult = {
 const UA = "agent-orchestrator-update-sync";
 const MAX_ASSET_BYTES = 400 * 1024 * 1024;
 const MAX_RELEASE_JSON = 1_500_000;
-const GITHUB_DOWNLOAD_PATH = /^\/Unaware-Kerbin\/(late|agent-orchestrator)\/releases\/download\//;
 
 export function parseUpdateChoice(value: unknown): UpdateChoice {
   if (value === "late" || value === "orchestrator" || value === "both") return value;
@@ -167,7 +172,7 @@ export async function checkUpdates(opts?: { fetchImpl?: GithubFetch }): Promise<
   return toGuiCheck(check);
 }
 
-export function assertGithubDownloadUrl(url: string): void {
+export function assertGithubDownloadUrl(url: string, expectedFileName?: string): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -179,14 +184,20 @@ export function assertGithubDownloadUrl(url: string): void {
     throw new Error("Download address must not include a login.");
   }
   const host = parsed.hostname.toLowerCase();
-  if (!allowedDownloadHost(url)) {
+  if (!allowedFirstDownloadUrl(url, expectedFileName || lastPathSegment(parsed))) {
     if (host === "github.com" || host === "api.github.com" || host.endsWith(".githubusercontent.com")) {
       throw new Error("Download must be a Unaware-Kerbin late or agent-orchestrator release file.");
     }
     throw new Error("Download host is not GitHub.");
   }
-  if (host === "github.com" && !GITHUB_DOWNLOAD_PATH.test(parsed.pathname)) {
-    throw new Error("Download must be a Unaware-Kerbin late or agent-orchestrator release file.");
+}
+
+function lastPathSegment(parsed: URL): string {
+  const raw = parsed.pathname.split("/").filter(Boolean).pop() ?? "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
   }
 }
 
@@ -212,11 +223,27 @@ export function archiveHasUnsafeMember(listing: string): boolean {
   for (const line of listing.split(/\r?\n/)) {
     const n = line.trim().replaceAll("\\", "/");
     if (!n) continue;
-    if (n.startsWith("/") || n.startsWith("../") || n.includes("/../") || n.endsWith("/..") || n === "..") {
-      return true;
-    }
+    if (n.includes("\0")) return true;
+    if (n.startsWith("/") || n.startsWith("//") || /^[a-zA-Z]:(\/|$)/.test(n)) return true;
+    if (n === ".." || n.startsWith("../") || n.includes("/../") || n.endsWith("/..")) return true;
+    if (n.split("/").some((part) => part === "..")) return true;
   }
   return false;
+}
+
+/** Resolved member must stay inside destDir (Windows drive letters and `..` included). */
+export function archiveMemberEscapesDest(member: string, destDir: string): boolean {
+  if (archiveHasUnsafeMember(member)) return true;
+  const n = member.trim().replaceAll("\\", "/");
+  if (!n) return true;
+  return !isPathInside(resolve(destDir, n), resolve(destDir));
+}
+
+function listingEscapesDest(listing: string, destDir: string): boolean {
+  return listing.split(/\r?\n/).some((line) => {
+    const n = line.trim();
+    return Boolean(n) && archiveMemberEscapesDest(n, destDir);
+  });
 }
 
 /** Verbose `tar -tv` / `unzip -Z` lines. Do not use on name-only listings (`linux-…` is a normal path). */
@@ -229,20 +256,41 @@ export function archiveListingHasLink(listing: string): boolean {
   return false;
 }
 
+export async function verifyFileDigest(filePath: string, pin: string): Promise<void> {
+  const expected = digestHex(pin);
+  if (!expected) throw new Error("Release file digest is not a SHA-256 pin. I will not keep it.");
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(filePath), hash);
+  const actual = hash.digest("hex");
+  if (!sha256HexMatches(actual, expected)) {
+    await unlink(filePath).catch(() => undefined);
+    throw new Error("Downloaded file did not match the GitHub SHA-256 digest. I will not keep it.");
+  }
+}
+
 export async function downloadAsset(
   url: string,
   destFile: string,
   fetchFn: typeof fetch = fetch,
+  expected?: { fileName: string; digest?: string | null },
 ): Promise<void> {
+  const fileName = expected?.fileName ?? safeAssetFileName(lastPathSegment(new URL(url)));
+  const digestPinned = Boolean(digestHex(expected?.digest ?? null));
   const first = new URL(url);
   if (first.hostname.toLowerCase() !== "github.com") {
     throw new Error("Download must start at github.com/Unaware-Kerbin/…/releases/download/.");
   }
-  assertGithubDownloadUrl(url);
+  assertGithubDownloadUrl(url, fileName);
   await mkdir(dirname(destFile), { recursive: true, mode: 0o700 });
   let current = url;
   for (let hop = 0; hop < 5; hop++) {
-    assertGithubDownloadUrl(current);
+    if (hop === 0) {
+      if (!allowedFirstDownloadUrl(current, fileName)) {
+        throw new Error("Download must start at github.com/Unaware-Kerbin/…/releases/download/.");
+      }
+    } else if (!allowedCdnRedirectUrl(current, fileName, digestPinned)) {
+      throw new Error("Refusing redirect off GitHub https.");
+    }
     const response = await fetchFn(current, {
       method: "GET",
       redirect: "manual",
@@ -251,10 +299,16 @@ export async function downloadAsset(
     if (response.status >= 300 && response.status < 400) {
       const loc = response.headers.get("location");
       if (!loc) throw new Error("GitHub redirect had no next address.");
-      current = new URL(loc, current).href;
+      const next = new URL(loc, current);
+      if (next.protocol !== "https:") throw new Error("Refusing redirect off GitHub https.");
+      current = next.href;
       continue;
     }
     if (!response.ok || !response.body) throw new Error(`Download failed (${response.status}).`);
+    const headerName = contentDispositionFileName(response.headers.get("content-disposition") ?? "");
+    if (headerName && headerName !== fileName) {
+      throw new Error("Download was not the chosen GitHub release file.");
+    }
     const tmp = `${destFile}.part`;
     const file = createWriteStream(tmp, { mode: 0o600 });
     let size = 0;
@@ -273,6 +327,12 @@ export async function downloadAsset(
       await unlink(tmp).catch(() => undefined);
       throw error;
     }
+    const pin = expected?.digest ?? null;
+    if (!pin || !digestHex(pin)) {
+      await unlink(destFile).catch(() => undefined);
+      throw new Error("GitHub did not publish a SHA-256 digest. I will not keep it.");
+    }
+    await verifyFileDigest(destFile, pin);
     return;
   }
   throw new Error("Too many GitHub redirects.");
@@ -283,27 +343,31 @@ function extractOrchestratorArchive(archivePath: string, destDir: string): void 
   if (archivePath.endsWith(".tar.gz") || archivePath.endsWith(".tgz")) {
     const listing = spawnSync("tar", ["-tzf", archivePath], { encoding: "utf8" });
     if (listing.status !== 0) throw new Error(listing.stderr?.trim() || "Could not read the archive.");
-    if (archiveHasUnsafeMember(listing.stdout ?? "")) {
+    if (listingEscapesDest(listing.stdout ?? "", destDir)) {
       throw new Error("Archive has an unsafe path. I will not unpack it.");
     }
     const verbose = spawnSync("tar", ["-tvzf", archivePath], { encoding: "utf8" });
-    if (verbose.status === 0 && archiveListingHasLink(verbose.stdout ?? "")) {
+    if (verbose.status !== 0) throw new Error(verbose.stderr?.trim() || "Could not inspect the archive.");
+    if (archiveListingHasLink(verbose.stdout ?? "")) {
       throw new Error("Archive has an unsafe path. I will not unpack it.");
     }
-    const result = spawnSync("tar", ["--no-absolute-filenames", "-xzf", archivePath, "-C", destDir], {
-      encoding: "utf8",
-    });
+    const result = spawnSync(
+      "tar",
+      ["--no-absolute-filenames", "--no-same-owner", "-xzf", archivePath, "-C", destDir],
+      { encoding: "utf8" },
+    );
     if (result.status !== 0) throw new Error(result.stderr?.trim() || "Could not unpack the archive.");
     return;
   }
   if (archivePath.endsWith(".zip")) {
     const listing = spawnSync("unzip", ["-Z1", archivePath], { encoding: "utf8" });
     if (listing.status !== 0) throw new Error(listing.stderr?.trim() || "Could not read the zip.");
-    if (archiveHasUnsafeMember(listing.stdout ?? "")) {
+    if (listingEscapesDest(listing.stdout ?? "", destDir)) {
       throw new Error("Archive has an unsafe path. I will not unpack it.");
     }
     const verbose = spawnSync("unzip", ["-Z", archivePath], { encoding: "utf8" });
-    if (verbose.status === 0 && archiveListingHasLink(verbose.stdout ?? "")) {
+    if (verbose.status !== 0) throw new Error(verbose.stderr?.trim() || "Could not inspect the zip.");
+    if (archiveListingHasLink(verbose.stdout ?? "")) {
       throw new Error("Archive has an unsafe path. I will not unpack it.");
     }
     const result = spawnSync("unzip", ["-q", archivePath, "-d", destDir], { encoding: "utf8" });
@@ -377,10 +441,34 @@ export async function applyUpdates(input: {
       });
       continue;
     }
-    assertGithubDownloadUrl(client.asset.url);
+    if (!digestHex(client.asset.digest)) {
+      skipped.push({
+        id,
+        reason: "GitHub did not publish a SHA-256 digest. I will not download it.",
+      });
+      continue;
+    }
+    assertGithubDownloadUrl(client.asset.url, client.asset.name);
     const destFile = join(destRoot, safeAssetFileName(client.asset.name));
-    if (input.download) await input.download(client.asset.url, destFile);
-    else await downloadAsset(client.asset.url, destFile);
+    try {
+      if (input.download) await input.download(client.asset.url, destFile);
+      else {
+        await downloadAsset(client.asset.url, destFile, fetch, {
+          fileName: client.asset.name,
+          digest: client.asset.digest,
+        });
+      }
+      const pin = client.asset.digest;
+      if (!pin) throw new Error("GitHub did not publish a SHA-256 digest. I will not keep it.");
+      await verifyFileDigest(destFile, pin);
+    } catch (error) {
+      await unlink(destFile).catch(() => undefined);
+      skipped.push({
+        id,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     let path = destFile;
     let note =
       id === "late"
