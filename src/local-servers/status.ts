@@ -1,6 +1,7 @@
 import { parseModelId } from "../identity.js";
 import { LOCAL_OPENAI_DUMMY_KEY } from "../providers/keys.js";
 import { isUnreachableError } from "../providers/keys.js";
+import { findEngineBin } from "./bins.js";
 import { which } from "../platform.js";
 import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, loopbackOrigin, normalizeLoopbackOpenAiUrl } from "./loopback.js";
 
@@ -25,11 +26,11 @@ export interface LlamaServerBinary {
 }
 
 export function llamaServerOnPath(whichFn: (cmd: string) => string | undefined = which): string | undefined {
-  return whichFn("llama-server");
+  return findEngineBin("llama-server", whichFn);
 }
 
 export function ollamaOnPath(whichFn: (cmd: string) => string | undefined = which): string | undefined {
-  return whichFn("ollama");
+  return findEngineBin("ollama", whichFn);
 }
 
 function acceptedModelId(raw: string): string | undefined {
@@ -40,10 +41,15 @@ function acceptedModelId(raw: string): string | undefined {
   }
 }
 
+/** OpenAI GET /v1/models JSON (`{ data: [...] }`). HTML or other JSON is not llama.cpp. */
+function isOpenAiModelsList(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  return Array.isArray((payload as { data?: unknown }).data);
+}
+
 function openaiModelIds(payload: unknown): string[] {
-  if (!payload || typeof payload !== "object") return [];
-  const data = (payload as { data?: unknown }).data;
-  if (!Array.isArray(data)) return [];
+  if (!isOpenAiModelsList(payload)) return [];
+  const data = (payload as { data: unknown[] }).data;
   const ids: string[] = [];
   for (const row of data) {
     if (row && typeof row === "object" && typeof (row as { id?: unknown }).id === "string") {
@@ -170,6 +176,18 @@ export async function probeLlamaCpp(options: {
   const apiKey = options.apiKey?.trim() || LOCAL_OPENAI_DUMMY_KEY;
   try {
     const modelsProbe = await getJson(`${baseUrl}/models`, fetchFn, timeoutMs, apiKey);
+    // HTTP 200 HTML (another process on :8080) is not llama.cpp — require OpenAI models JSON.
+    if (!isOpenAiModelsList(modelsProbe.payload)) {
+      return {
+        kind: "llamacpp",
+        running: false,
+        ready: false,
+        baseUrl,
+        origin,
+        models: [],
+        reason: `llama.cpp not running at ${baseUrl} (/v1/models is not an OpenAI models JSON list)`,
+      };
+    }
     const models = openaiModelIds(modelsProbe.payload);
     return {
       kind: "llamacpp",
@@ -187,9 +205,25 @@ export async function probeLlamaCpp(options: {
     try {
       const health = await fetchFn(`${origin}/health`, {
         method: "GET",
+        headers: { accept: "application/json" },
         signal: AbortSignal.timeout(timeoutMs),
       });
-      void health.arrayBuffer().catch(() => undefined);
+      const raw = await health.text().catch(() => "");
+      let payload: unknown;
+      try {
+        payload = JSON.parse(raw) as unknown;
+      } catch {
+        payload = undefined;
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return downStatus(
+          "llamacpp",
+          baseUrl,
+          origin,
+          new Error("/health is not JSON"),
+          timeoutMs,
+        );
+      }
       return {
         kind: "llamacpp",
         running: true,

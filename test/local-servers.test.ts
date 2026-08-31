@@ -1,12 +1,29 @@
 import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { parseOrchestratorConfig, validateConfigYaml } from "../src/config.js";
+import { pidAlive } from "../src/platform.js";
 import {
   isLoopbackHttpUrl,
   isLoopbackHostname,
   normalizeLoopbackOpenAiUrl,
 } from "../src/local-servers/loopback.js";
 import { llamaServerOnPath, ollamaOnPath, probeLlamaCpp, probeOllama } from "../src/local-servers/status.js";
+import { findEngineBin } from "../src/local-servers/bins.js";
+import {
+  formatOwnedPid,
+  llamaServerSpec,
+  ollamaServeSpec,
+  ownedPidIdentityLive,
+  ownedPidMatchesLive,
+  parseOwnedPid,
+  procComm,
+  procStarttime,
+  stopLocalServer,
+} from "../src/local-servers/spawn.js";
 import {
   DEFAULT_OLLAMA_BACKEND_ID,
   DEFAULT_OLLAMA_SPECIALIST_ID,
@@ -125,6 +142,20 @@ test("probeLlamaCpp uses mocked /v1/models", async () => {
   const status = await probeLlamaCpp({ fetchFn, timeoutMs: 50 });
   assert.equal(status.running, true);
   assert.deepEqual(status.models, ["qwen2.5-7b"]);
+});
+
+test("probeLlamaCpp does not treat HTML 200 on /v1/models as llama.cpp running", async () => {
+  const html = "<!DOCTYPE html><html><head><title>App</title></head><body>not llama.cpp</body></html>";
+  const fetchFn = (async () =>
+    new Response(html, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    })) as typeof fetch;
+  const status = await probeLlamaCpp({ fetchFn, timeoutMs: 50 });
+  assert.equal(status.running, false);
+  assert.equal(status.ready, false);
+  assert.deepEqual(status.models, []);
+  assert.match(status.reason, /not an OpenAI models JSON list/);
 });
 
 test("OllamaProvider probe ready/not-ready with mocked fetch", async () => {
@@ -264,4 +295,156 @@ test("llamaServerOnPath and ollamaOnPath use injected which including .exe names
   assert.equal(llamaServerOnPath(() => undefined), undefined);
   assert.equal(llamaServerOnPath((cmd) => (cmd === "llama-server" ? "C:\\\\tools\\\\llama-server.exe" : undefined)), "C:\\\\tools\\\\llama-server.exe");
   assert.equal(ollamaOnPath((cmd) => (cmd === "ollama" ? "C:\\\\Users\\\\me\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe" : undefined)), "C:\\\\Users\\\\me\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe");
+});
+
+test("bundled runtime/bin wins over PATH for findEngineBin", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-bin-"));
+  const bundled = join(dir, "ollama");
+  writeFileSync(bundled, "#!/bin/sh\n");
+  chmodSync(bundled, 0o755);
+  const prev = process.env.AGENT_ORCHESTRATOR_BUNDLE_BIN;
+  process.env.AGENT_ORCHESTRATOR_BUNDLE_BIN = dir;
+  try {
+    const found = findEngineBin("ollama");
+    assert.equal(found, bundled);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_BUNDLE_BIN;
+    else process.env.AGENT_ORCHESTRATOR_BUNDLE_BIN = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ollama serve and llama-server spawn specs bind 127.0.0.1", () => {
+  const ollama = ollamaServeSpec("/tmp/ollama");
+  assert.equal(ollama.args[0], "serve");
+  assert.equal(ollama.env.OLLAMA_HOST, "127.0.0.1:11434");
+  assert.equal(ollama.host, "127.0.0.1:11434");
+  const llama = llamaServerSpec("/tmp/llama-server", "/tmp/model.gguf");
+  assert.deepEqual(llama.args, ["-m", "/tmp/model.gguf", "--host", "127.0.0.1", "--port", "8080"]);
+  assert.throws(() => llamaServerSpec("/tmp/llama-server", "relative.gguf"), /absolute/);
+  assert.throws(() => llamaServerSpec("/tmp/llama-server", "/tmp/../etc/passwd.gguf"), /\.\./);
+});
+
+test("owned pid identity matches live comm+starttime and rejects a stranger", () => {
+  const pid = process.pid;
+  const comm = procComm(pid);
+  const starttime = procStarttime(pid);
+  assert.ok(comm);
+  assert.ok(starttime && starttime > 0);
+  const rec = { pid, starttime, comm };
+  assert.equal(ownedPidIdentityLive(rec), true);
+  assert.equal(ownedPidIdentityLive({ ...rec, starttime: 1 }), false);
+  assert.equal(ownedPidIdentityLive({ ...rec, comm: "ollama" }), false);
+  assert.equal(ownedPidMatchesLive({ pid, starttime, comm: "ollama" }, "ollama"), false);
+  assert.equal(parseOwnedPid(String(pid)), undefined);
+  assert.deepEqual(parseOwnedPid(formatOwnedPid(rec)), rec);
+});
+
+test("stopLocalServer does not kill a reused PID from a stale pidfile and unlinks it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-pid-"));
+  const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
+  try {
+    const victim = process.pid;
+    assert.ok(pidAlive(victim));
+    const pidFile = join(dir, "ollama-serve.pid");
+    writeFileSync(pidFile, `pid=${victim}\nstarttime=1\ncomm=ollama\n`);
+    const result = stopLocalServer("ollama");
+    assert.equal(result.running, false);
+    assert.equal(pidAlive(victim), true);
+    assert.equal(existsSync(pidFile), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stopLocalServer unlinks a pidfile whose process is already gone", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-pid-gone-"));
+  const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
+  try {
+    const pidFile = join(dir, "llama-server.pid");
+    writeFileSync(pidFile, "pid=999999\nstarttime=1\ncomm=llama-server\n");
+    stopLocalServer("llamacpp");
+    assert.equal(existsSync(pidFile), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stopLocalServer does not kill from a legacy numeric pidfile", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-pid-legacy-"));
+  const prev = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+  process.env.AGENT_ORCHESTRATOR_STATE_DIR = dir;
+  try {
+    const victim = process.pid;
+    assert.ok(pidAlive(victim));
+    const pidFile = join(dir, "ollama-serve.pid");
+    writeFileSync(pidFile, `${victim}\n`);
+    stopLocalServer("ollama");
+    assert.equal(pidAlive(victim), true);
+    assert.equal(existsSync(pidFile), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_ORCHESTRATOR_STATE_DIR;
+    else process.env.AGENT_ORCHESTRATOR_STATE_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fetch-inference-bins.sh pins find/curl/sha256sum off PATH", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "fetch-inference-bins.sh"),
+    "utf8",
+  );
+  assert.match(src, /FIND="\$\(secure_bin find\)"/);
+  assert.match(src, /CURL="\$\(secure_bin curl\)"/);
+  assert.match(src, /SHA256SUM="\$\(secure_bin sha256sum\)"/);
+  assert.match(src, /\$FIND/);
+  assert.match(src, /\$CURL/);
+  assert.match(src, /\$SHA256SUM/);
+  assert.match(src, /\$\{expect\}-\$\("\$BASENAME" "\$file"\)/);
+  assert.match(src, /SHA-256 mismatch/);
+  const code = src
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+  assert.doesNotMatch(code, /(?:^|[\n;|&])\s*find\s+"/m);
+  assert.doesNotMatch(code, /(?:^|[\n;|&])\s*curl\s+-/m);
+  assert.doesNotMatch(code, /(?:^|[\n;|&])\s*sha256sum\s+"/m);
+  assert.match(src, /usage: fetch-inference-bins.sh DEST \[linux-x64\|linux-arm64\|mac-arm64\|mac-x64\|win-x64\|darwin-arm64\|darwin-x64\]/);
+  assert.match(src, /mac-arm64/);
+  assert.match(src, /win-x64/);
+  assert.match(src, /darwin-arm64/);
+  assert.match(src, /INFERENCE_TARGET/);
+  assert.match(src, /INFERENCE_BINS_KEY/);
+  assert.match(src, /resources-win/);
+  assert.match(src, /mlx_metal\*/);
+  assert.match(src, /copy_engine_dir "\$ollama_bin" "\$DEST\/bin" "\$DEST\/lib\/ollama"/);
+  assert.match(src, /copy_engine_dir "\$llama_bin" "\$DEST\/bin"/);
+  const strip = src.slice(src.indexOf("strip_ollama_gpu_libs"), src.indexOf("\nwork="));
+  assert.match(strip, /cuda\*/);
+  assert.match(strip, /rocm\*/);
+  assert.doesNotMatch(strip, /mlx\*/);
+});
+
+test("pack.sh stages win and mac targets without host uname", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "pack.sh"),
+    "utf8",
+  );
+  assert.match(src, /win-x64/);
+  assert.match(src, /mac-arm64/);
+  assert.match(src, /mac-x64/);
+  assert.match(src, /fetch-inference-bins\.sh/);
+  assert.match(src, /PACK_OVERWRITE/);
+  assert.match(src, /--win/);
+  assert.match(src, /--mac/);
+  assert.match(src, /runtime-win/);
+  assert.match(src, /label=darwin/);
+  assert.match(src, /Distro-agnostic tarball/);
+  assert.match(src, /no fpm\/electron-builder stack/);
 });

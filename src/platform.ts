@@ -171,6 +171,7 @@ export function runCapture(command: string, args: string[], timeout = 4000): str
 
 export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
     return true;

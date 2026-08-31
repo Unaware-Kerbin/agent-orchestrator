@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      - name: Linux unpack tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Package
         shell: bash
         run: bash scripts/pack.sh
@@ -59,5 +62,6 @@ jobs:
             - **Linux / macOS:** extract, then `./bin/agent-orchestrator-gui`
             - **Windows:** extract, then `bin\agent-orchestrator-gui.cmd`
             - Copy the printed `/mcp` URL for Late. Stop with `--stop`.
+            - Archives include Node 22 plus Ollama and llama-server (Vulkan/Metal). Model weights are not included. vLLM Start still needs Docker.
 
-            Bind stays `127.0.0.1`. This does not start vLLM.
+            Bind stays `127.0.0.1`.

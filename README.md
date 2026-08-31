@@ -31,17 +31,51 @@ Chat (GUI or MCP)
 
 This clip is **Debate** on **your computer**: local Gemma, Cursor local, and Cursor cloud each get a turn. Gemini returned 429 and was skipped. You read the replies. Writes still wait for **Approve**.
 
+## What’s in the archive
+
+Ollama and llama-server are in the zip/tarball. **Weights are not.** vLLM Start still needs Docker. Bind stays `127.0.0.1`. This app does not start inference on another host.
+
+| What you get | Picture |
+|---|---|
+| What is packed | ![Archive includes Node, Ollama, llama-server; Mac is darwin zip](docs/images/installer-flow.png) |
+| Start / Stop on Local models | ![Start Ollama, Start llama-server, vLLM Start with Docker](docs/images/local-start-stop.png) |
+| GUI vs `/mcp` | ![Paste /mcp into Late, not the HTML token URL](docs/images/gui-vs-mcp.png) |
+
+### Four steps
+
+| 1 | 2 | 3 | 4 |
+|---|---|---|---|
+| [![Extract](docs/images/01-extract.png)](docs/images/01-extract.png) | [![Start Ollama](docs/images/02-start-ollama.png)](docs/images/02-start-ollama.png) | [![vLLM Docker](docs/images/03-vllm-docker.png)](docs/images/03-vllm-docker.png) | [![Late /mcp](docs/images/04-late-mcp.png)](docs/images/04-late-mcp.png) |
+
+```mermaid
+sequenceDiagram
+  actor You
+  participant GUI as GUI 127.0.0.1
+  participant Ollama as Ollama :11434
+  participant Late
+  You->>GUI: extract archive → agent-orchestrator-gui
+  You->>GUI: Local models → Start Ollama
+  GUI->>Ollama: serve on loopback
+  You->>Late: paste printed /mcp URL
+  Late->>GUI: chat_send (isolated prompt)
+  Note over GUI,Late: extra start_vllm / dispatch wait for Approve
+  Note over GUI: no start_ollama MCP tool
+```
+
 ## Install
 
 Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.2](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.2)). Each archive includes Node 22. Extract it, then:
 
 | Your computer | File | What you do |
 |---|---|---|
-| Linux | `agent-orchestrator-…-linux-….tar.gz` | Extract, run `./bin/agent-orchestrator-gui` |
-| Mac | `agent-orchestrator-…-mac-….tar.gz` | Extract, run `./bin/agent-orchestrator-gui` |
-| Windows | `agent-orchestrator-…-win-….zip` | Extract, run `bin\agent-orchestrator-gui.cmd` |
+| Linux | `agent-orchestrator-…-linux-….tar.gz` | Extract, run `./bin/agent-orchestrator-gui`. Same tarball on Debian, Fedora, Arch (no `.deb` / `.rpm`). |
+| Mac (Apple silicon) | `agent-orchestrator-…-darwin-arm64.zip` | Extract, run `./bin/agent-orchestrator-gui`. Unsigned zip — **not** `mac-….tar.gz`. Metal/MLX in this pack. |
+| Mac (Intel) | `agent-orchestrator-…-darwin-x64.zip` | Same. llama.cpp is CPU/BLAS. |
+| Windows | `agent-orchestrator-…-win-x64.zip` | Extract, run `bin\agent-orchestrator-gui.cmd` |
 
-That starts the loopback GUI and Streamable HTTP **`/mcp` on the same port**. Copy the printed URL for Late. Stop with `--stop`. Bind stays `127.0.0.1`. This does not start vLLM.
+That starts the loopback GUI and Streamable HTTP **`/mcp` on the same port**. Copy the printed URL for Late. Stop with `--stop`. Bind stays `127.0.0.1`. Ollama and llama.cpp are in the archive (Start on the Local models page). vLLM Start still needs Docker — if Docker is missing, **Start with Docker** stays hidden.
+
+The Linux file is a portable tarball — it is not tied to one distro. There is no `.deb` or `.rpm` (this project packs a Node runtime archive, not an fpm/electron-builder installer).
 
 Or install from source below.
 
@@ -81,12 +115,12 @@ npm run gui
 
 Open the token URL from stderr. Stop with `npm run gui:stop`. Late still uses the printed `/mcp` URL. `npm start` is stdio for this checkout’s Cursor IDE only (`node` + `tsx/dist/cli.mjs`, not a Unix `.bin` shim) — not the Late operator path.
 
-Local models are **user-installed** Windows binaries talking to `127.0.0.1`:
+Local models on **your computer** talk to `127.0.0.1`:
 
-- **Ollama** — install from ollama.com; typical path `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`. Register the loopback API in the GUI.
-- **llama.cpp** — put `llama-server.exe` on `PATH`, start with `--host 127.0.0.1`.
+- **Ollama** — packed installs include `runtime/bin/ollama`. Start it from Local models, or use one you already run (`%LOCALAPPDATA%\Programs\Ollama\ollama.exe`).
+- **llama.cpp** — packed installs include `llama-server` (Vulkan/Metal; Intel Mac is CPU/BLAS). Start with `--host 127.0.0.1` and a GGUF path. Weights are not in the archive.
 - **vLLM** — Windows CUDA wheel when you have NVIDIA + `nvidia-smi`; host `vllm` / `python -m vllm`. AMD: ROCm tools (`amd-smi`) when present.
-- **Docker Desktop** — optional. NVIDIA GPU in Docker Desktop can work when GPU support is enabled. **Intel XPU / `/dev/dri` images are a Linux path**; on Windows use WSL2 or a Linux host, or skip Intel Docker.
+- **Docker Desktop** — optional for vLLM. NVIDIA GPU in Docker Desktop can work when GPU support is enabled. **Intel XPU / `/dev/dri` images are a Linux path**; on Windows use WSL2 or a Linux host, or skip Intel Docker. If Docker is missing, vLLM Start-with-Docker stays hidden.
 
 Hardware detect uses `nvidia-smi` (including `C:\Windows\System32` / NVIDIA NVSMI), Win32 video controllers, and vendor CLIs when present — not Linux `lspci` / sysfs. If probes fail, the GUI shows a reason instead of crashing.
 
@@ -115,6 +149,16 @@ Home is a chat thread. The header (new chat, thread switcher, settings) and comp
 - **Single** / pin a backend — that backend only.
 
 While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so the UI does not look hung.
+
+## On your computer (short how-tos)
+
+| Do this | How | Picture |
+|---|---|---|
+| Start / Stop local servers | **Settings → Local models**. **Start Ollama** / **Stop**, or **Start llama-server** with an absolute `.gguf` path. Loopback only. Weights are not in the archive. | ![Start Ollama and llama-server](docs/images/local-start-stop.png) |
+| vLLM | **Start with Docker** only if Docker is on this computer. Hidden when Docker is missing. Ollama / llama.cpp still work. | ![Search the catalog](docs/assets/local-models.webp) |
+| MCP for Late | **Copy MCP URL** → paste `/mcp` into Late. HTML root is not MCP. Empty Late URL = folder. Send is `chat_send`. Extra `start_*` wait for Approve. Do **not** put this in Cursor `mcpServers`. | ![Copy the /mcp URL](docs/assets/http-mcp.webp) |
+| Token-gated `/api` | Open the printed `?token=` URL. GUI `/api/*` needs that session token. `/mcp` does not (Late never sends it). | ![GUI on loopback only](docs/assets/security.webp) |
+| MCP tools | `chat_send`, `list_agents`, `start_vllm`, `ollama_status`, `llamacpp_status`, … There is **no** `start_ollama` tool — Start Ollama is the Local models button. | ![GUI vs /mcp](docs/images/gui-vs-mcp.png) |
 
 ![Debate: several models each get a turn](docs/assets/chat.webp)
 
@@ -221,24 +265,20 @@ pip install -r scripts/requirements-hf.txt   # downloads
 
 ### Ollama
 
-Ollama is a separate local OpenAI-compat API (`http://127.0.0.1:11434/v1`). The orchestrator **detects and registers** a running daemon; it does not install Ollama or pull weights.
-
-1. Install Ollama yourself and run it so it listens on loopback.
-2. `ollama pull llama3.1` (or any tag you want).
-3. In the GUI: **Local models → Register Ollama backend**, or **Backends → Add Ollama backend**. Chat Auto treats a ready Ollama backend like other local speakers.
+Ollama is a local OpenAI-compat API (`http://127.0.0.1:11434/v1`). Packed installs include the binary. Start it from **Local models → Start Ollama** (loopback only). Pull weights yourself (`ollama pull llama3.1`) or from Late. Then **Register Ollama backend**.
 
 YAML type is `ollama`. Dummy `apiKey: ollama` is not a secret. Non-loopback hosts are refused.
 
 ### llama.cpp
 
-Connect to a user-started [`llama-server`](https://github.com/ggml-org/llama.cpp) OpenAI API. GGUF files are **not** the vLLM Hugging Face catalog.
+Packed installs include [`llama-server`](https://github.com/ggml-org/llama.cpp) (Vulkan on Linux/Windows, Metal on Apple silicon; Intel Mac is CPU/BLAS from the official zip). GGUF files are **not** in the archive. Start from Local models with an absolute `.gguf` path, or:
 
 ```bash
 llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080
 # Windows: llama-server.exe -m C:\path\to\model.gguf --host 127.0.0.1 --port 8080
 ```
 
-Then **Backends → Add llama.cpp backend** with `http://127.0.0.1:8080/v1` and the model id the server reports. Bind **127.0.0.1 only**. The GUI will mention `llama-server` if it is already on `PATH`; this app does not download binaries or GGUF weights.
+Then **Backends → Add llama.cpp backend** with `http://127.0.0.1:8080/v1`. Bind **127.0.0.1 only**.
 
 YAML type is `llamacpp`.
 
@@ -308,7 +348,7 @@ Login: not used by Late. HTTP MCP for Late is the printed `/mcp` URL with no GUI
 | `list_hardware` / `list_local_models` / `recommend_local_models` | Fit and catalog |
 | `download_local_model` | Hugging Face snapshot |
 | `start_vllm` / `stop_vllm` / `remove_vllm` / `vllm_status` / `delete_local_model` | Local vLLM servers |
-| `ollama_status` / `llamacpp_status` | Probe loopback Ollama / llama-server |
+| `ollama_status` / `llamacpp_status` | Probe loopback Ollama / llama-server. There is **no** `start_ollama` MCP tool — use Local models **Start Ollama**. |
 
 ## Default specialists
 

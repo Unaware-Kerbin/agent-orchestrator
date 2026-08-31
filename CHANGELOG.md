@@ -5,7 +5,11 @@ What shipped in each tag, in plain language. Newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are America/New_York.
 
-This is a window on **your computer**. Bind stays loopback (`127.0.0.1`). This does not start vLLM.
+This is a window on **your computer**. Bind stays loopback (`127.0.0.1`). Packed archives include Ollama and llama-server. vLLM Start still needs Docker.
+
+## Unreleased
+
+Packed installs include Ollama and `llama-server` (Vulkan on Linux/Windows, Metal on Apple silicon; Intel Mac is CPU/BLAS) under `runtime/bin`. Apple silicon packs Ollama `mlx_metal_v3`/`v4` under `lib/ollama`. `scripts/pack.sh` can stage `win-x64` / `mac-arm64` / `mac-x64` from Linux without replacing the Linux tarball. The Linux archive is distro-agnostic (Debian, Fedora, Arch, and others use the same `.tar.gz`; there is no `.deb`/`.rpm`). Start them from Local models (loopback only). Model weights stay out of the archive. vLLM Start still needs Docker; if Docker is missing the Start-with-Docker control stays hidden. README lists `darwin-*.zip` (not `mac-….tar.gz`), Local models Start/Stop, token-gated `/api`, and that there is no `start_ollama` MCP tool.
 
 ## [0.1.2] - 2026-08-30
 

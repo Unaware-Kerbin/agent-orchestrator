@@ -13,6 +13,7 @@ import { decodeLogoDataUrl, hasLogo, parseModelId, parseNickname, readLogo, remo
 import { envNamesForBackend, isEnvVarName } from "../providers/keys.js";
 import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, normalizeLoopbackOpenAiUrl } from "../local-servers/loopback.js";
 import { llamaServerOnPath, ollamaOnPath, probeLlamaCpp, probeOllama } from "../local-servers/status.js";
+import { startLlamaServer, startOllama, stopLocalServer } from "../local-servers/spawn.js";
 import {
   DEFAULT_OLLAMA_BACKEND_ID,
   DEFAULT_OLLAMA_SPECIALIST_ID,
@@ -1130,6 +1131,31 @@ export function startGuiServer(options: {
     if (path === "/api/local-servers" && method === "GET") {
       try {
         send(res, 200, await localServersSnapshot(orchestrator));
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/start" && method === "POST") {
+      try {
+        const kind = isRecord(body) && body.kind === "llamacpp" ? "llamacpp" : "ollama";
+        if (kind === "llamacpp") {
+          const modelPath = isRecord(body) && typeof body.modelPath === "string" ? body.modelPath.trim() : "";
+          send(res, 200, await startLlamaServer(modelPath));
+        } else {
+          send(res, 200, await startOllama());
+        }
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/stop" && method === "POST") {
+      try {
+        const kind = isRecord(body) && body.kind === "llamacpp" ? "llamacpp" : "ollama";
+        send(res, 200, stopLocalServer(kind));
       } catch (error) {
         send(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }

@@ -1,0 +1,18 @@
+# Pinned Ollama + llama.cpp downloads. Pack fails if SHA-256 mismatches.
+# Weights are never in this list. CUDA/ROCm Ollama layers are stripped after extract.
+OLLAMA_VERSION=v0.33.1
+LLAMA_CPP_TAG=b10276
+OLLAMA_REPO=https://github.com/ollama/ollama/releases/download
+LLAMA_REPO=https://github.com/ggml-org/llama.cpp/releases/download
+
+# os-arch  kind  filename  sha256
+linux-x64    ollama  ollama-linux-amd64.tar.zst                     88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d
+linux-arm64  ollama  ollama-linux-arm64.tar.zst                     869b98629bf4a438d1c11669331c8214e8317cdfd7ec3fe4efd44fb929602f57
+mac-arm64    ollama  ollama-darwin.tgz                              6c4ff73ee47b1d8971cf80df3b7db4fc4284cfcdffdfe09c014e12cd72bacf83
+mac-x64      ollama  ollama-darwin.tgz                              6c4ff73ee47b1d8971cf80df3b7db4fc4284cfcdffdfe09c014e12cd72bacf83
+win-x64      ollama  ollama-windows-amd64.zip                       321bf63e36871fb31ee44cf4987150d770c679ac3e233115540d83468d675b06
+linux-x64    llama   llama-b10276-bin-ubuntu-vulkan-x64.tar.gz      baa342ecfb8afe394dc16c2d36e74969b304049b84105a577272a05aa87e303a
+linux-arm64  llama   llama-b10276-bin-ubuntu-vulkan-arm64.tar.gz    1853cc7aa379262b381b43a5c69bf737e8a74a5d9e74158ccc1f36adb7776351
+mac-arm64    llama   llama-b10276-bin-macos-arm64.tar.gz            20d10cd3bb6004cf1343f8f62c56194c1115a5a926787de0dd65f806faff9887
+mac-x64      llama   llama-b10276-bin-macos-x64.tar.gz              58a8bf74a790b2bc7121f324c0e3df54beec8f83d77a8f71d8debc4f4d296fa4
+win-x64      llama   llama-b10276-bin-win-vulkan-x64.zip            e9f0f8cd772258a1bbc3c1f39bedbb63b2ce176ddfd1d2eecdd2be65406eba70

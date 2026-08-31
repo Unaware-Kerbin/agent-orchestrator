@@ -690,7 +690,7 @@ function renderOverview() {
                 .join("; ")
             : "no loopback llama-server registered"
         }</p>
-        <p class="muted">Connect to a user-started <span class="mono">llama-server</span> on 127.0.0.1. GGUF weights are not the vLLM catalog.</p>
+        <p class="muted">llama-server on 127.0.0.1 (bundled in packed installs). GGUF weights are not the vLLM catalog.</p>
       </article>
       <article class="card">
         <h2>Default cwd</h2>
@@ -892,7 +892,7 @@ async function renderBackends() {
     </form>
     <form id="llamacpp-form" class="card" style="margin-top:0.85rem">
       <h2>Add llama.cpp backend</h2>
-      <p class="muted">Connect to a user-started <span class="mono">llama-server</span> OpenAI API. Example: <span class="mono">llama-server -m model.gguf --host 127.0.0.1 --port 8080</span>. GGUF files are not vLLM Hugging Face snapshots. Bind 127.0.0.1 only.</p>
+      <p class="muted">llama.cpp OpenAI API. Packed installs include llama-server. Example: <span class="mono">llama-server -m model.gguf --host 127.0.0.1 --port 8080</span>. GGUF files are not vLLM Hugging Face snapshots. Bind 127.0.0.1 only.</p>
       <label class="field">Backend id <input name="id" type="text" required placeholder="llamacpp" /></label>
       <label class="field">Base URL <input name="baseUrl" type="text" placeholder="http://127.0.0.1:8080/v1" /></label>
       <label class="field">Model <input name="model" type="text" required placeholder="local" /></label>
@@ -1032,10 +1032,13 @@ function renderLocalModels() {
             ? `<p class="error">${escapeHtml(job.error || job.message || "error")}</p>`
             : "";
       const startLabel = preferDocker ? "Start with Docker" : "Start";
+      const dockerMissing = docker.daemon === "missing";
       let actions = `<button type="button" class="btn secondary" data-download="${escapeHtml(m.id)}">Download</button>`;
       if (thisRunning || thisStarting) {
         actions += `<button type="button" class="btn danger" data-vllm-stop="${escapeHtml(m.id)}">Stop</button>`;
         actions += `<button type="button" class="btn danger" data-vllm-remove="${escapeHtml(m.id)}">Remove from mix</button>`;
+      } else if (dockerMissing && preferDocker) {
+        actions += `<p class="muted">Install Docker to use vLLM on this computer.</p>`;
       } else {
         actions += `<button type="button" class="btn" data-vllm-start="${escapeHtml(m.id)}" ${m.downloaded && !thisStarting ? "" : "disabled"}>${thisStarting ? "Starting…" : startLabel}</button>`;
       }
@@ -1163,15 +1166,17 @@ function renderLocalModels() {
       <article class="card">
         <h2>Ollama</h2>
         <p>${localServers.ollama?.running ? `<span class="pill ok">running</span>` : `<span class="pill warn">not running</span>`} ${escapeHtml(localServers.ollama?.origin ?? "http://127.0.0.1:11434")}</p>
-        <p class="muted">${escapeHtml(localServers.ollama?.reason ?? "Probe loopback 11434. Install Ollama yourself — this app does not download it.")}${
-          localServers.ollamaBinary ? ` Found <span class="mono">${escapeHtml(localServers.ollamaBinary)}</span> on PATH.` : ""
+        <p class="muted">${escapeHtml(localServers.ollama?.reason ?? "Probe loopback 11434.")}${
+          localServers.ollamaBinary ? ` Found <span class="mono">${escapeHtml(localServers.ollamaBinary)}</span>.` : ""
         }</p>
         ${
           (localServers.ollama?.models ?? []).length
             ? `<ul>${localServers.ollama.models.map((m) => `<li class="mono">${escapeHtml(m)}</li>`).join("")}</ul>`
-            : `<p class="muted">No tags yet. Run <span class="mono">ollama pull llama3.1</span> then Register.</p>`
+            : `<p class="muted">No tags yet. Start Ollama, then <span class="mono">ollama pull</span> / Late Pull, then Register.</p>`
         }
         <div class="actions">
+          <button type="button" class="btn" id="ollama-start" ${localServers.ollama?.running ? "disabled" : ""}>Start Ollama</button>
+          <button type="button" class="btn secondary" id="ollama-stop" ${localServers.ollama?.running ? "" : "disabled"}>Stop</button>
           <button type="button" class="btn" id="ollama-connect" ${localServers.ollama?.running ? "" : "disabled"}>Register Ollama backend</button>
         </div>
       </article>
@@ -1189,9 +1194,16 @@ function renderLocalModels() {
         }
         <p class="muted">${
           localServers.llamaServerBinary
-            ? `Found <span class="mono">llama-server</span> at ${escapeHtml(localServers.llamaServerBinary)}. Start it yourself with <span class="mono">--host 127.0.0.1</span>, then add the backend on Settings → Backends. This app does not download GGUF files.`
-            : `Start <span class="mono">llama-server -m model.gguf --host 127.0.0.1 --port 8080</span> then add a backend. GGUF is not the vLLM Hugging Face catalog.`
+            ? `Found <span class="mono">llama-server</span> at ${escapeHtml(localServers.llamaServerBinary)}. Start binds <span class="mono">127.0.0.1</span>. GGUF weights are not in this archive.`
+            : `Packed installs include llama-server. Start with an absolute <span class="mono">.gguf</span> path, or run it yourself on 127.0.0.1:8080.`
         }</p>
+        <label class="field" for="llamacpp-gguf">GGUF path (absolute)
+          <input id="llamacpp-gguf" type="text" placeholder="/path/to/model.gguf" autocomplete="off" />
+        </label>
+        <div class="actions">
+          <button type="button" class="btn" id="llamacpp-start">Start llama-server</button>
+          <button type="button" class="btn secondary" id="llamacpp-stop">Stop</button>
+        </div>
       </article>
       <article class="card">
         <h2>Cursor cloud</h2>
@@ -1212,7 +1224,7 @@ function renderLocalModels() {
                 .join("")}</ul>
                <p class="muted">${preferDocker ? "Start with Docker is the default when a vendor image matches this GPU." : "Available as a launch backend."}</p>`
             : `<p>${escapeHtml(docker.error ?? "No local GPU serving images found.")}</p>
-               <p class="muted">Optional: pull a vLLM image that matches your GPU vendor, stay in the docker group, and keep publish on 127.0.0.1 only.</p>`
+               <p class="muted">${docker.daemon === "missing" ? "Install Docker to use vLLM on this computer. Ollama and llama.cpp are included and do not need Docker." : "Optional: pull a vLLM image that matches your GPU vendor, stay in the docker group, and keep publish on 127.0.0.1 only."}</p>`
         }
       </article>
     </div>
@@ -1968,6 +1980,52 @@ $("main").addEventListener("click", async (event) => {
       await loadLocalModels();
       renderLocalModels();
       if ($("local-models-status")) $("local-models-status").innerHTML = flash(`${name} cleared`, "ok");
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  if (target.id === "ollama-start") {
+    try {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash("Starting Ollama…", "ok");
+      await api("/api/local-servers/start", { method: "POST", body: JSON.stringify({ kind: "ollama" }) });
+      await loadLocalServers();
+      renderLocalModels();
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  if (target.id === "ollama-stop") {
+    try {
+      await api("/api/local-servers/stop", { method: "POST", body: JSON.stringify({ kind: "ollama" }) });
+      await loadLocalServers();
+      renderLocalModels();
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  if (target.id === "llamacpp-start") {
+    try {
+      const modelPath = $("llamacpp-gguf")?.value?.trim() ?? "";
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash("Starting llama-server…", "ok");
+      await api("/api/local-servers/start", {
+        method: "POST",
+        body: JSON.stringify({ kind: "llamacpp", modelPath }),
+      });
+      await loadLocalServers();
+      renderLocalModels();
+    } catch (error) {
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
+    }
+    return;
+  }
+  if (target.id === "llamacpp-stop") {
+    try {
+      await api("/api/local-servers/stop", { method: "POST", body: JSON.stringify({ kind: "llamacpp" }) });
+      await loadLocalServers();
+      renderLocalModels();
     } catch (error) {
       if ($("local-models-status")) $("local-models-status").innerHTML = flash(error.message, "bad");
     }
