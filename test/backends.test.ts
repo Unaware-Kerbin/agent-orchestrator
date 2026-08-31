@@ -273,6 +273,13 @@ specialists:
   assert.match(patched, /type: openai/);
   const parsed = validateConfigYaml(patched);
   assert.equal(parsed.mcp?.listenHost, "192.168.2.139");
+  const autoYaml = patchMcpListenHostYaml(yaml, "auto");
+  assert.match(autoYaml, /listen_host: "auto"/);
+  assert.equal(validateConfigYaml(autoYaml).mcp?.listenHost, "auto");
+  const emptyYaml = patchMcpListenHostYaml(yaml, "");
+  assert.match(emptyYaml, /listen_host: "auto"/);
+  const autoCfg = parseOrchestratorConfig({ ...base, mcp: { listen_host: "auto" } });
+  assert.equal(autoCfg.mcp?.listenHost, "auto");
 });
 
 test("gemini is ready when GEMINI_API_KEY is set", () => {

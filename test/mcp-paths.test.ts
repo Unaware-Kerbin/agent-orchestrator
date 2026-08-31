@@ -3,11 +3,13 @@ import { test } from "node:test";
 import {
   bindMcpListenHost,
   bindMcpLoopbackOnly,
+  isAutoListenHost,
   lateMcpCopyLines,
   listenHostHeaderOk,
   listenMcpUrl,
   listenOriginOk,
   loopbackMcpUrl,
+  primaryPrivateIpv4,
 } from "../src/mcp/bind.js";
 import { isMcpHealthPath, isMcpLivenessGet, isMcpLoginPath, isMcpPath, normalizeMcpPath } from "../src/mcp/paths.js";
 import { assertNoMachineHome } from "./machine-paths.js";
@@ -29,6 +31,39 @@ test("MCP HTTP bind allows loopback and one RFC1918 IP; refuses 0.0.0.0 and publ
   assert.throws(() => bindMcpListenHost("169.254.1.1"), /private/);
   assert.throws(() => bindMcpListenHost("255.255.255.255"), /private/);
   assert.throws(() => bindMcpListenHost("example.com"), /private/);
+});
+
+test("auto picks the primary RFC1918 IPv4; empty bind stays loopback", () => {
+  assert.equal(isAutoListenHost("auto"), true);
+  assert.equal(isAutoListenHost("AUTO"), true);
+  assert.equal(isAutoListenHost(""), false);
+  const picked = primaryPrivateIpv4(
+    {
+      lo: [{ address: "127.0.0.1", family: "IPv4", internal: true, mac: "", netmask: "255.0.0.0", cidr: null }],
+      docker0: [{ address: "172.17.0.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.0.0", cidr: null }],
+      virbr0: [{ address: "192.168.122.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+      eno2: [{ address: "192.168.2.139", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+    },
+    "eno2",
+  );
+  assert.equal(picked, "192.168.2.139");
+  const noDefault = primaryPrivateIpv4(
+    {
+      docker0: [{ address: "172.17.0.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.0.0", cidr: null }],
+      eno2: [{ address: "192.168.2.139", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+    },
+    undefined,
+  );
+  assert.equal(noDefault, "192.168.2.139");
+  assert.equal(bindMcpListenHost(undefined), "127.0.0.1");
+  assert.equal(bindMcpListenHost(""), "127.0.0.1");
+  const lan = primaryPrivateIpv4();
+  if (lan) {
+    assert.equal(bindMcpListenHost("auto"), lan);
+    assert.equal(listenMcpUrl(8790, "auto"), `http://${lan}:8790/mcp`);
+  } else {
+    assert.throws(() => bindMcpListenHost("auto"), /auto/);
+  }
 });
 
 test("/mcp and /MCP are MCP paths; other GUI routes are not", () => {

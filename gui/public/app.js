@@ -76,6 +76,7 @@ async function loadSession() {
     bind: typeof data.bind === "string" ? data.bind : "",
     listenHost: typeof data.listenHost === "string" ? data.listenHost : "",
     configListenHost: typeof data.configListenHost === "string" ? data.configListenHost : "",
+    suggestedLanHost: typeof data.suggestedLanHost === "string" ? data.suggestedLanHost : "",
     envListenHostSet: data.envListenHostSet === true,
   };
   return data;
@@ -151,7 +152,7 @@ function tokenFromLocation() {
 
 let token = tokenFromLocation();
 let catalog = { backends: [], specialists: [], workflows: [], writePolicy: { allowedDirectories: [], defaultCwd: "" }, localRuntime: {} };
-let sessionInfo = { mcpUrl: "", bind: "", listenHost: "", configListenHost: "", envListenHostSet: false };
+let sessionInfo = { mcpUrl: "", bind: "", listenHost: "", configListenHost: "", suggestedLanHost: "", envListenHostSet: false };
 let runs = [];
 let localModelsQuery = "";
 let localModels = null;
@@ -857,9 +858,9 @@ async function renderBackends() {
       </div>
       <form id="mcp-listen-host-form">
         <label class="field">Listen host (this computer)
-          <input id="mcp-listen-host" name="listenHost" class="mono" type="text" autocomplete="off" ${sessionInfo.envListenHostSet ? "disabled" : ""} value="${escapeHtml(sessionInfo.configListenHost || sessionInfo.listenHost || "127.0.0.1")}" placeholder="127.0.0.1" />
+          <input id="mcp-listen-host" name="listenHost" class="mono" type="text" autocomplete="off" ${sessionInfo.envListenHostSet ? "disabled" : ""} value="${escapeHtml(sessionInfo.configListenHost)}" placeholder="${escapeHtml(sessionInfo.suggestedLanHost || "192.168.2.139")}" />
         </label>
-        <p class="muted">Loopback, or one private IP you type (example <span class="mono">192.168.2.139</span>). Env <span class="mono">AGENT_ORCHESTRATOR_GUI_HOST</span> / <span class="mono">AGENT_ORCHESTRATOR_MCP_HOST</span> override. Restart after save. Trusted LAN only — firewall to the laptop. Late still Approve.</p>
+        <p class="muted">Empty or <span class="mono">auto</span> binds this computer's LAN address (example <span class="mono">${escapeHtml(sessionInfo.suggestedLanHost || "192.168.2.139")}</span>). Or type that IP, or <span class="mono">127.0.0.1</span>. Env <span class="mono">AGENT_ORCHESTRATOR_MCP_HOST</span> / <span class="mono">AGENT_ORCHESTRATOR_GUI_HOST</span> override. Restart after save. One private IP only — not every interface. Trusted LAN only — firewall to the laptop. Late still Approve.</p>
         <div class="actions"><button type="submit"${sessionInfo.envListenHostSet ? " disabled" : ""}>Save listen host</button></div>
         <div id="mcp-listen-status"></div>
       </form>

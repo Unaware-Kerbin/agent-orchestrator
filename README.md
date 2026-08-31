@@ -64,7 +64,7 @@ sequenceDiagram
 
 ## Install
 
-Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.3](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.3)). GitHub Actions **Build installers** also packs on `main` (workflow artifacts). Filenames are in [release/README.md](release/README.md). Each archive includes Node 22. Extract it, then:
+Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.4](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.4)). GitHub Actions **Build installers** also packs on `main` (workflow artifacts). Filenames are in [release/README.md](release/README.md). Each archive includes Node 22. Extract it, then:
 
 | Your computer | File | What you do |
 |---|---|---|
@@ -208,7 +208,7 @@ The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per brows
 
 | Property | Behavior |
 | --- | --- |
-| Bind | GUI and HTTP MCP default to **`127.0.0.1`**. You may bind **one** private IP on this computer (RFC1918 or IPv6 ULA) via `mcp.listen_host`, GUI Settings, or `AGENT_ORCHESTRATOR_MCP_HOST` / `AGENT_ORCHESTRATOR_GUI_HOST`. Ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT` (defaults 8787 / 8790). `0.0.0.0`, `::`, and public addresses are refused. Local model HTTP stays loopback. |
+| Bind | GUI and HTTP MCP default to **`127.0.0.1`**. You may bind **one** private IP on this computer (RFC1918 or IPv6 ULA) via `mcp.listen_host`, GUI Settings, or `AGENT_ORCHESTRATOR_MCP_HOST` / `AGENT_ORCHESTRATOR_GUI_HOST`. `auto` (or Settings empty) is this computer's primary RFC1918 IPv4. Ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT` (defaults 8787 / 8790). `0.0.0.0`, `::`, and public addresses are refused. Local model HTTP stays loopback. |
 | Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not (Late never sends it). Host + Origin are the boundary (loopback and the bound private host). Pairing a token on `/mcp` would break Late unless Late starts sending one. On a private-IP bind, treat `/mcp` as trusted LAN — firewall to the laptop. Do not tunnel `/mcp` to the public internet. Late Approve is Late’s sidecar when Late is the client. |
 | GUI token | Open the printed `?token=` URL. The token is stored in sessionStorage and stripped from the address bar. EventSource `/api/events` still uses a query token because the browser cannot set `Authorization` on EventSource. Logo URLs use the same query form. |
 | Origin | `Host` must be loopback or the bound private IP. GUI `/api` Origin must match this port. Streamable HTTP `/mcp` allows loopback Origin, the bound private host, or none (Late sidecar). Random websites (`evil.com`) are rejected. |
@@ -295,16 +295,22 @@ You start Orchestrator on this computer. Late only talks HTTP; it will not start
 On the Orchestrator PC, pick one:
 
 ```bash
+# Auto: this computer's primary RFC1918 IPv4 (here 192.168.2.139)
+AGENT_ORCHESTRATOR_MCP_HOST=auto AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http
+
+# Explicit IP
 AGENT_ORCHESTRATOR_MCP_HOST=192.168.2.139 AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http
 ```
+
+Bare `npm run mcp:http` stays `127.0.0.1` unless YAML `mcp.listen_host` is `auto` or an IP.
 
 Or bind the GUI (same `/mcp` on the GUI port, default 8787):
 
 ```bash
-AGENT_ORCHESTRATOR_GUI_HOST=192.168.2.139 npm run gui
+AGENT_ORCHESTRATOR_GUI_HOST=auto npm run gui
 ```
 
-Or type `192.168.2.139` in GUI **Settings → Backends → Listen host**, save, and restart. That writes `mcp.listen_host` in `agents.config.yaml`. Env vars override the YAML field.
+Or type `auto` / leave empty / type `192.168.2.139` in GUI **Settings → Backends → Listen host**, save, and restart. That writes `mcp.listen_host` in `agents.config.yaml`. Env vars override the YAML field.
 
 Late on the other computer: paste the printed URL, for example **`http://192.168.2.139:8790/mcp`** (dedicated MCP) or **`http://192.168.2.139:8787/mcp`** (GUI). The HTML page is not MCP.
 

@@ -13,7 +13,7 @@ import { isGeminiOpenAiConfig, parseGeminiModelId } from "./providers/gemini.js"
 import { parseModelId, parseNickname } from "./identity.js";
 import { normalizeLoopbackOpenAiUrl } from "./local-servers/loopback.js";
 import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./local-servers/loopback.js";
-import { bindMcpListenHost, MCP_LOOPBACK_HOST } from "./mcp/bind.js";
+import { bindMcpListenHost, isAutoListenHost, MCP_AUTO_LISTEN_HOST } from "./mcp/bind.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -197,6 +197,7 @@ function parseMcpListenHost(raw: unknown): string | undefined {
   if (!isRecord(raw)) return undefined;
   const value = raw.listen_host ?? raw.listenHost;
   if (typeof value !== "string" || !value.trim()) return undefined;
+  if (isAutoListenHost(value)) return MCP_AUTO_LISTEN_HOST;
   return bindMcpListenHost(value);
 }
 
@@ -310,9 +311,11 @@ export function patchBackendModelYaml(yamlText: string, backendId: string, model
   return yamlText.slice(0, abs) + nextBlock + yamlText.slice(abs + block.length);
 }
 
-/** Set `mcp.listen_host` without rewriting backends. Loopback writes 127.0.0.1. */
+/** Set `mcp.listen_host` without rewriting backends. Empty or `auto` writes `auto` (LAN at bind). */
 export function patchMcpListenHostYaml(yamlText: string, listenHost: string): string {
-  const host = bindMcpListenHost(listenHost || MCP_LOOPBACK_HOST);
+  const trimmed = listenHost.trim();
+  const host =
+    !trimmed || isAutoListenHost(trimmed) ? MCP_AUTO_LISTEN_HOST : bindMcpListenHost(trimmed);
   const value = JSON.stringify(host);
   const mcpHeader = /^mcp:\s*\n/m.exec(yamlText);
   if (mcpHeader && mcpHeader.index !== undefined) {

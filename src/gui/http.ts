@@ -32,10 +32,13 @@ import type { McpAuth } from "../mcp/auth/index.js";
 import {
   bindGuiListenHost,
   httpListenUrl,
+  isAutoListenHost,
   listenHostHeaderOk,
   listenMcpUrl,
   listenOriginOk,
+  MCP_AUTO_LISTEN_HOST,
   MCP_LOOPBACK_HOST,
+  primaryPrivateIpv4,
 } from "../mcp/bind.js";
 import { isMcpPath } from "../mcp/paths.js";
 import { applyConfirmedUpdates, checkInstalledReleases, parseUpdateChoice } from "../update-apply.js";
@@ -404,7 +407,8 @@ export function startGuiServer(options: {
         bind: `${host}:${port}`,
         listenHost: host,
         mcpUrl: listen.mcpUrl,
-        configListenHost: configListenHost ?? host,
+        configListenHost: configListenHost ?? "",
+        suggestedLanHost: primaryPrivateIpv4() ?? "",
         envListenHostSet: envGui,
       });
       return;
@@ -424,22 +428,25 @@ export function startGuiServer(options: {
           : isRecord(body) && typeof body.listen_host === "string"
             ? body.listen_host
             : "";
-      let saved: string;
+      const trimmed = raw.trim();
+      const persist = !trimmed || isAutoListenHost(trimmed) ? MCP_AUTO_LISTEN_HOST : trimmed;
+      let resolved: string;
       try {
-        saved = bindGuiListenHost(raw.trim() || MCP_LOOPBACK_HOST);
+        resolved = bindGuiListenHost(persist);
       } catch (error) {
         send(res, 400, { error: error instanceof Error ? error.message : "Invalid listen host" });
         return;
       }
-      const yaml = patchMcpListenHostYaml(readConfigYaml(orchestrator.configPath), saved);
+      const yaml = patchMcpListenHostYaml(readConfigYaml(orchestrator.configPath), persist);
       const parsed = writeConfigYaml(yaml, orchestrator.configPath);
       orchestrator.reloadConfig(parsed);
       send(res, 200, {
         ok: true,
-        savedListenHost: saved,
-        restartRequired: saved !== host,
+        savedListenHost: persist,
+        resolvedListenHost: resolved,
+        restartRequired: resolved !== host,
         activeBind: `${host}:${port}`,
-        mcpUrl: listenMcpUrl(port, saved),
+        mcpUrl: listenMcpUrl(port, resolved),
       });
       return;
     }

@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
+import { networkInterfaces, type NetworkInterfaceInfo } from "node:os";
 
 export const MCP_LOOPBACK_HOST = "127.0.0.1" as const;
+export const MCP_AUTO_LISTEN_HOST = "auto" as const;
 
 const LOOPBACK_NAMES = new Set([MCP_LOOPBACK_HOST, "localhost", "::1", "localhost.localdomain"]);
 
@@ -79,13 +82,77 @@ function isLinkLocalV6(host: string): boolean {
 
 function refuseMessage(requested: string): string {
   return (
-    `Refusing to bind to "${requested}". Use loopback (${MCP_LOOPBACK_HOST}) or one private address on your computer ` +
-    `(RFC1918 10/8, 172.16/12, 192.168/16, or IPv6 ULA fd00::/8). Do not use 0.0.0.0, ::, or a public address.`
+    `Refusing to bind to "${requested}". Use loopback (${MCP_LOOPBACK_HOST}), ${MCP_AUTO_LISTEN_HOST} (this computer's primary RFC1918 IPv4), ` +
+    `or one private address (RFC1918 10/8, 172.16/12, 192.168/16, or IPv6 ULA fd00::/8). Do not use 0.0.0.0, ::, or a public address.`
   );
 }
 
+const SKIP_IFACE = /^(lo|docker|br-|virbr|veth|cni|flannel|kube|tailscale|zt|wg)/i;
+
+function isIpv4Family(family: string | number): boolean {
+  return family === "IPv4" || family === 4;
+}
+
+function defaultRouteInterface(): string | undefined {
+  try {
+    const text = readFileSync("/proc/net/route", "utf8");
+    for (const line of text.split("\n").slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols[1] === "00000000" && cols[0]) return cols[0];
+    }
+  } catch {
+    /* Windows / macOS have no /proc/net/route */
+  }
+  return undefined;
+}
+
+export type PrivateIfaceMap = NodeJS.Dict<NetworkInterfaceInfo[]>;
+
 /**
- * One listen address: loopback, or a single RFC1918 / ULA IP. Never 0.0.0.0 / :: / public.
+ * This computer's primary RFC1918 IPv4 (default-route iface first; skip docker/virbr).
+ * Never 0.0.0.0 or a public address. Undefined if none.
+ */
+export function primaryPrivateIpv4(
+  ifaces: PrivateIfaceMap = networkInterfaces(),
+  defaultIface: string | undefined = defaultRouteInterface(),
+): string | undefined {
+  const candidates: { address: string; score: number }[] = [];
+  for (const [name, addrs] of Object.entries(ifaces)) {
+    if (!addrs) continue;
+    for (const a of addrs) {
+      if (a.internal || !isIpv4Family(a.family)) continue;
+      const address = stripHost(a.address);
+      if (!isRfc1918(address)) continue;
+      let score = 10;
+      if (defaultIface && name === defaultIface) score += 100;
+      if (SKIP_IFACE.test(name)) score -= 50;
+      const oct = address.split(".").map(Number);
+      if ((oct[0] ?? 0) === 172 && (oct[1] ?? 0) >= 17 && (oct[1] ?? 0) <= 19) score -= 20;
+      if (address.startsWith("192.168.122.")) score -= 20;
+      candidates.push({ address, score });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.address;
+}
+
+export function isAutoListenHost(raw: string | undefined): boolean {
+  return stripHost(raw ?? "") === MCP_AUTO_LISTEN_HOST;
+}
+
+function resolveAutoListenHost(): string {
+  const lan = primaryPrivateIpv4();
+  if (!lan) {
+    throw new Error(
+      `listen_host=${MCP_AUTO_LISTEN_HOST} needs one RFC1918 IPv4 on this computer. Set an explicit private address or ${MCP_LOOPBACK_HOST}.`,
+    );
+  }
+  return lan;
+}
+
+/**
+ * One listen address: loopback, `auto` (primary RFC1918 IPv4), or a single private IP.
+ * Never 0.0.0.0 / :: / public. Empty stays loopback so `npm run mcp:http` is local unless auto is set.
  * Loopback aliases bind as 127.0.0.1 so the printed Late URL stays stable.
  */
 export function bindPrivateListenHost(requestedHost: string | undefined): string {
@@ -93,6 +160,7 @@ export function bindPrivateListenHost(requestedHost: string | undefined): string
   if (!raw) return MCP_LOOPBACK_HOST;
   const host = stripHost(raw);
   if (!host) return MCP_LOOPBACK_HOST;
+  if (isAutoListenHost(host)) return resolveAutoListenHost();
   if (isUnspecified(host) || host === "0:0:0:0:0:0:0:0") {
     throw new Error(refuseMessage(raw));
   }

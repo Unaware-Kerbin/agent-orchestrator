@@ -7,6 +7,15 @@ Dates are America/New_York.
 
 This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Ollama and llama-server. vLLM Start still needs Docker.
 
+## [0.1.4] - 2026-08-31
+
+New GitHub tag [v0.1.4](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.4) so this build is trackable. Tag [v0.1.3](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.3) stays frozen — future installers are new tags; do not rewrite old tags.
+
+**listen_host auto (primary RFC1918 IPv4).**
+
+- `listen_host: auto` or `AGENT_ORCHESTRATOR_MCP_HOST=auto` binds this computer's primary RFC1918 IPv4 (here `192.168.2.139`) and prints `http://192.168.2.139:8790/mcp`. Settings empty save is `auto`. Bare `npm run mcp:http` stays loopback unless auto or an IP is set.
+- GUI Settings → Listen host: empty or `auto` writes `listen_host: "auto"`. Placeholder shows this computer's LAN address.
+
 ## [0.1.3] - 2026-08-31
 
 New GitHub tag [v0.1.3](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.3) so this build is trackable. Tag [v0.1.2](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.2) stays frozen — future installers are new tags; do not rewrite old tags.
@@ -51,6 +60,7 @@ Portable GUI + `/mcp` archives with apply-patch and a Debate README clip.
 
 First portable GUI + Streamable HTTP `/mcp` archives (Linux, macOS, Windows). Loopback only. Extract, then `./bin/agent-orchestrator-gui` (Windows: `bin\agent-orchestrator-gui.cmd`). Copy the printed `/mcp` URL for Late.
 
+[0.1.4]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.0...v0.1.1

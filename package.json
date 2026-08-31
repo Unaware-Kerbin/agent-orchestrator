@@ -1,6 +1,6 @@
 {
   "name": "agent-orchestrator",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "MCP orchestrator that routes work to Cursor agents and external LLM agents",
   "type": "module",
   "bin": {

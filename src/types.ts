@@ -99,7 +99,7 @@ export interface WorkflowConfig {
 }
 
 export interface McpListenConfig {
-  /** Loopback or one RFC1918 / ULA IP. Never 0.0.0.0. Env HOST vars override. */
+  /** Loopback, `auto` (primary RFC1918 IPv4 at bind), or one private IP. Never 0.0.0.0. Env HOST vars override. */
   listenHost?: string;
 }
 
