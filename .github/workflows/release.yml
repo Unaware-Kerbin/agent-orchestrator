@@ -3,6 +3,7 @@ name: Build installers
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags:
       - "v*"
 
@@ -16,8 +17,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            args: "--target linux-x64"
+          - os: macos-latest
+            args: "--target mac-arm64 --target mac-x64"
+          - os: windows-latest
+            args: "--target win-x64"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +39,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Package
         shell: bash
-        run: bash scripts/pack.sh
+        env:
+          PACK_OVERWRITE: "1"
+        run: bash scripts/pack.sh ${{ matrix.args }}
       - uses: actions/upload-artifact@v4
         with:
           name: agent-orchestrator-${{ matrix.os }}

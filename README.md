@@ -64,7 +64,7 @@ sequenceDiagram
 
 ## Install
 
-Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.2](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.2)). Each archive includes Node 22. Extract it, then:
+Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/agent-orchestrator/releases)** (tag [v0.1.2](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.2)). GitHub Actions **Build installers** also packs on `main` (workflow artifacts). Filenames are in [release/README.md](release/README.md). Each archive includes Node 22. Extract it, then:
 
 | Your computer | File | What you do |
 |---|---|---|

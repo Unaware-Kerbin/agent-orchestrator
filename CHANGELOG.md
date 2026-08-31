@@ -9,7 +9,12 @@ This is a window on **your computer**. Bind stays loopback (`127.0.0.1`). Packed
 
 ## Unreleased
 
-Packed installs include Ollama and `llama-server` (Vulkan on Linux/Windows, Metal on Apple silicon; Intel Mac is CPU/BLAS) under `runtime/bin`. Apple silicon packs Ollama `mlx_metal_v3`/`v4` under `lib/ollama`. `scripts/pack.sh` can stage `win-x64` / `mac-arm64` / `mac-x64` from Linux without replacing the Linux tarball. The Linux archive is distro-agnostic (Debian, Fedora, Arch, and others use the same `.tar.gz`; there is no `.deb`/`.rpm`). Start them from Local models (loopback only). Model weights stay out of the archive. vLLM Start still needs Docker; if Docker is missing the Start-with-Docker control stays hidden. README lists `darwin-*.zip` (not `mac-….tar.gz`), Local models Start/Stop, token-gated `/api`, and that there is no `start_ollama` MCP tool.
+## 2026-08-31
+
+**Packed Ollama + llama-server; GitHub packs linux/win/darwin.**
+
+- Packed installs include Ollama and `llama-server` (Vulkan on Linux/Windows, Metal on Apple silicon; Intel Mac is CPU/BLAS) under `runtime/bin`. Apple silicon packs Ollama `mlx_metal_v3`/`v4` under `lib/ollama`. `scripts/pack.sh` can stage `win-x64` / `mac-arm64` / `mac-x64` from Linux without replacing the Linux tarball. The Linux archive is distro-agnostic (Debian, Fedora, Arch, and others use the same `.tar.gz`; there is no `.deb`/`.rpm`). Start them from Local models (loopback only). Model weights stay out of the archive. vLLM Start still needs Docker; if Docker is missing the Start-with-Docker control stays hidden. README lists `darwin-*.zip` (not `mac-….tar.gz`), Local models Start/Stop, token-gated `/api`, and that there is no `start_ollama` MCP tool.
+- **Build installers** now runs on `main` (workflow artifacts) as well as `v*` tags (GitHub Release). Ubuntu packs `linux-x64`, macOS packs both Darwin zips, Windows packs `win-x64`. See [release/README.md](release/README.md) for the filenames. Binaries stay gitignored.
 
 ## [0.1.2] - 2026-08-30
 

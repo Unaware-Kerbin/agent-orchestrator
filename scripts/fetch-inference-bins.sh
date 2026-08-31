@@ -9,14 +9,23 @@
 # DEST/lib/ollama holds Ollama GPU libs (Linux Vulkan, Darwin mlx_metal*). CUDA/ROCm are stripped; mlx is not.
 set -euo pipefail
 
-# Resolve tools from the POSIX default PATH so a poisoned PATH cannot swap binaries.
-# Fail closed if a required tool is missing or not an absolute executable.
+# Prefer POSIX default PATH (`command -p`). Fall back to the process PATH so
+# Git Bash on windows-latest still finds curl/tar when they are not in /usr/bin.
+is_usable_bin() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  [[ -x "$p" || -f "$p" ]]
+}
+
 secure_bin() {
   local name="$1"
   local resolved
   resolved="$(command -p -v "$name" 2>/dev/null || true)"
-  if [[ -z "$resolved" || "$resolved" != /* || ! -x "$resolved" ]]; then
-    echo "late: missing $name (need it on the default PATH, e.g. /usr/bin/$name)" >&2
+  if ! is_usable_bin "$resolved"; then
+    resolved="$(command -v "$name" 2>/dev/null || true)"
+  fi
+  if ! is_usable_bin "$resolved"; then
+    echo "late: missing $name (need it on PATH, e.g. /usr/bin/$name)" >&2
     exit 1
   fi
   printf '%s' "$resolved"
@@ -26,7 +35,10 @@ optional_bin() {
   local name="$1"
   local resolved
   resolved="$(command -p -v "$name" 2>/dev/null || true)"
-  if [[ -n "$resolved" && "$resolved" == /* && -x "$resolved" ]]; then
+  if ! is_usable_bin "$resolved"; then
+    resolved="$(command -v "$name" 2>/dev/null || true)"
+  fi
+  if is_usable_bin "$resolved"; then
     printf '%s' "$resolved"
   fi
   return 0
@@ -50,17 +62,34 @@ ZSTD="$(optional_bin zstd)"
 UNZIP="$(optional_bin unzip)"
 PYTHON3="$(optional_bin python3)"
 
-if command -p -v sha256sum >/dev/null 2>&1; then
+if command -p -v sha256sum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; then
   SHA256SUM="$(secure_bin sha256sum)"
   sha256_file() {
     local f="$1"
     "$SHA256SUM" "$f" | "$AWK" '{print $1}'
   }
-else
+elif command -p -v shasum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
   SHA256SUM="$(secure_bin shasum)"
   sha256_file() {
     local f="$1"
     "$SHA256SUM" -a 256 "$f" | "$AWK" '{print $1}'
+  }
+else
+  PYTHON3_SHA="$(optional_bin python3)"
+  if [[ -z "$PYTHON3_SHA" ]]; then
+    echo "late: need sha256sum, shasum, or python3 to verify downloads" >&2
+    exit 1
+  fi
+  sha256_file() {
+    local f="$1"
+    "$PYTHON3_SHA" - "$f" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
   }
 fi
 
