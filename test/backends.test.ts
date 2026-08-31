@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadConfig, parseOrchestratorConfig, patchBackendModelYaml, patchBackendNicknameYaml, validateConfigYaml } from "../src/config.js";
+import { loadConfig, parseOrchestratorConfig, patchBackendModelYaml, patchBackendNicknameYaml, patchMcpListenHostYaml, validateConfigYaml } from "../src/config.js";
 import { loadEnvFile } from "../src/env.js";
 import { GEMINI_ONE_ID_ERROR, parseGeminiModelId } from "../src/providers/gemini.js";
 import { OpenAIProvider } from "../src/providers/openai.js";
@@ -246,6 +246,33 @@ specialists:
   const cleared = patchBackendNicknameYaml(named, "vllm-local", undefined);
   assert.equal(/nickname:/.test(cleared.split("vllm-local:")[1]?.split("specialists:")[0] ?? "nickname:"), false);
   assert.match(cleared, /Qwen\/Qwen2\.5-0\.5B-Instruct/);
+});
+
+test("mcp.listen_host accepts one RFC1918 IP and refuses 0.0.0.0", () => {
+  const base = {
+    backends: { gemini: { type: "openai", model: "gemini-3.6-flash", apiKeyEnv: "GEMINI_API_KEY" } },
+    specialists: { planner: { description: "x", backend: "gemini" } },
+  };
+  const ok = parseOrchestratorConfig({ ...base, mcp: { listen_host: "192.168.2.139" } });
+  assert.equal(ok.mcp?.listenHost, "192.168.2.139");
+  assert.equal(parseOrchestratorConfig(base).mcp, undefined);
+  assert.throws(() => parseOrchestratorConfig({ ...base, mcp: { listen_host: "0.0.0.0" } }), /0\.0\.0\.0|private/);
+  assert.throws(() => parseOrchestratorConfig({ ...base, mcp: { listen_host: "8.8.8.8" } }), /private/);
+  const yaml = `backends:
+  gemini:
+    type: openai
+    model: gemini-3.6-flash
+    apiKeyEnv: GEMINI_API_KEY
+specialists:
+  planner:
+    description: x
+    backend: gemini
+`;
+  const patched = patchMcpListenHostYaml(yaml, "192.168.2.139");
+  assert.match(patched, /listen_host: "192\.168\.2\.139"/);
+  assert.match(patched, /type: openai/);
+  const parsed = validateConfigYaml(patched);
+  assert.equal(parsed.mcp?.listenHost, "192.168.2.139");
 });
 
 test("gemini is ready when GEMINI_API_KEY is set", () => {

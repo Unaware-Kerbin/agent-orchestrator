@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { extname, join, resolve } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
 import { canonicalizeDirectory, isPathInside } from "../allowlist.js";
-import { parseConfigYaml, packageRoot, patchBackendModelYaml, patchBackendNicknameYaml, readConfigYaml, validateConfigYaml, writeConfigYaml } from "../config.js";
+import { parseConfigYaml, packageRoot, patchBackendModelYaml, patchBackendNicknameYaml, patchMcpListenHostYaml, readConfigYaml, validateConfigYaml, writeConfigYaml } from "../config.js";
 import { isGeminiOpenAiConfig, normalizeGeminiConfigModel } from "../providers/gemini.js";
 import { extractBearerToken, tokensEqual } from "../gui-auth.js";
 import type { ChatService } from "../chat/service.js";
@@ -29,11 +29,17 @@ import { handleTempAnalyzeApi, TEMP_ANALYZE_PATH } from "../temp-analyze-http.js
 import type { McpHttpHandler } from "@modelcontextprotocol/server";
 import { tryHandleMcpRequest } from "../mcp/attach.js";
 import type { McpAuth } from "../mcp/auth/index.js";
-import { loopbackMcpUrl } from "../mcp/bind.js";
+import {
+  bindGuiListenHost,
+  httpListenUrl,
+  listenHostHeaderOk,
+  listenMcpUrl,
+  listenOriginOk,
+  MCP_LOOPBACK_HOST,
+} from "../mcp/bind.js";
 import { isMcpPath } from "../mcp/paths.js";
 import { applyConfirmedUpdates, checkInstalledReleases, parseUpdateChoice } from "../update-apply.js";
 
-const HOST = "127.0.0.1";
 const MAX_BODY = 1_000_000;
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -45,7 +51,7 @@ const MIME: Record<string, string> = {
 };
 
 export interface GuiListen {
-  host: typeof HOST;
+  host: string;
   port: number;
   url: string;
   mcpUrl: string;
@@ -140,41 +146,33 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-export function hostAllowed(hostHeader: string | undefined, port: number): boolean {
-  if (!hostHeader) return false;
-  const host = hostHeader.trim().toLowerCase();
-  return (
-    host === `${HOST}:${port}` ||
-    host === `localhost:${port}` ||
-    host === HOST ||
-    host === "localhost"
-  );
+export function hostAllowed(
+  hostHeader: string | undefined,
+  port: number,
+  listenHost: string = MCP_LOOPBACK_HOST,
+): boolean {
+  return listenHostHeaderOk(hostHeader, port, listenHost);
 }
 
 /** GUI /api Origin must match this server's port. Missing Origin is allowed. */
-export function originAllowed(origin: string | undefined, port: number): boolean {
+export function originAllowed(
+  origin: string | undefined,
+  port: number,
+  listenHost: string = MCP_LOOPBACK_HOST,
+): boolean {
   if (!origin) return true;
+  if (!listenOriginOk(origin, listenHost, { httpOnly: true })) return false;
   try {
     const url = new URL(origin);
-    if (url.protocol !== "http:") return false;
-    const hostOk = url.hostname === HOST || url.hostname === "localhost";
-    const portOk = url.port === String(port) || (url.port === "" && port === 80);
-    return hostOk && portOk;
+    return url.port === String(port) || (url.port === "" && port === 80);
   } catch {
     return false;
   }
 }
 
-/** Streamable HTTP /mcp: any loopback Origin (Late UI :5173 / sidecar :7430) or none. */
-export function mcpOriginAllowed(origin: string | undefined): boolean {
-  if (!origin) return true;
-  try {
-    const url = new URL(origin);
-    if (url.protocol !== "http:") return false;
-    return url.hostname === HOST || url.hostname === "localhost" || url.hostname === "::1";
-  } catch {
-    return false;
-  }
+/** Streamable HTTP /mcp: loopback Origin (Late UI / sidecar), the bound private host, or none. */
+export function mcpOriginAllowed(origin: string | undefined, listenHost: string = MCP_LOOPBACK_HOST): boolean {
+  return listenOriginOk(origin, listenHost, { httpOnly: true });
 }
 
 function publicDir(): string {
@@ -195,11 +193,18 @@ export function startGuiServer(options: {
   chat: ChatService;
   token: string;
   port: number;
+  host?: string;
   mcpHandler?: McpHttpHandler;
   mcpAuth?: McpAuth;
 }): { server: ReturnType<typeof createServer>; listen: GuiListen } {
   const { orchestrator, chat, token, port, mcpHandler, mcpAuth } = options;
-  const listen: GuiListen = { host: HOST, port, url: `http://${HOST}:${port}`, mcpUrl: loopbackMcpUrl(port) };
+  const host = bindGuiListenHost(options.host);
+  const listen: GuiListen = {
+    host,
+    port,
+    url: httpListenUrl(host, port),
+    mcpUrl: listenMcpUrl(port, host),
+  };
   const sseClients = new Set<ServerResponse>();
 
   const broadcastRun = (run: OrchestratedRun) => {
@@ -268,29 +273,29 @@ export function startGuiServer(options: {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
-    const host = req.headers.host;
-    if (!hostAllowed(host, port)) {
+    const hostHeader = req.headers.host;
+    if (!hostAllowed(hostHeader, port, host)) {
       send(res, 403, { error: "Invalid Host header" });
       return;
     }
 
-    const url = new URL(req.url ?? "/", `http://${HOST}:${port}`);
+    const url = new URL(req.url ?? "/", `${listen.url}/`);
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
     if (mcpHandler && mcpAuth && isMcpPath(url.pathname)) {
-      if (!mcpOriginAllowed(origin)) {
+      if (!mcpOriginAllowed(origin, host)) {
         send(res, 403, { error: "Origin not allowed" });
         return;
       }
       if (await tryHandleMcpRequest({ req, res, url, auth: mcpAuth, handler: mcpHandler })) {
         return;
       }
-    } else if (!originAllowed(origin, port)) {
+    } else if (!originAllowed(origin, port, host)) {
       send(res, 403, { error: "Origin not allowed" });
       return;
     }
 
     if (url.pathname === "/health" && method === "GET") {
-      send(res, 200, { ok: true, bind: `${HOST}:${port}`, pid: process.pid });
+      send(res, 200, { ok: true, bind: `${host}:${port}`, pid: process.pid });
       return;
     }
 
@@ -392,7 +397,50 @@ export function startGuiServer(options: {
     const path = url.pathname;
 
     if (path === "/api/session" && method === "GET") {
-      send(res, 200, { ok: true, bind: `${HOST}:${port}`, mcpUrl: listen.mcpUrl });
+      const configListenHost = orchestrator.config.mcp?.listenHost;
+      const envGui = Boolean(process.env.AGENT_ORCHESTRATOR_GUI_HOST?.trim());
+      send(res, 200, {
+        ok: true,
+        bind: `${host}:${port}`,
+        listenHost: host,
+        mcpUrl: listen.mcpUrl,
+        configListenHost: configListenHost ?? host,
+        envListenHostSet: envGui,
+      });
+      return;
+    }
+
+    if (path === "/api/mcp/listen-host" && method === "POST") {
+      if (process.env.AGENT_ORCHESTRATOR_GUI_HOST?.trim()) {
+        send(res, 400, {
+          error:
+            "AGENT_ORCHESTRATOR_GUI_HOST is set. Unset it to save listen host in config, or keep using the env value.",
+        });
+        return;
+      }
+      const raw =
+        isRecord(body) && typeof body.listenHost === "string"
+          ? body.listenHost
+          : isRecord(body) && typeof body.listen_host === "string"
+            ? body.listen_host
+            : "";
+      let saved: string;
+      try {
+        saved = bindGuiListenHost(raw.trim() || MCP_LOOPBACK_HOST);
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : "Invalid listen host" });
+        return;
+      }
+      const yaml = patchMcpListenHostYaml(readConfigYaml(orchestrator.configPath), saved);
+      const parsed = writeConfigYaml(yaml, orchestrator.configPath);
+      orchestrator.reloadConfig(parsed);
+      send(res, 200, {
+        ok: true,
+        savedListenHost: saved,
+        restartRequired: saved !== host,
+        activeBind: `${host}:${port}`,
+        mcpUrl: listenMcpUrl(port, saved),
+      });
       return;
     }
 
@@ -1293,13 +1341,8 @@ export function startGuiServer(options: {
   return { server, listen };
 }
 
-export function bindLoopbackOnly(requestedHost: string | undefined): typeof HOST {
-  if (requestedHost && requestedHost !== HOST && requestedHost !== "localhost") {
-    throw new Error(
-      `Refusing to bind GUI to "${requestedHost}". Only ${HOST} is allowed so the control plane stays on this machine.`,
-    );
-  }
-  return HOST;
+export function bindLoopbackOnly(requestedHost: string | undefined): string {
+  return bindGuiListenHost(requestedHost);
 }
 
 async function localServersSnapshot(orchestrator: Orchestrator) {

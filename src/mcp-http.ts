@@ -9,7 +9,7 @@ import {
   writeMcpHealth,
 } from "./mcp-http-handler.js";
 import { writeAdvertisedMcpUrl } from "./mcp/advertise.js";
-import { bindMcpLoopbackOnly, lateMcpCopyLines, loopbackMcpUrl } from "./mcp/bind.js";
+import { isLoopbackListenHost, lateMcpCopyLines, listenMcpUrl, resolveMcpListenHost } from "./mcp/bind.js";
 import { isMcpLivenessGet } from "./mcp/paths.js";
 import { installMcpProcessGuards } from "./mcp/process-guard.js";
 import {
@@ -24,13 +24,6 @@ import {
 
 installMcpProcessGuards();
 
-let HOST: "127.0.0.1";
-try {
-  HOST = bindMcpLoopbackOnly(process.env.AGENT_ORCHESTRATOR_MCP_HOST);
-} catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
-}
 const port = Number(process.env.AGENT_ORCHESTRATOR_MCP_PORT ?? "8790");
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   console.error("AGENT_ORCHESTRATOR_MCP_PORT must be an integer 1–65535");
@@ -38,6 +31,13 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 }
 
 const { orchestrator, chat } = createOrchestrator();
+let HOST: string;
+try {
+  HOST = resolveMcpListenHost(orchestrator.config.mcp?.listenHost);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+}
 const handler = createOrchestratorMcpHandler(orchestrator, chat);
 const secret = loadOrCreateGuiToken();
 
@@ -80,12 +80,12 @@ async function tryHandleRest(req: IncomingMessage, res: ServerResponse, url: URL
 
 async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const host = req.headers.host ?? `${HOST}:${port}`;
-  if (!loopbackHostOk(req.headers.host, port)) {
+  if (!loopbackHostOk(req.headers.host, port, HOST)) {
     sendJson(res, 403, { error: "Invalid Host header" });
     return;
   }
   const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
-  if (!loopbackOriginOk(origin)) {
+  if (!loopbackOriginOk(origin, HOST)) {
     sendJson(res, 403, { error: "Origin not allowed" });
     return;
   }
@@ -135,14 +135,21 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 server.listen(port, HOST, () => {
-  const mcpUrl = loopbackMcpUrl(port);
+  const mcpUrl = listenMcpUrl(port, HOST);
+  const loopback = isLoopbackListenHost(HOST);
   writeAdvertisedMcpUrl(mcpUrl, { kind: "http" });
   console.error(`agent-orchestrator MCP Streamable HTTP`);
   console.error(`  bind:  ${HOST}:${port}`);
   console.error(`  url:   ${mcpUrl}`);
-  console.error(`  health: GET ${mcpUrl}/health  → {"ok":true} (loopback, no tools)`);
+  console.error(`  health: GET ${mcpUrl}/health  → {"ok":true} (no tools)`);
   for (const line of lateMcpCopyLines(mcpUrl)) console.error(`  ${line}`);
   console.error(`  notes: The GUI also serves /mcp on AGENT_ORCHESTRATOR_GUI_PORT (same-process as the web UI).`);
   console.error(`         Temp pcap allowlist: POST ${TEMP_ANALYZE_PATH} with Bearer (GUI token).`);
-  console.error(`         Bound to 127.0.0.1 only. You start this process. Late will not start it.`);
+  if (loopback) {
+    console.error(`         Bound to 127.0.0.1. You start this process. Late will not start it.`);
+  } else {
+    console.error(
+      `         One private IP on your computer. Trusted LAN only — firewall to the laptop. You start this process. Late will not start it.`,
+    );
+  }
 });

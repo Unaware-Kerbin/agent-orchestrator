@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { createOrchestrator } from "./bootstrap.js";
 import { loadOrCreateGuiToken } from "./gui-auth.js";
-import { bindLoopbackOnly, startGuiServer } from "./gui/http.js";
+import { startGuiServer } from "./gui/http.js";
 import { clearGuiPid, guiAddrInUseMessage, guiPidPath, stopOurGui, writeGuiPid } from "./gui-process.js";
 import { createOrchestratorMcpHandler } from "./mcp-http-handler.js";
 import { loadMcpAuthConfig, McpAuth } from "./mcp/auth/index.js";
-import { lateMcpCopyLines } from "./mcp/bind.js";
+import { isLoopbackListenHost, lateMcpCopyLines, resolveGuiListenHost } from "./mcp/bind.js";
 import { writeAdvertisedMcpUrl } from "./mcp/advertise.js";
 import { installProcessGuards } from "./mcp/process-guard.js";
 import { openUrl as openInBrowser } from "./platform.js";
@@ -24,16 +24,16 @@ if (process.argv.includes("--stop") || process.argv.includes("--restart")) {
   }
 }
 
+installProcessGuards("gui");
+
+const { orchestrator, chat } = createOrchestrator();
+let host: string;
 try {
-  bindLoopbackOnly(process.env.AGENT_ORCHESTRATOR_GUI_HOST);
+  host = resolveGuiListenHost(orchestrator.config.mcp?.listenHost);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 }
-
-installProcessGuards("gui");
-
-const { orchestrator, chat } = createOrchestrator();
 const secret = loadOrCreateGuiToken();
 const mcpHandler = createOrchestratorMcpHandler(orchestrator, chat);
 const mcpAuth = new McpAuth(loadMcpAuthConfig(secret.token));
@@ -42,6 +42,7 @@ const { server, listen } = startGuiServer({
   chat,
   token: secret.token,
   port,
+  host,
   mcpHandler,
   mcpAuth,
 });
@@ -69,15 +70,22 @@ server.listen(listen.port, listen.host, () => {
   writeGuiPid(process.pid);
   const openUrl = `${listen.url}/?token=${encodeURIComponent(secret.token)}`;
   const mcpUrl = listen.mcpUrl;
+  const loopback = isLoopbackListenHost(listen.host);
   writeAdvertisedMcpUrl(mcpUrl, { kind: "gui" });
   console.error(`Agent Orchestrator GUI`);
-  console.error(`  bind:   ${listen.host}:${listen.port} (loopback only)`);
+  console.error(
+    `  bind:   ${listen.host}:${listen.port}${loopback ? " (loopback)" : " (one private IP on your computer)"}`,
+  );
   console.error(`  pid:    ${process.pid} (${guiPidPath()})`);
   console.error(`  open:   ${openUrl}`);
   for (const line of lateMcpCopyLines(mcpUrl)) console.error(`  ${line}`);
   console.error(`  token:  ${secret.path}${secret.created ? " (created)" : ""}`);
   console.error(`  notes:  MCP stdio is unchanged. This UI is a local extra surface.`);
-  console.error(`          Do not tunnel, proxy, or bind this process off localhost.`);
+  if (loopback) {
+    console.error(`          Do not tunnel or proxy this process to the public internet.`);
+  } else {
+    console.error(`          Trusted LAN only. Firewall to the laptop. Do not bind 0.0.0.0 or a public address.`);
+  }
   console.error(`          Dedicated MCP process: npm run mcp:http (AGENT_ORCHESTRATOR_MCP_PORT).`);
   console.error(`          Stop: npm run gui:stop   Restart: npm run gui:restart`);
   console.error(`          Docker stop of an orch-vllm-* container does not stop this GUI.`);

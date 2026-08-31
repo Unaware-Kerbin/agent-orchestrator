@@ -36,7 +36,8 @@ async function readRawBody(req: IncomingMessage, max = 1_000_000): Promise<Buffe
 /**
  * Handle /mcp and /MCP (and /mcp/login). Returns true when the request was consumed.
  * Host/Origin must already have been checked by the GUI server.
- * Streamable HTTP on loopback does not require the GUI token — Late never sends it.
+ * Streamable HTTP does not require the GUI token — Late never sends it.
+ * On a private-IP bind, /mcp is a trusted-LAN model (firewall to the laptop); still not 0.0.0.0.
  * Optional POST /mcp/login stays available for LDAP/RADIUS session tokens.
  */
 export async function tryHandleMcpRequest(opts: {

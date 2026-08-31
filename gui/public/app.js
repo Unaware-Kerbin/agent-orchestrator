@@ -74,11 +74,14 @@ async function loadSession() {
   sessionInfo = {
     mcpUrl: typeof data.mcpUrl === "string" ? data.mcpUrl : "",
     bind: typeof data.bind === "string" ? data.bind : "",
+    listenHost: typeof data.listenHost === "string" ? data.listenHost : "",
+    configListenHost: typeof data.configListenHost === "string" ? data.configListenHost : "",
+    envListenHostSet: data.envListenHostSet === true,
   };
   return data;
 }
 
-/** Exact Late Settings URL from this GUI process (127.0.0.1 + bound port). Never a hardcoded GUI default. */
+/** Exact Late Settings URL from this GUI process (bound host + port). Never a hardcoded GUI default. */
 function mcpUrlForLate() {
   if (sessionInfo.mcpUrl) return sessionInfo.mcpUrl;
   const host = location.hostname === "localhost" || location.hostname === "[::1]" ? "127.0.0.1" : location.hostname;
@@ -148,7 +151,7 @@ function tokenFromLocation() {
 
 let token = tokenFromLocation();
 let catalog = { backends: [], specialists: [], workflows: [], writePolicy: { allowedDirectories: [], defaultCwd: "" }, localRuntime: {} };
-let sessionInfo = { mcpUrl: "", bind: "" };
+let sessionInfo = { mcpUrl: "", bind: "", listenHost: "", configListenHost: "", envListenHostSet: false };
 let runs = [];
 let localModelsQuery = "";
 let localModels = null;
@@ -852,6 +855,14 @@ async function renderBackends() {
         <button type="button" class="btn" data-copy-mcp>Copy MCP URL</button>
         <span id="mcp-copy-status" class="muted"></span>
       </div>
+      <form id="mcp-listen-host-form">
+        <label class="field">Listen host (this computer)
+          <input id="mcp-listen-host" name="listenHost" class="mono" type="text" autocomplete="off" ${sessionInfo.envListenHostSet ? "disabled" : ""} value="${escapeHtml(sessionInfo.configListenHost || sessionInfo.listenHost || "127.0.0.1")}" placeholder="127.0.0.1" />
+        </label>
+        <p class="muted">Loopback, or one private IP you type (example <span class="mono">192.168.2.139</span>). Env <span class="mono">AGENT_ORCHESTRATOR_GUI_HOST</span> / <span class="mono">AGENT_ORCHESTRATOR_MCP_HOST</span> override. Restart after save. Trusted LAN only — firewall to the laptop. Late still Approve.</p>
+        <div class="actions"><button type="submit"${sessionInfo.envListenHostSet ? " disabled" : ""}>Save listen host</button></div>
+        <div id="mcp-listen-status"></div>
+      </form>
       <p class="muted">Optional ClearPass / ISE (RADIUS) and Active Directory (LDAPS) are off until you set <span class="mono">AGENT_ORCHESTRATOR_MCP_AUTH</span> in <span class="mono">.env</span>. Secrets below never go in YAML.</p>
       <form class="secret-form" data-name="RADIUS_SECRET">
         <label class="field">RADIUS_SECRET (ClearPass / ISE shared secret)
@@ -1879,6 +1890,22 @@ $("main").addEventListener("submit", async (event) => {
       catalog = result.catalog ?? catalog;
       await renderBackends();
       $("llamacpp-status").innerHTML = flash(`Saved backend ${result.id}`, "ok");
+    } else if (form.id === "mcp-listen-host-form") {
+      const result = await api("/api/mcp/listen-host", {
+        method: "POST",
+        body: JSON.stringify({ listenHost: String(data.get("listenHost") ?? "").trim() }),
+      });
+      if (typeof result.mcpUrl === "string") sessionInfo.mcpUrl = result.mcpUrl;
+      if (typeof result.savedListenHost === "string") {
+        sessionInfo.configListenHost = result.savedListenHost;
+      }
+      const urlInput = $("mcp-url");
+      if (urlInput) urlInput.value = mcpUrlForLate();
+      const saved = result.savedListenHost || "";
+      const msg = result.restartRequired
+        ? `Saved ${saved}. Restart the GUI on your computer so Late can use ${result.mcpUrl}.`
+        : `Listen host ${saved}.`;
+      $("mcp-listen-status").innerHTML = flash(msg, "ok");
     } else if (form.classList.contains("backend-model-form")) {
       const backendId = form.getAttribute("data-backend");
       const model = String(data.get("model") ?? "").trim();
@@ -1940,6 +1967,8 @@ $("main").addEventListener("submit", async (event) => {
                   ? "ollama-status"
                   : form.id === "llamacpp-form"
                     ? "llamacpp-status"
+                    : form.id === "mcp-listen-host-form"
+                      ? "mcp-listen-status"
                     : pageId() === "local-models"
                       ? "local-models-status"
                       : "backends-status";

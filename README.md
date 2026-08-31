@@ -2,7 +2,7 @@
 
 Agent Orchestrator is a window on **your computer**. You chat with models that already run here or on a box you started. Other apps (like Late) can use it as MCP.
 
-Writes wait for **Approve**. Keys stay on this computer. Bind is loopback (`127.0.0.1`).
+Writes wait for **Approve**. Keys stay on this computer. Bind is loopback (`127.0.0.1`) unless you type one private IP on this computer.
 
 ## How it works
 
@@ -15,7 +15,7 @@ That is the whole idea.
 
 ![How Agent Orchestrator works on your computer](docs/assets/how-it-works.webp)
 
-Chat on this computer, then **Copy MCP URL** for Late. The address is `127.0.0.1` on the port this process printed.
+Chat on this computer, then **Copy MCP URL** for Late. The address is the host this process bound (loopback, or the private IP you typed) on the port it printed.
 
 ```
 Chat (GUI or MCP)
@@ -73,7 +73,7 @@ Download a portable build from **[Releases](https://github.com/Unaware-Kerbin/ag
 | Mac (Intel) | `agent-orchestrator-…-darwin-x64.zip` | Same. llama.cpp is CPU/BLAS. |
 | Windows | `agent-orchestrator-…-win-x64.zip` | Extract, run `bin\agent-orchestrator-gui.cmd` |
 
-That starts the loopback GUI and Streamable HTTP **`/mcp` on the same port**. Copy the printed URL for Late. Stop with `--stop`. Bind stays `127.0.0.1`. Ollama and llama.cpp are in the archive (Start on the Local models page). vLLM Start still needs Docker — if Docker is missing, **Start with Docker** stays hidden.
+That starts the GUI and Streamable HTTP **`/mcp` on the same port**. Copy the printed URL for Late. Stop with `--stop`. Bind stays `127.0.0.1` unless you set one private IP (see below). Ollama and llama.cpp are in the archive (Start on the Local models page). vLLM Start still needs Docker — if Docker is missing, **Start with Docker** stays hidden.
 
 The Linux file is a portable tarball — it is not tied to one distro. There is no `.deb` or `.rpm` (this project packs a Node runtime archive, not an fpm/electron-builder installer).
 
@@ -91,11 +91,11 @@ cp .env.example .env
 Put API keys in `.env` or in the GUI **Backends** page — never in `agents.config.yaml`. `apiKeyEnv` is the **variable name** (`GEMINI_API_KEY`), not the secret.
 
 ```bash
-# GUI (loopback only)
+# GUI (loopback, or one private IP — see Late on another computer)
 npm run gui
 ```
 
-Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…`). The session token is stored at `.orchestrator/gui.secret` (gitignored). The GUI also serves Streamable HTTP at **`/mcp` on that same port** (no GUI token). Copy that exact URL from stderr or GUI Settings → **Copy MCP URL** — it is the port this process bound, not always 8787. On listen it writes `.orchestrator/mcp.gui.url` (and last-writer `mcp.url`) plus `~/.config/agent-orchestrator/` (or `$XDG_CONFIG_HOME`) so a client like Late can find a non-default port. Dedicated `npm run mcp:http` writes `mcp.http.url` separately so it does not hide the GUI URL.
+Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…` on loopback, or the private IP you typed). The session token is stored at `.orchestrator/gui.secret` (gitignored). The GUI also serves Streamable HTTP at **`/mcp` on that same port** (no GUI token — Late never sends it). Copy that exact URL from stderr or GUI Settings → **Copy MCP URL** — it is the host and port this process bound, not always 8787. On listen it writes `.orchestrator/mcp.gui.url` (and last-writer `mcp.url`) plus `~/.config/agent-orchestrator/` (or `$XDG_CONFIG_HOME`) so a client like Late can find a non-default port. Dedicated `npm run mcp:http` writes `mcp.http.url` separately so it does not hide the GUI URL.
 
 **Late** uses only the printed Streamable HTTP `/mcp` URL (same port as the GUI, or `npm run mcp:http`). Do not put this program in Cursor `mcpServers` for Late — that skips Late Approve and must not receive API keys. `npm start` / [`.cursor/mcp.json`](.cursor/mcp.json) is stdio for **this repo’s Cursor IDE**, not the Late operator path.
 
@@ -105,7 +105,7 @@ The HTML root is the GUI. `/mcp` on that same port is Streamable HTTP (a JSON bo
 
 ### Windows
 
-Same Node 22.13+ and `npm` commands work in PowerShell or cmd. Loopback bind and GUI auth are unchanged (`127.0.0.1` only).
+Same Node 22.13+ and `npm` commands work in PowerShell or cmd. Loopback bind is the default (`127.0.0.1`). One private IP is optional (see below).
 
 ```powershell
 npm install
@@ -157,7 +157,7 @@ While a speaker runs, a **thinking** chip shows name, elapsed time, and phase so
 | Start / Stop local servers | **Settings → Local models**. **Start Ollama** / **Stop**, or **Start llama-server** with an absolute `.gguf` path. Loopback only. Weights are not in the archive. | ![Start Ollama and llama-server](docs/images/local-start-stop.png) |
 | vLLM | **Start with Docker** only if Docker is on this computer. Hidden when Docker is missing. Ollama / llama.cpp still work. | ![Search the catalog](docs/assets/local-models.webp) |
 | MCP for Late | **Copy MCP URL** → paste `/mcp` into Late. HTML root is not MCP. Empty Late URL = folder. Send is `chat_send`. Extra `start_*` wait for Approve. Do **not** put this in Cursor `mcpServers`. | ![Copy the /mcp URL](docs/assets/http-mcp.webp) |
-| Token-gated `/api` | Open the printed `?token=` URL. GUI `/api/*` needs that session token. `/mcp` does not (Late never sends it). | ![GUI on loopback only](docs/assets/security.webp) |
+| Token-gated `/api` | Open the printed `?token=` URL. GUI `/api/*` needs that session token. `/mcp` does not (Late never sends it). On a private-IP bind, `/mcp` is trusted LAN — firewall to the laptop. | ![GUI on loopback only](docs/assets/security.webp) |
 | MCP tools | `chat_send`, `list_agents`, `start_vllm`, `ollama_status`, `llamacpp_status`, … There is **no** `start_ollama` tool — Start Ollama is the Local models button. | ![GUI vs /mcp](docs/images/gui-vs-mcp.png) |
 
 ![Debate: several models each get a turn](docs/assets/chat.webp)
@@ -178,7 +178,7 @@ Grant a folder that already exists on this computer, then **Approve**. This capt
 
 | Page | What it does |
 | --- | --- |
-| Backends | Ready/not-ready, paste keys (masked), Gemini model id, nicknames, custom logos |
+| Backends | Ready/not-ready, paste keys (masked), Gemini model id, nicknames, custom logos, **Listen host** (loopback or one private IP) + Copy MCP URL |
 | Local models | Detect GPU VRAM, recommend weights that fit, download, start/stop/remove local servers. **Hugging Face token** (gated Gemma/Llama/Mistral): paste a Hub read token; status is configured/not; value is never returned |
 | Allowlist | Directories Cursor may write to |
 | Updates | Check GitHub for this app and Late. Ask before download. Cloud AI is not required. |
@@ -208,10 +208,10 @@ The GUI **Theme** picker (sidebar, Chat → Settings, and Overview) is per brows
 
 | Property | Behavior |
 | --- | --- |
-| Bind | GUI and HTTP MCP bind **`127.0.0.1` only** (ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT`, defaults 8787 / 8790). Local model HTTP is loopback. |
-| Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not (Late never sends it). Loopback Host + Origin are the boundary — any process on this computer can call mutating tools (`chat_approve`, `dispatch`, `add_allowed_dir`). Pairing a token on `/mcp` would break Late unless Late starts sending one. Do not tunnel `/mcp`. Late Approve is Late’s sidecar when Late is the client. |
-| GUI token | Open the printed `?token=` URL. The token is stored in sessionStorage and stripped from the address bar. EventSource `/api/events` still uses a query token because the browser cannot set `Authorization` on EventSource. Logo URLs use the same query form. Loopback only. |
-| Origin | Non-loopback `Host` is rejected. GUI `/api` Origin must match this port. Streamable HTTP `/mcp` allows any loopback Origin (Late UI / sidecar) or none. |
+| Bind | GUI and HTTP MCP default to **`127.0.0.1`**. You may bind **one** private IP on this computer (RFC1918 or IPv6 ULA) via `mcp.listen_host`, GUI Settings, or `AGENT_ORCHESTRATOR_MCP_HOST` / `AGENT_ORCHESTRATOR_GUI_HOST`. Ports from `AGENT_ORCHESTRATOR_GUI_PORT` / `AGENT_ORCHESTRATOR_MCP_PORT` (defaults 8787 / 8790). `0.0.0.0`, `::`, and public addresses are refused. Local model HTTP stays loopback. |
+| Auth | GUI `/api/*` requires the session token. Streamable HTTP `/mcp` does not (Late never sends it). Host + Origin are the boundary (loopback and the bound private host). Pairing a token on `/mcp` would break Late unless Late starts sending one. On a private-IP bind, treat `/mcp` as trusted LAN — firewall to the laptop. Do not tunnel `/mcp` to the public internet. Late Approve is Late’s sidecar when Late is the client. |
+| GUI token | Open the printed `?token=` URL. The token is stored in sessionStorage and stripped from the address bar. EventSource `/api/events` still uses a query token because the browser cannot set `Authorization` on EventSource. Logo URLs use the same query form. |
+| Origin | `Host` must be loopback or the bound private IP. GUI `/api` Origin must match this port. Streamable HTTP `/mcp` allows loopback Origin, the bound private host, or none (Late sidecar). Random websites (`evil.com`) are rejected. |
 | Secrets | Never logged or shown in full. Not committed. POSIX files `0600`; Windows needs NTFS ACLs. |
 | Writes | Realpath + allowlist; `..` and symlink escapes fail. |
 
@@ -219,7 +219,7 @@ Do not tunnel the GUI or vLLM. Cloud Cursor agents cannot reach localhost; the o
 
 ![GUI on loopback only](docs/assets/security.webp)
 
-The rail says `127.0.0.1`. Local vLLM is the same bind. This page is only for **your computer**.
+The rail shows the bind address. Local vLLM stays loopback. This page is for **your computer** (and, if you choose, one private IP on a trusted LAN).
 
 ## Write allowlist
 
@@ -286,7 +286,31 @@ Ready vLLM, Ollama, and llama.cpp backends all participate in Auto debate when t
 
 ## HTTP MCP (any client)
 
-The GUI serves Streamable HTTP at **`http://127.0.0.1:<gui-port>/mcp`** on the same process as the web UI (`AGENT_ORCHESTRATOR_GUI_PORT`). A dedicated process is **`npm run mcp:http`** → `http://127.0.0.1:<mcp-port>/mcp` (`AGENT_ORCHESTRATOR_MCP_PORT`). `/MCP` is the same route. Late does not send a GUI token. Copy the URL that process printed (or GUI Settings → Copy MCP URL). Late works with MCP off.
+The GUI serves Streamable HTTP at **`http://<bind-host>:<gui-port>/mcp`** on the same process as the web UI (`AGENT_ORCHESTRATOR_GUI_PORT`, default 8787). A dedicated process is **`npm run mcp:http`** → `http://<bind-host>:<mcp-port>/mcp` (`AGENT_ORCHESTRATOR_MCP_PORT`, default 8790). `/MCP` is the same route. Late does not send a GUI token. Copy the URL that process printed (or GUI Settings → Copy MCP URL). Late works with MCP off.
+
+### Late on another computer on your LAN
+
+You start Orchestrator on this computer. Late only talks HTTP; it will not start this process. Cloud AI is not required for a private LAN address.
+
+On the Orchestrator PC, pick one:
+
+```bash
+AGENT_ORCHESTRATOR_MCP_HOST=192.168.2.139 AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http
+```
+
+Or bind the GUI (same `/mcp` on the GUI port, default 8787):
+
+```bash
+AGENT_ORCHESTRATOR_GUI_HOST=192.168.2.139 npm run gui
+```
+
+Or type `192.168.2.139` in GUI **Settings → Backends → Listen host**, save, and restart. That writes `mcp.listen_host` in `agents.config.yaml`. Env vars override the YAML field.
+
+Late on the other computer: paste the printed URL, for example **`http://192.168.2.139:8790/mcp`** (dedicated MCP) or **`http://192.168.2.139:8787/mcp`** (GUI). The HTML page is not MCP.
+
+Firewall: allow the laptop (example `192.168.3.116`) to that host and port. If the two boxes are on different subnets (`.2` vs `.3`) you need routing — if ping already works, you are fine. SSH is not required.
+
+This is one private IP on **your computer**, not every interface. `0.0.0.0` and public addresses are refused. `/mcp` has no GUI token because Late never sends one — use a trusted LAN and the firewall.
 
 ![Copy MCP URL vs the HTML root](docs/assets/http-mcp.webp)
 
@@ -294,11 +318,13 @@ Paste that `/mcp` URL. Opening the HTML page in a browser is the GUI, not MCP.
 
 ```http
 POST /mcp HTTP/1.1
-Host: 127.0.0.1:<mcp-or-gui-port>
+Host: 192.168.2.139:8790
 Accept: application/json, text/event-stream
 Content-Type: application/json
 MCP-Protocol-Version: 2025-03-26
 ```
+
+(Loopback is `Host: 127.0.0.1:<port>`.)
 
 **Late:** Settings → MCP is optional. If you turn it on, Address = the printed `/mcp` URL from this process (GUI Settings can copy it). Save, then Check. List/status tools run; starts and writes still wait for Approve. You start the GUI or `npm run mcp:http`; Late will not start it and still chats when MCP is off.
 

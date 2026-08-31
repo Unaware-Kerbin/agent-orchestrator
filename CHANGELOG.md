@@ -5,9 +5,15 @@ What shipped in each tag, in plain language. Newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are America/New_York.
 
-This is a window on **your computer**. Bind stays loopback (`127.0.0.1`). Packed archives include Ollama and llama-server. vLLM Start still needs Docker.
+This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Ollama and llama-server. vLLM Start still needs Docker.
 
 ## Unreleased
+
+**One private IP for Late on another computer.**
+
+- GUI and `npm run mcp:http` can bind **one** RFC1918 / ULA address you type (`mcp.listen_host` in YAML, Settings → Listen host, or `AGENT_ORCHESTRATOR_MCP_HOST` / `AGENT_ORCHESTRATOR_GUI_HOST`). Default stays `127.0.0.1`. `0.0.0.0`, `::`, and public IPs are refused.
+- Printed / Copy MCP URL is `http://<that-host>:<port>/mcp` so Late on another computer can paste it. Host/Origin allow that bind host plus loopback; random websites are rejected. Late still does not send a GUI token — trusted LAN, firewall to the laptop.
+- Example: `AGENT_ORCHESTRATOR_MCP_HOST=192.168.2.139 AGENT_ORCHESTRATOR_MCP_PORT=8790 npm run mcp:http` then paste `http://192.168.2.139:8790/mcp`. You start Orchestrator; Late will not start it. SSH is not required.
 
 ## 2026-08-31
 

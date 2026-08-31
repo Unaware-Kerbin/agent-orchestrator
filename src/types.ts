@@ -98,9 +98,16 @@ export interface WorkflowConfig {
   steps: WorkflowStepConfig[];
 }
 
+export interface McpListenConfig {
+  /** Loopback or one RFC1918 / ULA IP. Never 0.0.0.0. Env HOST vars override. */
+  listenHost?: string;
+}
+
 export interface OrchestratorConfig {
   workspace?: { cwd?: string };
   defaults?: { wait?: boolean; model?: string };
+  /** Streamable HTTP / GUI listen. Env AGENT_ORCHESTRATOR_*_HOST overrides. */
+  mcp?: McpListenConfig;
   backends: Record<string, BackendConfig>;
   specialists: Record<string, SpecialistConfig>;
   workflows: Record<string, WorkflowConfig>;

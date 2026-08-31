@@ -183,11 +183,15 @@ test("loopback Host and Origin accept localhost and 127.0.0.1", () => {
   assert.equal(loopbackHostOk("[::1]:8790", 8790), true);
   assert.equal(loopbackHostOk("0.0.0.0:8790", 8790), false);
   assert.equal(loopbackHostOk("example.com:8790", 8790), false);
+  assert.equal(loopbackHostOk("192.168.2.139:8790", 8790, "192.168.2.139"), true);
+  assert.equal(loopbackHostOk("evil.com:8790", 8790, "192.168.2.139"), false);
   assert.equal(loopbackOriginOk(undefined), true);
   assert.equal(loopbackOriginOk("http://127.0.0.1:8790"), true);
   assert.equal(loopbackOriginOk("http://localhost:5173"), true);
   assert.equal(loopbackOriginOk("http://evil.example:8790"), false);
   assert.equal(loopbackOriginOk("null"), false);
+  assert.equal(loopbackOriginOk("http://192.168.2.139:8790", "192.168.2.139"), true);
+  assert.equal(loopbackOriginOk("http://evil.com", "192.168.2.139"), false);
 });
 
 test("GET /mcp/health is {ok:true} without Bearer; GET /mcp is not a 404; tools/list still works", async () => {

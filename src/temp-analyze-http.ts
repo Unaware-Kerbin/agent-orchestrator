@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extractBearerToken, tokensEqual } from "./gui-auth.js";
 import { readLogo } from "./identity.js";
+import { listenHostHeaderOk, listenOriginOk, MCP_LOOPBACK_HOST } from "./mcp/bind.js";
 import { redactSecretText } from "./redact.js";
 import type { TempAnalyzeAllowlist } from "./temp-allowlist.js";
 
@@ -20,31 +21,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   res.end(JSON.stringify(body));
 }
 
-export function loopbackHostOk(hostHeader: string | undefined, port: number): boolean {
-  if (!hostHeader) return false;
-  const host = hostHeader.trim().toLowerCase();
-  return (
-    host === `127.0.0.1:${port}` ||
-    host === `localhost:${port}` ||
-    host === "127.0.0.1" ||
-    host === "localhost" ||
-    host === `[::1]:${port}` ||
-    host === "::1"
-  );
+export function loopbackHostOk(
+  hostHeader: string | undefined,
+  port: number,
+  listenHost: string = MCP_LOOPBACK_HOST,
+): boolean {
+  return listenHostHeaderOk(hostHeader, port, listenHost);
 }
 
-/** Missing Origin is OK (non-browser MCP clients). A present Origin must be loopback. */
-export function loopbackOriginOk(origin: string | undefined): boolean {
-  if (!origin) return true;
-  if (origin.trim().toLowerCase() === "null") return false;
-  try {
-    const url = new URL(origin);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-    const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "localhost.localdomain";
-  } catch {
-    return false;
-  }
+/** Missing Origin is OK (non-browser MCP clients). A present Origin must be loopback or the bind host. */
+export function loopbackOriginOk(origin: string | undefined, listenHost: string = MCP_LOOPBACK_HOST): boolean {
+  return listenOriginOk(origin, listenHost);
 }
 
 export function restAuthorized(req: IncomingMessage, token: string): boolean {

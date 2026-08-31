@@ -99,6 +99,7 @@ test("GUI Settings copies session mcpUrl for Late; bound port, not a machine hom
   assert.ok(js.includes("data-copy-mcp"));
   assert.ok(js.includes("mcpUrlForLate"));
   assert.ok(js.includes("sessionInfo.mcpUrl"));
+  assert.ok(js.includes("mcp-listen-host"));
   assert.ok(js.includes("Copy MCP URL"));
   assert.ok(js.includes("Late works") || js.includes("does not need this server"));
   assert.equal(js.includes("http://${escapeHtml(location.host)}/mcp"), false);

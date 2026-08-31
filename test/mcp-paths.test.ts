@@ -1,16 +1,34 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bindMcpLoopbackOnly, lateMcpCopyLines, loopbackMcpUrl } from "../src/mcp/bind.js";
+import {
+  bindMcpListenHost,
+  bindMcpLoopbackOnly,
+  lateMcpCopyLines,
+  listenHostHeaderOk,
+  listenMcpUrl,
+  listenOriginOk,
+  loopbackMcpUrl,
+} from "../src/mcp/bind.js";
 import { isMcpHealthPath, isMcpLivenessGet, isMcpLoginPath, isMcpPath, normalizeMcpPath } from "../src/mcp/paths.js";
 import { assertNoMachineHome } from "./machine-paths.js";
 
-test("MCP HTTP bind refuses 0.0.0.0 and non-loopback", () => {
-  assert.equal(bindMcpLoopbackOnly(undefined), "127.0.0.1");
-  assert.equal(bindMcpLoopbackOnly("127.0.0.1"), "127.0.0.1");
-  assert.equal(bindMcpLoopbackOnly("localhost"), "127.0.0.1");
-  assert.throws(() => bindMcpLoopbackOnly("0.0.0.0"), /127\.0\.0\.1/);
-  assert.throws(() => bindMcpLoopbackOnly("::"), /127\.0\.0\.1/);
-  assert.throws(() => bindMcpLoopbackOnly("192.168.1.5"), /127\.0\.0\.1/);
+test("MCP HTTP bind allows loopback and one RFC1918 IP; refuses 0.0.0.0 and public", () => {
+  assert.equal(bindMcpListenHost(undefined), "127.0.0.1");
+  assert.equal(bindMcpListenHost("127.0.0.1"), "127.0.0.1");
+  assert.equal(bindMcpListenHost("localhost"), "127.0.0.1");
+  assert.equal(bindMcpListenHost("192.168.2.139"), "192.168.2.139");
+  assert.equal(bindMcpListenHost("192.168.1.5"), "192.168.1.5");
+  assert.equal(bindMcpListenHost("10.1.2.3"), "10.1.2.3");
+  assert.equal(bindMcpListenHost("172.16.0.9"), "172.16.0.9");
+  assert.equal(bindMcpListenHost("fd12:3456:789a::1"), "fd12:3456:789a::1");
+  assert.equal(bindMcpLoopbackOnly("192.168.2.139"), "192.168.2.139");
+  assert.throws(() => bindMcpListenHost("0.0.0.0"), /0\.0\.0\.0|private/);
+  assert.throws(() => bindMcpListenHost("::"), /private|::/);
+  assert.throws(() => bindMcpListenHost("8.8.8.8"), /8\.8\.8\.8|private/);
+  assert.throws(() => bindMcpListenHost("1.1.1.1"), /private/);
+  assert.throws(() => bindMcpListenHost("169.254.1.1"), /private/);
+  assert.throws(() => bindMcpListenHost("255.255.255.255"), /private/);
+  assert.throws(() => bindMcpListenHost("example.com"), /private/);
 });
 
 test("/mcp and /MCP are MCP paths; other GUI routes are not", () => {
@@ -39,14 +57,32 @@ test("GET /mcp/health and GET /mcp without SSE are liveness, not tools/list", ()
   assert.equal(isMcpLivenessGet("GET", "/", "text/event-stream", { standalone: true }), false);
 });
 
-test("loopback MCP URL is 127.0.0.1 plus the bound port", () => {
+test("MCP URL uses the bound listen host", () => {
   assert.equal(loopbackMcpUrl(8107), "http://127.0.0.1:8107/mcp");
   assert.equal(loopbackMcpUrl(8787), "http://127.0.0.1:8787/mcp");
   assert.equal(loopbackMcpUrl(8790), "http://127.0.0.1:8790/mcp");
+  assert.equal(listenMcpUrl(8790, "192.168.2.139"), "http://192.168.2.139:8790/mcp");
+  assert.equal(listenMcpUrl(8787, "192.168.2.139"), "http://192.168.2.139:8787/mcp");
+  assert.equal(listenMcpUrl(8790, "fd12:3456:789a::1"), "http://[fd12:3456:789a::1]:8790/mcp");
   const lines = lateMcpCopyLines(loopbackMcpUrl(8107));
   assert.ok(lines.some((l) => l.includes("http://127.0.0.1:8107/mcp")));
   assert.ok(lines.some((l) => /Late works with MCP off/i.test(l)));
+  const lan = lateMcpCopyLines(listenMcpUrl(8790, "192.168.2.139"));
+  assert.ok(lan.some((l) => l.includes("http://192.168.2.139:8790/mcp")));
+  assert.ok(lan.some((l) => /trusted LAN/i.test(l)));
   for (const line of lines) assertNoMachineHome(line, "lateMcpCopyLines");
   assert.throws(() => loopbackMcpUrl(0), /1–65535/);
 });
 
+test("Host and Origin allow the bound private IP; evil.com is rejected", () => {
+  assert.equal(listenHostHeaderOk("192.168.2.139:8790", 8790, "192.168.2.139"), true);
+  assert.equal(listenHostHeaderOk("127.0.0.1:8790", 8790, "192.168.2.139"), true);
+  assert.equal(listenHostHeaderOk("evil.com:8790", 8790, "192.168.2.139"), false);
+  assert.equal(listenHostHeaderOk("0.0.0.0:8790", 8790, "192.168.2.139"), false);
+  assert.equal(listenOriginOk(undefined, "192.168.2.139"), true);
+  assert.equal(listenOriginOk("http://192.168.2.139:8790", "192.168.2.139"), true);
+  assert.equal(listenOriginOk("http://127.0.0.1:5173", "192.168.2.139"), true);
+  assert.equal(listenOriginOk("http://evil.com", "192.168.2.139"), false);
+  assert.equal(listenOriginOk("https://evil.com", "192.168.2.139"), false);
+  assert.equal(listenOriginOk("null", "192.168.2.139"), false);
+});

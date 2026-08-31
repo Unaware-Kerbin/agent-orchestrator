@@ -13,6 +13,7 @@ import { isGeminiOpenAiConfig, parseGeminiModelId } from "./providers/gemini.js"
 import { parseModelId, parseNickname } from "./identity.js";
 import { normalizeLoopbackOpenAiUrl } from "./local-servers/loopback.js";
 import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./local-servers/loopback.js";
+import { bindMcpListenHost, MCP_LOOPBACK_HOST } from "./mcp/bind.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -192,6 +193,13 @@ export function resolveConfigPath(): string {
   }
 }
 
+function parseMcpListenHost(raw: unknown): string | undefined {
+  if (!isRecord(raw)) return undefined;
+  const value = raw.listen_host ?? raw.listenHost;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  return bindMcpListenHost(value);
+}
+
 export function parseOrchestratorConfig(parsed: unknown): OrchestratorConfig {
   if (!isRecord(parsed)) throw new Error("Config root must be a mapping");
 
@@ -200,6 +208,7 @@ export function parseOrchestratorConfig(parsed: unknown): OrchestratorConfig {
   const workflowsRaw = isRecord(parsed.workflows) ? parsed.workflows : {};
   const workspace = isRecord(parsed.workspace) ? parsed.workspace : {};
   const defaults = isRecord(parsed.defaults) ? parsed.defaults : {};
+  const listenHost = parseMcpListenHost(parsed.mcp);
 
   const backends: Record<string, BackendConfig> = {};
   for (const [id, value] of Object.entries(backendsRaw)) {
@@ -229,6 +238,7 @@ export function parseOrchestratorConfig(parsed: unknown): OrchestratorConfig {
       wait: defaults.wait !== false,
       model: typeof defaults.model === "string" ? defaults.model : undefined,
     },
+    mcp: listenHost ? { listenHost } : undefined,
     backends,
     specialists,
     workflows,
@@ -298,6 +308,37 @@ export function patchBackendModelYaml(yamlText: string, backendId: string, model
     : block.replace(/^( {2}\S+:\n)/, `$1    model: ${quoted}\n`);
   const abs = start + match.index;
   return yamlText.slice(0, abs) + nextBlock + yamlText.slice(abs + block.length);
+}
+
+/** Set `mcp.listen_host` without rewriting backends. Loopback writes 127.0.0.1. */
+export function patchMcpListenHostYaml(yamlText: string, listenHost: string): string {
+  const host = bindMcpListenHost(listenHost || MCP_LOOPBACK_HOST);
+  const value = JSON.stringify(host);
+  const mcpHeader = /^mcp:\s*\n/m.exec(yamlText);
+  if (mcpHeader && mcpHeader.index !== undefined) {
+    const start = mcpHeader.index + mcpHeader[0].length;
+    const rest = yamlText.slice(start);
+    const nextSection = rest.search(/^[A-Za-z][A-Za-z0-9_-]*:\s*$/m);
+    const sectionText = nextSection >= 0 ? rest.slice(0, nextSection) : rest;
+    const listenRe = /^( {2}listen_host:)\s*.*$/m;
+    const camelRe = /^( {2}listenHost:)\s*.*$/m;
+    let nextSectionText: string;
+    if (listenRe.test(sectionText)) {
+      nextSectionText = sectionText.replace(listenRe, `$1 ${value}`);
+    } else if (camelRe.test(sectionText)) {
+      nextSectionText = sectionText.replace(camelRe, `  listen_host: ${value}`);
+    } else {
+      nextSectionText = `  listen_host: ${value}\n${sectionText}`;
+    }
+    return yamlText.slice(0, start) + nextSectionText + yamlText.slice(start + sectionText.length);
+  }
+  const block = `mcp:\n  listen_host: ${value}\n\n`;
+  const backends = /^backends:\s*$/m.exec(yamlText);
+  if (backends && backends.index !== undefined) {
+    return yamlText.slice(0, backends.index) + block + yamlText.slice(backends.index);
+  }
+  const body = yamlText.endsWith("\n") ? yamlText : `${yamlText}\n`;
+  return `${body}${block}`;
 }
 
 /** Set or clear `backends.<id>.nickname`. Empty nickname removes the field. */

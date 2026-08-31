@@ -41,6 +41,57 @@ test("mcpOriginAllowed accepts any loopback Origin; GUI /api stays same-port", (
   assert.equal(originAllowed("http://127.0.0.1:5173", 8787), false);
 });
 
+test("mcpOriginAllowed accepts the bound private host; evil.com is rejected", () => {
+  assert.equal(mcpOriginAllowed("http://192.168.2.139:8790", "192.168.2.139"), true);
+  assert.equal(mcpOriginAllowed("http://192.168.2.139:5173", "192.168.2.139"), true);
+  assert.equal(mcpOriginAllowed(undefined, "192.168.2.139"), true);
+  assert.equal(mcpOriginAllowed("http://evil.com", "192.168.2.139"), false);
+  assert.equal(mcpOriginAllowed("https://evil.com", "192.168.2.139"), false);
+  assert.equal(originAllowed("http://192.168.2.139:8787", 8787, "192.168.2.139"), true);
+  assert.equal(originAllowed("http://evil.com:8787", 8787, "192.168.2.139"), false);
+  assert.equal(hostAllowed("192.168.2.139:8787", 8787, "192.168.2.139"), true);
+  assert.equal(hostAllowed("0.0.0.0:8787", 8787, "192.168.2.139"), false);
+});
+
+test("startGuiServer Copy MCP URL uses the entered private host", () => {
+  const events = new EventEmitter();
+  const orchestrator = {
+    events,
+    catalog: async () => ({ backends: [], specialists: [], workflows: [] }),
+    localModels: { snapshot: () => ({}) },
+    store: { list: () => [], get: () => undefined },
+    configPath: "/tmp/agents.config.yaml",
+    config: { backends: {}, specialists: {}, mcp: { listenHost: "192.168.2.139" } },
+    allowlist: { list: () => [] },
+    defaultCwd: () => "/",
+    reloadConfig: () => undefined,
+  };
+  const chat = {
+    list: () => [],
+    create: () => ({}),
+    get: () => ({}),
+    delete: () => false,
+    setPin: () => ({}),
+    send: async () => ({}),
+    runAction: async () => ({}),
+    resolveApproval: async () => ({}),
+  };
+  const { server, listen } = startGuiServer({
+    orchestrator: orchestrator as never,
+    chat: chat as never,
+    token: "test-token",
+    port: 8787,
+    host: "192.168.2.139",
+  });
+  try {
+    assert.equal(listen.host, "192.168.2.139");
+    assert.equal(listen.mcpUrl, "http://192.168.2.139:8787/mcp");
+    assert.equal(listen.url, "http://192.168.2.139:8787");
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /api/vllm/start returns 202 with jobId without waiting for health", async () => {
   const events = new EventEmitter();
   let phase: "idle" | "starting" | "running" = "idle";
