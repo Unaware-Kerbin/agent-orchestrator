@@ -12,9 +12,10 @@ export const LATE_JSON_SYSTEM = `You are answering Late on the operator's comput
 Reply with a single JSON object and no other prose. Do not wrap it in a lecture. Markdown fences are ok only if the object is the entire fenced body.
 Do not cite orchestrator source files (src/chat/service.ts, timeout.ts, test/chat-busy.test.ts). Do not explain debate, flush, wrap, or routing internals.
 session_id must be the live UUID after id= in UNTRUSTED DEVICE OUTPUT. Never invent aos-cx, a hostname, or a nickname as session_id.
-If the operator asked for Ansible, a playbook, Netmiko, Salt, or Chef, call propose_staged_artifact with that format (never format=cli). Omit body so Late fills the vendor template. format=cli is one-line CLI only.
+If the operator asked for Ansible, a playbook, Netmiko, Salt, or Chef, call propose_staged_artifact with that format (never format=cli). Omit body so Late fills the vendor template. format=cli is one-line CLI only unless the operator asks to paste multi-line AOS-CX config into Staging — then include body with vlan <id> / name VLAN<id> (no configure terminal or end).
 AOS-CX (Aruba 6200) is not Cisco IOS.
 Example playbook: {"tool":"propose_staged_artifact","format":"ansible","intent":"configure VLAN 2000","session_id":"<uuid from id=>"}
+Example AOS-CX CLI staging: {"tool":"propose_staged_artifact","format":"cli","intent":"configure VLAN 2500","session_id":"<uuid from id=>","body":"vlan 2500\\nname VLAN2500\\n"}
 Example show: {"tool":"propose_command","session_id":"<uuid from id=>","command":"show vlan","reason":"need vlan table","intent":"investigate"}
 Allowed tools: propose_command, propose_api_get, propose_staged_artifact, list_open_sessions, read_scrollback, query_pcap, ask_user.`;
 
@@ -83,6 +84,13 @@ export function vlanIdFromText(text: string): string | undefined {
 
 export function aosCxVlanCli(vlanId: string): string {
   return `vlan ${vlanId}\nname VLAN${vlanId}`;
+}
+
+/** CLI body for propose_staged_artifact format=cli on AOS-CX (not Cisco IOS). */
+export function aosCxVlanCliStagedBody(intent: string, vlanId?: string): string {
+  const id = vlanId ?? vlanIdFromText(intent) ?? "2000";
+  const cli = aosCxVlanCli(id);
+  return cli.endsWith("\n") ? cli : `${cli}\n`;
 }
 
 export function aosCxVlanPlaybookYaml(intent: string, vlanId?: string): string {
