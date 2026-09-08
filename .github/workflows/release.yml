@@ -115,7 +115,9 @@ jobs:
             ### v0.1.5
             - Inference engines documented (late-infer / OpenVINO/Candle, Ollama, llama.cpp, vLLM Docker).
             - late-infer Hub pre-screen: `ovExportOk` / `loadable` from `model_type` + soft-fail cached `config.json` probe; loadable ungated rows sort first.
-            - CI packs `late-infer` by building Unaware-Kerbin/late on each runner (no sibling checkout required).
+            - Chat tokens/sec (research, opt-in) in the composer — default off; not a billing meter.
+            - Soft-fail human messages for missing/denied Hub `config.json` on Download (real Instruct seed ids; no bare `Error: config.json`).
+            - CI packs `late-infer` by building Unaware-Kerbin/late on each runner (darwin-x64 cross-compiled on macos-14).
 
             ### Install
             - **Linux / macOS:** extract, then `./bin/agent-orchestrator-gui`

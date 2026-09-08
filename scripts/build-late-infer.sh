@@ -64,7 +64,7 @@ if [[ "$dest_name" == "late-infer" ]]; then
   chmod +x "$DEST_DIR/$dest_name" "$RUNTIME_DIR/$dest_name"
 fi
 
-pkg_ver="$(node -p "require('$ROOT/package.json').version")"
+pkg_ver="$(cd "$ROOT" && node -p "require('./package.json').version")"
 printf '%s\n' "$pkg_ver" > "$DEST_DIR/late-infer.stamp"
 printf '%s\n' "$pkg_ver" > "$RUNTIME_DIR/.late-infer-built-for"
 

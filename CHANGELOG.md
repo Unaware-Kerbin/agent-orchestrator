@@ -7,18 +7,6 @@ Dates are America/New_York.
 
 This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Node 22 and `late-infer`. Ollama / llama-server / vLLM remain optional local engines; vLLM Start still needs Docker.
 
-## [Unreleased]
-
-Work on `main` after [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.5). Not a new installer tag yet.
-
-### Added
-
-- **Chat tokens/sec (research, opt-in).** Composer checkbox **Show tokens/sec (research)** — default off. Estimates tok/s for the active reply (chars÷4 / elapsed); finished replies store `tokensPerSec` / `completionTokensEst` on the message. Not a billing meter.
-
-### Fixed
-
-- **Instant `Error: config.json` on Download.** Fallback seed `Qwen/Qwen3-4B-Instruct` had no public Hub `config.json` (real Instruct id is `Qwen/Qwen3-4B-Instruct-2507`); screening skipped probes when `model_type` was inferred, so the row showed ready/OV ok while Download failed. Also: late-infer often prints bare `Error: config.json` on the first stderr line before Caused-by / HTTP status — the job froze that cryptic line. Fix: use real Hub seed ids, always probe fallback seeds, soft-fail bare/missing/denied config with a human message, upgrade the job error from full stderr on exit, and fail closed earlier on Hub 404 in the gated probe.
-
 ## [0.1.5] - 2026-09-08
 
 New GitHub tag [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.5) so this build is trackable. Tag [v0.1.4](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.4) stays frozen — future installers are new tags; do not rewrite old tags.
@@ -30,10 +18,12 @@ New GitHub tag [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/rel
 ### Added
 
 - **late-infer Hub pre-screen.** Local models HF store stamps `ovExportOk` / `loadable` from known `model_type` plus a soft-fail cached `config.json` probe; loadable ungated rows sort first; broken config / OV-incompatible graphs are demoted (`a776eee`).
+- **Chat tokens/sec (research, opt-in).** Composer checkbox **Show tokens/sec (research)** — default off. Estimates tok/s for the active reply (chars÷4 / elapsed); finished replies store `tokensPerSec` / `completionTokensEst` on the message. Not a billing meter (`7d04d10`).
 
 ### Fixed
 
-- **Build installers CI.** Packaging after v0.1.4 requires a host-built `late-infer` binary; CI had no sibling Late checkout, so every `main` pack failed. Workflow now checks out `Unaware-Kerbin/late`, builds `late-infer` on each runner, and packs one native target per job (linux / darwin-arm64 / darwin-x64 / win-x64).
+- **Build installers CI.** Packaging after v0.1.4 requires a host-built `late-infer` binary; CI had no sibling Late checkout, so every `main` pack failed. Workflow now checks out `Unaware-Kerbin/late`, builds `late-infer` on each runner, and packs one native target per job (linux / darwin-arm64 / darwin-x64 / win-x64). Windows stamp uses a relative `package.json` require so Git Bash paths work.
+- **Instant `Error: config.json` on Download.** Fallback seed `Qwen/Qwen3-4B-Instruct` had no public Hub `config.json` (real Instruct id is `Qwen/Qwen3-4B-Instruct-2507`); screening skipped probes when `model_type` was inferred, so the row showed ready/OV ok while Download failed. Also: late-infer often prints bare `Error: config.json` on the first stderr line before Caused-by / HTTP status — the job froze that cryptic line. Fix: use real Hub seed ids, always probe fallback seeds, soft-fail bare/missing/denied config with a human message, upgrade the job error from full stderr on exit, and fail closed earlier on Hub 404 in the gated probe (`7d04d10`).
 
 ## [0.1.4] - 2026-08-31
 
@@ -88,7 +78,6 @@ Portable GUI + `/mcp` archives with apply-patch and a Debate README clip.
 
 First portable GUI + Streamable HTTP `/mcp` archives (Linux, macOS, Windows). Loopback only. Extract, then `./bin/agent-orchestrator-gui` (Windows: `bin\agent-orchestrator-gui.cmd`). Copy the printed `/mcp` URL for Late.
 
-[Unreleased]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.5...HEAD
 [0.1.5]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.2...v0.1.3
