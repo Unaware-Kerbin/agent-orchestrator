@@ -1245,7 +1245,13 @@ export function startGuiServer(options: {
       const q = url.searchParams.get("q") ?? "";
       try {
         refreshRuntimeEnv();
-        const catalog = await listHubModels({ q });
+        const gpuPlan = resolveLateInferGpuPlan({});
+        const idleCard = gpuPlan.visible[0] ?? gpuPlan.primary;
+        const catalog = await listHubModels({
+          q,
+          idleVramMiB: idleCard && idleCard.vramMiB > 0 ? idleCard.vramMiB : undefined,
+          displayCap: idleCard?.display ? gpuPlan.displayCapPercent / 100 : undefined,
+        });
         send(res, 200, catalog);
       } catch (error) {
         send(

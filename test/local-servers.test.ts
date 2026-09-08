@@ -444,17 +444,17 @@ test("pullLateInfer job has no FS fields and reports download then compile", asy
     assert.equal("cwd" in job, false);
     assert.equal("allowlist" in job, false);
     assert.equal("dest" in job, false);
-    assert.equal(job.phase === "downloading" || job.phase === "compiling" || job.phase === "done", true);
+    assert.equal(job.phase === "downloading" || job.phase === "probing" || job.phase === "compiling" || job.phase === "ready", true);
     const start = Date.now();
     let latest = job;
     while (Date.now() - start < 1000) {
       latest = lateInferCompileJob() ?? latest;
-      if (latest.phase === "done") break;
+      if (latest.phase === "ready") break;
       await delay(15);
     }
-    assert.equal(latest.phase, "done");
+    assert.equal(latest.phase, "ready");
     assert.equal(latest.downloading, false);
-    assert.match(latest.message, /ready for Start/i);
+    assert.match(latest.message, /ready/i);
     assert.equal(compileJobHasFsFields(latest), false);
   } finally {
     resetLateInferCompileForTests();
@@ -631,10 +631,10 @@ test("pullLateInfer records Hub fetch percent and ETA from mocked progress bytes
     let done = compiling;
     while (Date.now() - doneStart < 1000) {
       done = lateInferCompileJob();
-      if (done?.phase === "done") break;
+      if (done?.phase === "ready") break;
       await delay(15);
     }
-    assert.equal(done?.phase, "done");
+    assert.equal(done?.phase, "ready");
     assert.equal(done?.percent, 100);
     assert.equal(done?.downloading, false);
   } finally {

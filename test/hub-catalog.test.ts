@@ -452,6 +452,42 @@ test("max VRAM is weights plus 50% KV/activation headroom", () => {
   assert.equal(fromId.vramMaxMiB, 4_500);
 });
 
+test("dual B70 fit budget is 80% of one idle card, not total VRAM", () => {
+  const hw = fakeIntelHardware({ vramMiB: 31_023, ramMiB: 62_276 });
+  assert.equal(hw.totalVramMiB, 62_046);
+  assert.equal(hw.vramMiB, 31_023);
+  const budget = hardwareFitBudgetMiB(hw);
+  assert.equal(Math.round(budget), Math.round(31_023 * HUB_FIT_FRACTION));
+  assert.ok(budget < hw.totalVramMiB * HUB_FIT_FRACTION);
+});
+
+test("Hub fit uses peak vramMaxMiB against idle budget", () => {
+  const budget = 31_023 * HUB_FIT_FRACTION; // ~24.8 GiB
+  const small = toHubCatalogModel(
+    {
+      id: "Qwen/Qwen2.5-0.5B-Instruct",
+      pipeline_tag: "text-generation",
+      tags: ["safetensors", "text-generation", "instruct"],
+      safetensors: { total: 500_000_000 },
+    },
+    budget,
+  );
+  const huge = toHubCatalogModel(
+    {
+      id: "org/Huge-70B-Instruct",
+      pipeline_tag: "text-generation",
+      tags: ["safetensors", "text-generation", "instruct"],
+      safetensors: { total: 70_000_000_000 },
+    },
+    budget,
+  );
+  assert.equal(small?.fits, true);
+  assert.ok((small?.vramMaxMiB ?? 0) > 0);
+  assert.equal(huge?.fits, false);
+  assert.equal(huge?.likelyTooBig, true);
+  assert.ok((huge?.vramMaxMiB ?? 0) > budget);
+});
+
 test("CPU-only machines budget 80% of RAM", async () => {
   const hw = fakeHardware({ ramMiB: 8_192 });
   const result = await listHubModels({ fetchFn: mockHubFetch([QWEN25, HUGE]), hardware: hw });
@@ -476,7 +512,12 @@ test("Intel Arc / XPU without nvidia-smi still lists models using RAM when VRAM 
 test("Intel Arc with known VRAM budgets from GPU memory, not nvidia-smi", async () => {
   const hw = fakeIntelHardware({ vramMiB: 31_023, ramMiB: 62_276 });
   assert.equal(hw.hasNvidiaSmi, false);
-  assert.equal(Math.round(hardwareFitBudgetMiB(hw)), Math.round(62_046 * HUB_FIT_FRACTION));
+  // Idle compile target = one card (~31 GiB), never dual total (~62 GiB).
+  assert.equal(Math.round(hardwareFitBudgetMiB(hw)), Math.round(31_023 * HUB_FIT_FRACTION));
+  assert.equal(
+    Math.round(hardwareFitBudgetMiB(hw, { idleVramMiB: 32_768, displayCap: 0.7 })),
+    Math.round(32_768 * 0.7 * HUB_FIT_FRACTION),
+  );
   const result = await listHubModels({
     fetchFn: mockHubFetch([QWEN25, GEMMA_IT, GEMMA_2B, GEMMA_E2B, VISION, MISTRAL]),
     hardware: hw,

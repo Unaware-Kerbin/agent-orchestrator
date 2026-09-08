@@ -392,6 +392,11 @@ export function lateInferSpec(
     vramMaxMiB: gpu.vramMaxMiB ?? vramMaxMiBForHubId(id),
   });
   const env = mergeGpuPlanEnv({ ...process.env }, plan);
+  const accel = String(env.LATE_INFER_ACCEL ?? plan.env.LATE_INFER_ACCEL ?? "").toLowerCase();
+  if (accel === "intel") {
+    env.LATE_INFER_SKIP_MLC_PREFLIGHT = "1";
+    env.LATE_INFER_SKIP_MLC = "1";
+  }
   return {
     args: ["--bind", `${LOOPBACK_HOST}:${LATE_INFER_PORT}`, "--model", id],
     env,

@@ -17,6 +17,11 @@ New GitHub tag [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/rel
 
 ### Added
 
+- **Fits my GPU (idle compile target).** Hub store budgets ~80% of the **idle** card VRAM (not dual-GPU total). Display compile target keeps the 70% cap before that fraction. **Fits my GPU** filter (default on) auto-hides over-budget rows; peak `vramMaxMiB` drives the mark.
+- **Download vs compile pipeline states.** Distinct phases: `probing` → `downloading` → `compiling` → `ready` (+ soft-fail error messages) in compile jobs and Local models progress UI.
+- **Research metrics panel (opt-in).** Composer **Show research metrics** expands tokens/sec with latency, VRAM label, and model id on replies (still default off).
+- **Intel Arc OpenVINO defaults.** Compile/Start set `LATE_INFER_SKIP_MLC_PREFLIGHT` when `LATE_INFER_ACCEL=intel`; idle BDF + `ZE_AFFINITY_MASK` stay pinned to the non-display B70.
+
 - **late-infer Hub pre-screen.** Local models HF store stamps `ovExportOk` / `loadable` from known `model_type` plus a soft-fail cached `config.json` probe; loadable ungated rows sort first; broken config / OV-incompatible graphs are demoted (`a776eee`).
 - **Chat tokens/sec (research, opt-in).** Composer checkbox **Show tokens/sec (research)** — default off. Estimates tok/s for the active reply (chars÷4 / elapsed); finished replies store `tokensPerSec` / `completionTokensEst` on the message. Not a billing meter (`7d04d10`).
 

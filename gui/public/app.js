@@ -251,6 +251,17 @@ let lateInferShowGated = (() => {
   }
   return true;
 })();
+/** Auto-hide Hub rows over idle compile-target VRAM (~80% of idle card). Default on. */
+let lateInferFitsMyGpu = (() => {
+  try {
+    const v = sessionStorage.getItem("orchestrator.lateinfer.fitsMyGpu");
+    if (v === "0") return false;
+    if (v === "1") return true;
+  } catch {
+    /* ignore */
+  }
+  return true;
+})();
 let lateInferHfTokenSet = false;
 let llamaGgufCatalog = {
   models: [],
@@ -362,7 +373,7 @@ function lateInferJobBusy(infer) {
   if (!infer || lateInferHasError(infer)) return false;
   if (infer.downloading) return true;
   const phase = String(infer.phase ?? "").toLowerCase();
-  return phase === "downloading" || phase === "compiling";
+  return phase === "downloading" || phase === "probing" || phase === "compiling";
 }
 
 function lateInferBusy(infer) {
@@ -407,12 +418,16 @@ function formatLateInferEtaSec(sec) {
   return `about ${Math.round(min / 60)} h left`;
 }
 
-/** Hub Download progress (percent / ETA / compiling). GPU-status sibling: leave #lateinfer-download-progress alone. */
+/** Hub Download progress: probing → downloading → compiling → ready (soft-fail messages elsewhere). */
 function lateInferDownloadProgressHtml(infer) {
   if (lateInferHasError(infer)) return "";
-  if (!lateInferJobBusy(infer) && !lateInferDownloadBusy) return "";
-  const msg = String(infer?.message ?? "").trim();
   const phase = String(infer?.phase ?? "").toLowerCase();
+  const msg = String(infer?.message ?? "").trim();
+  if (phase === "ready" || (!lateInferJobBusy(infer) && !lateInferDownloadBusy && phase === "ready")) {
+    return `<div class="lateinfer-download-progress-inner" aria-live="polite"><p class="muted"><span class="pill ok">ready</span> ${escapeHtml(msg || "Ready on your computer — Start when IR is on the idle GPU.")}</p></div>`;
+  }
+  if (!lateInferJobBusy(infer) && !lateInferDownloadBusy) return "";
+  const probing = phase === "probing" || (/prob/i.test(msg) && !/download|compil/i.test(msg));
   const compiling = phase === "compiling" || (infer?.downloading && /compil/i.test(msg));
   const percent = Number(infer?.percent);
   const hasPercent = Number.isFinite(percent) && percent >= 0;
@@ -420,9 +435,12 @@ function lateInferDownloadProgressHtml(infer) {
   const bytes = Number(infer?.bytes);
   const total = Number(infer?.totalBytes);
   const eta = Number(infer?.etaSec);
-  const bar = compiling && !hasPercent
+  const bar = (compiling || probing) && !hasPercent
     ? ""
     : `<div class="progress" id="lateinfer-download-progress-bar" title="${hasPercent ? `${Math.round(percent)}%` : ""}"><span style="width:${width}%"></span></div>`;
+  if (probing) {
+    return `<div class="lateinfer-download-progress-inner" aria-live="polite"><p class="muted"><span class="lateinfer-compile-spinner" aria-hidden="true"></span> <span class="pill warn">probing</span> Probing Hub config / license…${msg && !/prob/i.test(msg) ? ` ${escapeHtml(msg)}` : ""}</p></div>`;
+  }
   if (compiling) {
     const pct = hasPercent ? ` ${escapeHtml(String(Math.round(percent)))}%` : "";
     return `<div class="lateinfer-download-progress-inner" aria-live="polite"><p class="muted"><span class="lateinfer-compile-spinner" aria-hidden="true"></span> <span class="pill warn">compiling</span> Compiling on your computer…${pct}${msg && !/compil/i.test(msg) ? ` ${escapeHtml(msg)}` : ""}</p>${bar}</div>`;
@@ -746,6 +764,9 @@ function hubModelGroupsForPicker(query) {
     models: (group.models ?? []).filter((model) => {
       if (lateInferOnComputerOnly && !(model.onComputer === true || hubModelOnComputer(model))) return false;
       if (!lateInferShowGated && (model.gated || model.gatedNeedsLicense)) return false;
+      if (lateInferFitsMyGpu && (model.fits === false || model.likelyTooBig === true) && !hubModelOnComputer(model)) {
+        return false;
+      }
       return true;
     }),
   })).filter((group) => group.models.length);
@@ -873,7 +894,7 @@ function renderLateInferHubListHtml(query) {
           } else if (gated) {
             availability = `<span class="pill warn" title="Accept the Hugging Face license, then set a read token in Settings → Local models">gated · locked</span>`;
           } else {
-            availability = `<span class="pill ok">ready to download</span>`;
+            availability = `<span class="pill ok">available to download</span>`;
           }
           const ovPill =
             model.ovExportOk === true
@@ -883,7 +904,7 @@ function renderLateInferHubListHtml(query) {
                 : "";
           return `
         <button type="button" role="option" data-hub-id="${escapeHtml(model.id)}" data-lateinfer-pane="store" data-on-computer="${onComputer ? "true" : "false"}" data-loadable="${loadable ? "true" : "false"}" data-gated="${gated ? "true" : "false"}" class="hub-model-option${selected ? " is-selected" : ""}${onComputer ? " is-on-computer" : ""}${demoted ? " is-demoted" : ""}${gated && loadable ? " is-gated-locked" : ""}" aria-selected="${selected ? "true" : "false"}">
-          <span class="hub-model-option-main">${escapeHtml(hubModelPickerLabel(model))} ${availability}${ovPill}${model.fallback ? ` <span class="muted">(fallback)</span>` : ""}${model.likelyTooBig || model.fits === false ? ` <span class="muted">(likely too big)</span>` : model.sizeUnknown ? ` <span class="muted">(size unknown)</span>` : ""}</span>
+          <span class="hub-model-option-main">${escapeHtml(hubModelPickerLabel(model))} ${availability}${ovPill}${model.fallback ? ` <span class="muted">(fallback)</span>` : ""}${model.likelyTooBig || model.fits === false ? ` <span class="pill warn" title="Peak VRAM estimate exceeds ~80% of idle compile-target GPU">over idle VRAM</span>` : model.sizeUnknown ? ` <span class="muted">(size unknown)</span>` : ""}</span>
           <span class="hub-model-option-vram">${escapeHtml(formatHubVramMax(model))}</span>
         </button>`;
         })
@@ -1752,6 +1773,40 @@ function messageTokensPerSec(m, now = Date.now()) {
   return formatTokensPerSec(tokens / elapsedSec);
 }
 
+function formatResearchLatency(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1000) return `${Math.round(n)} ms`;
+  const sec = n / 1000;
+  if (sec < 60) return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)} s`;
+  return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
+}
+
+/** Opt-in research metrics: tok/s, latency, VRAM, model id. */
+function messageResearchMetricsHtml(m, now = Date.now()) {
+  if (!chatShowTokensPerSec || !m || m.role === "user") return "";
+  const parts = [];
+  const tps = messageTokensPerSec(m, now);
+  if (tps) parts.push(tps);
+  let latency = "";
+  if (typeof m.latencyMs === "number" && Number.isFinite(m.latencyMs)) {
+    latency = formatResearchLatency(m.latencyMs);
+  } else if (m.status === "streaming" || m.status === "thinking") {
+    const started = m.thinkingStartedAt || m.createdAt;
+    if (started) latency = formatResearchLatency(now - started);
+  } else if (m.status === "finished") {
+    const started = m.thinkingStartedAt || m.createdAt;
+    if (started) latency = formatResearchLatency(now - started);
+  }
+  if (latency) parts.push(latency);
+  const vram = String(m.researchVramLabel || "").trim();
+  if (vram) parts.push(vram);
+  const modelId = String(m.researchModelId || m.chip || "").trim();
+  if (modelId && modelId.toLowerCase() !== "auto") parts.push(modelId);
+  if (!parts.length) return "";
+  return `<span class="tok-per-sec research-metrics" title="Research: tok/s · latency · VRAM · model id (not a billing meter)">${escapeHtml(parts.join(" · "))}</span>`;
+}
+
 function thinkingChipLabel(m, now = Date.now()) {
 
   const phase = m.thinkingPhase || (m.status === "streaming" ? "streaming" : "waiting");
@@ -1793,12 +1848,7 @@ function renderMessages() {
           ${avatarMarkup(m.speaker)}
           <span class="speaker">${escapeHtml(m.label || m.speaker || role)}</span>
           <span>${escapeHtml(formatTime(m.createdAt))}${escapeHtml(round)}</span>
-          ${(() => {
-            const tps = messageTokensPerSec(m, now);
-            return tps
-              ? `<span class="tok-per-sec" title="Research estimate (chars÷4 / elapsed) — not a billing meter">${escapeHtml(tps)}</span>`
-              : "";
-          })()}
+          ${messageResearchMetricsHtml(m, now)}
         </div>
         ${chip}
         ${bubble}
@@ -1920,9 +1970,9 @@ function ensureChatLayout() {
           <button type="submit" id="composer-send">Send</button>
         </div>
         <div class="composer-extras">
-          <label class="research-toggle" title="Research: estimate tokens per second for the active reply (chars÷4 / elapsed). Default off.">
+          <label class="research-toggle" title="Research: tok/s, latency, VRAM, and model id on replies. Default off.">
             <input type="checkbox" id="chat-show-tps" ${chatShowTokensPerSec ? "checked" : ""} />
-            Show tokens/sec <span class="muted">(research)</span>
+            Show research metrics <span class="muted">(tok/s · latency · VRAM · model)</span>
           </label>
         </div>
         <p class="hint">Auto | Debate | Single chooses speakers. Implement/install requires Approve before writes or host installs; Q&A and debate text stay unblocked. Drag a folder here to grant it (path must exist on this computer). Repo writes go to Cursor local or Approve apply-patch inside the allowlist.</p>
@@ -2749,6 +2799,7 @@ function renderLocalModels() {
                 <input id="lateinfer-hub-search" type="search" value="${escapeHtml(lateInferHubSearch)}" placeholder="Qwen, Mistral, Gemma…" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="lateinfer-hub-list" aria-autocomplete="list" />
               </label>
               <div class="lateinfer-hub-filters" role="group" aria-label="Hub store filters">
+                <label class="check-row" title="Hide Hub rows whose estimated peak VRAM exceeds ~80% of the idle compile-target GPU (not dual total). Default on."><input type="checkbox" id="lateinfer-fits-my-gpu"${lateInferFitsMyGpu ? " checked" : ""} /> Fits my GPU</label>
                 <label class="check-row"><input type="checkbox" id="lateinfer-on-computer-only"${lateInferOnComputerOnly ? " checked" : ""} /> On your computer only</label>
                 <label class="check-row" title="When off, gated repos are hidden. When on, they stay listed as locked until you accept the license and set a Hugging Face read token."><input type="checkbox" id="lateinfer-show-gated"${lateInferShowGated ? " checked" : ""} /> Show gated (locked until license + HF token)</label>
               </div>
@@ -3253,6 +3304,16 @@ document.addEventListener("change", (event) => {
 });
 
 $("main").addEventListener("change", async (event) => {
+  if (event.target?.id === "lateinfer-fits-my-gpu") {
+    lateInferFitsMyGpu = event.target.checked === true;
+    try {
+      sessionStorage.setItem("orchestrator.lateinfer.fitsMyGpu", lateInferFitsMyGpu ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    refreshLateInferHubList();
+    return;
+  }
   if (event.target?.id === "lateinfer-on-computer-only") {
     lateInferOnComputerOnly = event.target.checked === true;
     refreshLateInferHubList();

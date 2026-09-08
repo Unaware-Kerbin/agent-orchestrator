@@ -38,6 +38,12 @@ export interface ChatMessage {
   completionTokensEst?: number;
   /** Research: estimated tokens per second for the finished reply. */
   tokensPerSec?: number;
+  /** Research: wall-clock latency for the reply (ms). */
+  latencyMs?: number;
+  /** Research: model / backend id that produced the reply. */
+  researchModelId?: string;
+  /** Research: idle-GPU VRAM pair label when known (e.g. "2 GB / 32 GB"). */
+  researchVramLabel?: string;
 }
 
 export interface ChatHeartbeatPayload {

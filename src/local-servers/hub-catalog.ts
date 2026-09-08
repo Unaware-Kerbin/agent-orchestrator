@@ -309,10 +309,17 @@ export function emptyHubCatalog(input: {
   vendor?: HubServeVendor;
   runtimeOk?: boolean;
   serveLabel?: string;
+  /** Idle compile-target VRAM (one card). Prefer over total dual-GPU VRAM. */
+  idleVramMiB?: number;
+  /** 0.7 when compile target is the display GPU. */
+  displayCap?: number;
 }): HubCatalogResponse {
   const hardware = input.hardware ?? testDeps.hardware ?? detectHardware();
   const serve = resolveCatalogServe({ hardware, vendor: input.vendor, runtimeOk: input.runtimeOk, serveLabel: input.serveLabel });
-  const budgetMiB = hardwareFitBudgetMiB(hardware);
+  const budgetMiB = hardwareFitBudgetMiB(hardware, {
+    idleVramMiB: input.idleVramMiB,
+    displayCap: input.displayCap,
+  });
   const budgetGiB = Math.round((budgetMiB / 1024) * 10) / 10;
   const q = String(input.q ?? "").trim();
   const mapped = stampHubCatalogLoadability(
@@ -378,11 +385,33 @@ export function catalogHint(
   return listed;
 }
 
-export function hardwareFitBudgetMiB(hardware: HardwareSnapshot): number {
-  const vram = Number(hardware.totalVramMiB) > 0 ? hardware.totalVramMiB : Number(hardware.vramMiB) > 0 ? hardware.vramMiB : 0;
+/**
+ * Fit budget for late-infer Hub rows: ~80% of one idle compile-target card.
+ * Never use total dual-GPU VRAM (dual B70 would look like ~62 GB and hide nothing).
+ * Display-card override: pass `displayCap` (0.7) when the compile target is the monitor GPU.
+ */
+export function hardwareFitBudgetMiB(
+  hardware: HardwareSnapshot,
+  options: { displayCap?: number; idleVramMiB?: number } = {},
+): number {
   const ram = Math.max(0, Number(hardware.ramMiB) || 0);
+  const injected = Number(options.idleVramMiB);
+  const perCard =
+    Number.isFinite(injected) && injected > 0
+      ? injected
+      : Number(hardware.vramMiB) > 0
+        ? hardware.vramMiB
+        : Number(hardware.minVramMiB) > 0
+          ? hardware.minVramMiB
+          : 0;
   // Intel Arc / XPU has no nvidia-smi. Unknown GPU VRAM still lists against RAM so the catalog is not empty.
-  if (vram > 0) return vram * HUB_FIT_FRACTION;
+  if (perCard > 0) {
+    const cap =
+      typeof options.displayCap === "number" && Number.isFinite(options.displayCap) && options.displayCap > 0
+        ? Math.min(1, options.displayCap)
+        : 1;
+    return perCard * cap * HUB_FIT_FRACTION;
+  }
   return ram * HUB_FIT_FRACTION;
 }
 
@@ -660,7 +689,9 @@ export function toHubCatalogModel(row: HubRawModel, budgetMiB: number): HubCatal
     sizeMiB: weights.sizeMiB,
   });
   const sizeUnknown = estimated.sizeUnknown;
-  const likelyTooBig = !sizeUnknown && (estimated.sizeMiB ?? 0) > budgetMiB;
+  // Honest peak VRAM (weights + KV headroom) vs idle compile-target budget — not weight bytes alone.
+  const vramNeeded = estimated.vramMaxMiB ?? estimated.sizeMiB ?? 0;
+  const likelyTooBig = !sizeUnknown && vramNeeded > budgetMiB;
   return {
     ...estimated,
     fits: sizeUnknown || !likelyTooBig,
@@ -971,10 +1002,17 @@ export async function listHubModels(options: {
   fetchFn?: HubFetchFn;
   hardware?: HardwareSnapshot;
   token?: string;
+  /** Idle compile-target VRAM from gpu-pick (one B70), not dual total. */
+  idleVramMiB?: number;
+  /** DISPLAY_GPU_VRAM_CAP when compile target is the monitor card. */
+  displayCap?: number;
 } = {}): Promise<HubCatalogResponse> {
   try {
     const hardware = options.hardware ?? testDeps.hardware ?? detectHardware();
-    const budgetMiB = hardwareFitBudgetMiB(hardware);
+    const budgetMiB = hardwareFitBudgetMiB(hardware, {
+      idleVramMiB: options.idleVramMiB,
+      displayCap: options.displayCap,
+    });
     const budgetGiB = Math.round((budgetMiB / 1024) * 10) / 10;
     const q = String(options.q ?? "")
       .trim()
@@ -990,7 +1028,7 @@ export async function listHubModels(options: {
       try {
         const model = toHubCatalogModel(row, budgetMiB);
         if (!model) continue;
-        // Keep likelyTooBig (Intel Arc ~31 GB × 2 still lists Gemma 2B/E2B/4B; Download/compile fail closed).
+        // Keep likelyTooBig vs idle-card budget (~80% of one B70). Download/compile still fail closed.
         fromHub.push(model);
       } catch {
         // Soft-fail untypable Hub rows (bad payload / missing config metadata) — keep the rest of the list.

@@ -82,6 +82,12 @@ export function estimateTokensPerSec(text: string, startedAt: number | undefined
   return tokens / elapsedSec;
 }
 
+/** Research: wall-clock reply latency in ms. */
+export function estimateLatencyMs(startedAt: number | undefined, finishedAt = Date.now()): number | undefined {
+  if (!startedAt || !Number.isFinite(startedAt)) return undefined;
+  return Math.max(0, finishedAt - startedAt);
+}
+
 export class ChatService {
   readonly store = new ChatStore();
   private readonly queues = new Map<string, Promise<void>>();
@@ -743,6 +749,17 @@ export class ChatService {
     const startedAt = current?.thinkingStartedAt ?? current?.createdAt;
     const completionTokensEst = error ? undefined : estimateCompletionTokens(content);
     const tokensPerSec = error ? undefined : estimateTokensPerSec(content, startedAt, finishedAt);
+    const latencyMs =
+      startedAt && Number.isFinite(startedAt) ? Math.max(0, finishedAt - startedAt) : undefined;
+    const researchModelId = error
+      ? undefined
+      : String(
+          (run as { model?: string }).model ||
+            (run as { modelId?: string }).modelId ||
+            decision.chip ||
+            current?.speaker ||
+            "",
+        ) || undefined;
     this.store.patchMessage(threadId, messageId, {
       content,
       status: error ? "error" : "finished",
@@ -755,6 +772,8 @@ export class ChatService {
       suggestedAction: suggestedForRunError(run.error, decision),
       completionTokensEst,
       tokensPerSec,
+      latencyMs: error ? undefined : latencyMs,
+      researchModelId,
     });
     this.stopHeartbeatIfIdle(threadId);
     this.emit(this.store.get(threadId));

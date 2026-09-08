@@ -25,7 +25,7 @@ import {
 } from "./gpu-pick.js";
 import { FALLBACK_HUB_SEEDS } from "./hub-catalog.js";
 
-export type LateInferCompilePhase = "downloading" | "compiling" | "done" | "error";
+export type LateInferCompilePhase = "downloading" | "probing" | "compiling" | "ready" | "error";
 
 /** Public compile job. No cwd, allowlist, dest, or filesystem path. */
 export interface LateInferCompileJob {
@@ -403,7 +403,7 @@ export function deleteCompiledLateInfer(options: {
   if (
     currentJob &&
     compiledHubIdsMatch(currentJob.model, model) &&
-    (currentJob.phase === "downloading" || currentJob.phase === "compiling")
+    (currentJob.phase === "downloading" || currentJob.phase === "probing" || currentJob.phase === "compiling")
   ) {
     throw new LateInferCompiledDeleteError(
       "Download is still running for that snapshot on your computer. Wait until it finishes.",
@@ -442,6 +442,12 @@ function lateInferCompileEnv(bin?: string, plan?: GpuPickPlan): NodeJS.ProcessEn
   env.LATE_HF_HOME = lateHfHomeDir(env);
   const token = resolveHfToken();
   if (token && !env.HF_TOKEN?.trim()) env.HF_TOKEN = token;
+  // Intel OpenVINO path: skip mlc-llm PATH preflight (CUDA/MLC is not the idle Arc card).
+  const accel = String(env.LATE_INFER_ACCEL ?? plan?.env?.LATE_INFER_ACCEL ?? "").toLowerCase();
+  if (accel === "intel") {
+    env.LATE_INFER_SKIP_MLC_PREFLIGHT = "1";
+    env.LATE_INFER_SKIP_MLC = "1";
+  }
   return env;
 }
 
@@ -474,7 +480,11 @@ export function lateInferCompileView(): {
   const job = currentJob;
   if (!job) return { downloading: false };
   const failed = job.phase === "error" || Boolean(job.error);
-  const busy = !failed && (job.phase === "downloading" || job.phase === "compiling");
+  const busy =
+    !failed &&
+    (job.phase === "downloading" ||
+      job.phase === "probing" ||
+      job.phase === "compiling");
   return {
     downloading: busy,
     phase: job.phase,
@@ -483,7 +493,7 @@ export function lateInferCompileView(): {
     percent: job.percent,
     bytes: job.bytes,
     totalBytes: job.totalBytes,
-    etaSec: failed || job.phase === "done" ? undefined : job.etaSec,
+    etaSec: failed || job.phase === "ready" ? undefined : job.etaSec,
   };
 }
 
@@ -555,7 +565,11 @@ export function parseCompilePhase(text: string): LateInferCompilePhase | undefin
   ) {
     return "error";
   }
-  if (/compil/i.test(text)) return "compiling";
+  if (/\bready\b|compiled on your computer/i.test(text) && !/\bcompiling\b/i.test(text)) return "ready";
+  if (/\bcompiling\b|compil(e|ation|er)\b/i.test(text) && !/compiled on your computer/i.test(text)) return "compiling";
+  if (/\bprob(e|ing)\b|config\.json|gated access|license/i.test(text) && !/download/i.test(text) && !/compil/i.test(text)) {
+    return "probing";
+  }
   if (/download/i.test(text)) return "downloading";
   return undefined;
 }
@@ -601,7 +615,7 @@ function parseFiniteInt(raw: string | undefined): number | undefined {
 /** Parse late-infer `--compile-only` progress lines (bytes / total / percent / ETA). */
 export function parseCompileProgress(text: string): LateInferCompileProgress | undefined {
   const phase = parseCompilePhase(text);
-  const tagged = /\bprogress\s+phase=(downloading|compiling)\b/i.exec(text);
+  const tagged = /\bprogress\s+phase=(downloading|probing|compiling|ready)\b/i.exec(text);
   const bytes = parseFiniteInt(/\bbytes=(\d+)\b/i.exec(text)?.[1]);
   const totalBytes = parseFiniteInt(/\btotal=(\d+)\b/i.exec(text)?.[1]);
   const percentRaw = parseFiniteInt(/\bpercent=(\d+(?:\.\d+)?)\b/i.exec(text)?.[1]);
@@ -713,7 +727,7 @@ function applyProgressFields(chunk: string, now: number): void {
 
 function applyChunk(chunk: string, now: number): void {
   if (!currentJob) return;
-  if (currentJob.phase === "error" || currentJob.phase === "done") return;
+  if (currentJob.phase === "error" || currentJob.phase === "ready") return;
   const phase = parseCompilePhase(chunk);
   if (phase === "error") {
     // Bare first line is often just "Error: config.json"; Caused-by / HTTP status follow.
@@ -782,13 +796,13 @@ function finishJob(code: number | null, stderr: string, stdout: string, now: num
       );
       return;
     }
-    currentJob.phase = "done";
+    currentJob.phase = "ready";
     currentJob.downloading = false;
     currentJob.percent = 100;
     currentJob.etaSec = undefined;
     currentJob.ir = ir;
     currentJob.gpuReady = vendor === "amd" ? false : true;
-    currentJob.message = "compiled on your computer — ready for Start";
+    currentJob.message = "ready — compiled on your computer (Start when IR is on the idle GPU)";
     currentJob.error = undefined;
     return;
   }
@@ -807,7 +821,12 @@ export async function pullLateInfer(
   } & LateInferGpuOptions,
 ): Promise<LateInferCompileJob> {
   const model = parseModelId(options.model);
-  if (currentJob && (currentJob.phase === "downloading" || currentJob.phase === "compiling")) {
+  if (
+    currentJob &&
+    (currentJob.phase === "downloading" ||
+      currentJob.phase === "probing" ||
+      currentJob.phase === "compiling")
+  ) {
     return publicJob(currentJob);
   }
   const spec = lateInferCompileSpec(model, options);
@@ -821,8 +840,8 @@ export async function pullLateInfer(
     kind: "lateinfer",
     model,
     downloading: true,
-    phase: "downloading",
-    message: "downloading Hub snapshot…",
+    phase: "probing",
+    message: "probing Hub config / license…",
     startedAt: now,
     updatedAt: now,
     percent: 0,
@@ -847,6 +866,10 @@ export async function pullLateInfer(
     markJobError(message, Date.now());
     return publicJob(currentJob);
   }
+  if (currentJob.phase === "error") return publicJob(currentJob);
+  currentJob.phase = "downloading";
+  currentJob.message = "downloading Hub snapshot…";
+  currentJob.updatedAt = Date.now();
   const env = lateInferCompileEnv(bin, spec.gpu);
   const run = options.spawnFn ?? spawnImpl;
   const child = run(bin, spec.args, {
