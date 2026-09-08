@@ -276,8 +276,9 @@ Local inference is **local-first**: engines bind loopback only (127.0.0.1 — ne
 
 - Built from the sibling Late crate (LATE_INFER_CRATE / LATE_CHECKOUT / Local_AI_Terminal_Emulator) into bin/ and runtime/bin. MCP-only processes do not build or spawn it.
 - Compile path: late-infer --compile-only --model HubId. On Intel, Start needs OpenVINO IR on disk (.../compiled/slug/openvino/openvino_model.xml). Missing IR means Start refused. NVIDIA uses Candle/MLC when eligible; AMD HIP serve is fail-closed.
-- Hub catalog (hub-catalog.ts + hub-serve.ts) lists snapshots the idle GPU can compile/serve. Gemma3/4 visual-only Optimum types are not OpenVINO CausalLM text-generation-with-past.
-- Default Hub id when unset: Qwen/Qwen2.5-0.5B-Instruct.
+- Hub catalog (hub-catalog.ts + hub-serve.ts) lists safetensors CausalLM snapshots for late-infer (not GGUF — that is the llama.cpp Hub store). Rows are pre-screened with `ovExportOk` / `loadable` from known `model_type` plus an optional cached config.json probe (soft-fail). Loadable + ungated sort first (newest among those); broken config / OV-incompatible graphs are demoted. Gemma3/4 visual-only Optimum types are not OpenVINO CausalLM text-generation-with-past. Gemma2 is not the primary default.
+- Hub store UI: checkbox to hide gated models or show them locked until license accept + HF read token; clearer gated path before Download.
+- Default Hub id when unset: Qwen/Qwen2.5-0.5B-Instruct (prefers loadable ungated over Gemma2).
 
 ### Ollama
 

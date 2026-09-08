@@ -233,6 +233,18 @@ let lateInferHubCatalog = {
 let lateInferHubSearch = "";
 let lateInferHubSearchTimer = null;
 let lateInferOnComputerOnly = false;
+/** When false, hide gated Hub rows. When true, show gated but locked until license + HF token. */
+let lateInferShowGated = (() => {
+  try {
+    const v = sessionStorage.getItem("orchestrator.lateinfer.showGated");
+    if (v === "0") return false;
+    if (v === "1") return true;
+  } catch {
+    /* ignore */
+  }
+  return true;
+})();
+let lateInferHfTokenSet = false;
 let llamaGgufCatalog = {
   models: [],
   hint: "",
@@ -518,8 +530,30 @@ function parseHubVersionScore(version, id) {
   return 0;
 }
 
+function hubModelIsLoadable(model) {
+  if (model?.loadable === false) return false;
+  if (model?.configStatus === "missing") return false;
+  if (model?.ovExportOk === false && model?.backends?.lateinfer === false) return false;
+  return model?.loadable !== false;
+}
+
+function hubModelIsGemma2(model) {
+  const t = String(model?.modelType ?? "").toLowerCase();
+  if (t === "gemma2") return true;
+  return /gemma-?2/i.test(String(model?.id ?? ""));
+}
+
 function compareHubModelNewestFirst(a, b) {
   if (Boolean(a.onComputer) !== Boolean(b.onComputer)) return a.onComputer ? -1 : 1;
+  const aLoad = hubModelIsLoadable(a);
+  const bLoad = hubModelIsLoadable(b);
+  if (aLoad !== bLoad) return aLoad ? -1 : 1;
+  const aGate = Boolean(a.gated || a.gatedNeedsLicense);
+  const bGate = Boolean(b.gated || b.gatedNeedsLicense);
+  if (aLoad && bLoad && aGate !== bGate) return aGate ? 1 : -1;
+  const aGemma2 = hubModelIsGemma2(a);
+  const bGemma2 = hubModelIsGemma2(b);
+  if (aLoad && bLoad && aGemma2 !== bGemma2) return aGemma2 ? 1 : -1;
   if (Boolean(a.fallback) !== Boolean(b.fallback)) return a.fallback ? -1 : 1;
   const score = (model) => {
     if (typeof model.version === "number" && Number.isFinite(model.version)) return model.version * 100;
@@ -621,6 +655,13 @@ function mergeLateInferHubWithFallback(fromHub) {
       vramMaxMiB: next.vramMaxMiB ?? prev?.vramMaxMiB,
       vramMaxGiB: next.vramMaxGiB ?? prev?.vramMaxGiB,
       vramMaxLabel: next.vramMaxLabel ?? prev?.vramMaxLabel,
+      modelType: next.modelType ?? prev?.modelType,
+      ovExportOk: next.ovExportOk ?? prev?.ovExportOk,
+      loadable: next.loadable ?? prev?.loadable,
+      configStatus: next.configStatus ?? prev?.configStatus,
+      serveBlockedReason: next.serveBlockedReason ?? prev?.serveBlockedReason,
+      downloadable: next.downloadable ?? prev?.downloadable,
+      backends: next.backends ?? prev?.backends,
     });
   }
   return [...byId.values()];
@@ -692,7 +733,11 @@ function hubModelGroupsForPicker(query) {
   const sourceGroups = groupLateInferHubModels(merged);
   const grouped = sourceGroups.map((group) => ({
     family: hubFamilyDisplayName(group.family),
-    models: (group.models ?? []).filter((model) => !lateInferOnComputerOnly || model.onComputer === true || hubModelOnComputer(model)),
+    models: (group.models ?? []).filter((model) => {
+      if (lateInferOnComputerOnly && !(model.onComputer === true || hubModelOnComputer(model))) return false;
+      if (!lateInferShowGated && (model.gated || model.gatedNeedsLicense)) return false;
+      return true;
+    }),
   })).filter((group) => group.models.length);
   if (!needle) return grouped;
   return grouped
@@ -801,9 +846,34 @@ function renderLateInferHubListHtml(query) {
         .map((model) => {
           const selected = model.id === lateInferHubId;
           const onComputer = model.onComputer === true || hubModelOnComputer(model);
+          const loadable = hubModelIsLoadable(model);
+          const gated = Boolean(model.gated || model.gatedNeedsLicense);
+          const demoted = !loadable;
+          let availability;
+          if (onComputer) {
+            availability = `<span class="pill ok">on your computer</span>`;
+          } else if (!loadable) {
+            const why =
+              model.configStatus === "missing"
+                ? "missing config.json"
+                : model.serveBlockedReason
+                  ? "not for this GPU"
+                  : "not loadable";
+            availability = `<span class="pill bad" title="${escapeHtml(model.serveBlockedReason || why)}">${escapeHtml(why)}</span>`;
+          } else if (gated) {
+            availability = `<span class="pill warn" title="Accept the Hugging Face license, then set a read token in Settings → Local models">gated · locked</span>`;
+          } else {
+            availability = `<span class="pill ok">ready to download</span>`;
+          }
+          const ovPill =
+            model.ovExportOk === true
+              ? ` <span class="pill ok" title="OpenVINO CausalLM export ok">OV ok</span>`
+              : model.ovExportOk === false
+                ? ` <span class="pill bad" title="${escapeHtml(model.serveBlockedReason || "Not OpenVINO CausalLM on this GPU")}">OV no</span>`
+                : "";
           return `
-        <button type="button" role="option" data-hub-id="${escapeHtml(model.id)}" data-lateinfer-pane="store" data-on-computer="${onComputer ? "true" : "false"}" class="hub-model-option${selected ? " is-selected" : ""}${onComputer ? " is-on-computer" : ""}" aria-selected="${selected ? "true" : "false"}">
-          <span class="hub-model-option-main">${escapeHtml(hubModelPickerLabel(model))} ${onComputer ? `<span class="pill ok">on your computer</span>` : `<span class="pill warn">available to download</span>`}${model.fallback ? ` <span class="muted">(fallback)</span>` : ""}${model.gated || model.gatedNeedsLicense ? ` <span class="pill warn" title="Needs Hugging Face license accept + read token">gated</span>` : ""}${model.likelyTooBig || model.fits === false ? ` <span class="muted">(likely too big)</span>` : model.sizeUnknown ? ` <span class="muted">(size unknown)</span>` : ""}</span>
+        <button type="button" role="option" data-hub-id="${escapeHtml(model.id)}" data-lateinfer-pane="store" data-on-computer="${onComputer ? "true" : "false"}" data-loadable="${loadable ? "true" : "false"}" data-gated="${gated ? "true" : "false"}" class="hub-model-option${selected ? " is-selected" : ""}${onComputer ? " is-on-computer" : ""}${demoted ? " is-demoted" : ""}${gated && loadable ? " is-gated-locked" : ""}" aria-selected="${selected ? "true" : "false"}">
+          <span class="hub-model-option-main">${escapeHtml(hubModelPickerLabel(model))} ${availability}${ovPill}${model.fallback ? ` <span class="muted">(fallback)</span>` : ""}${model.likelyTooBig || model.fits === false ? ` <span class="muted">(likely too big)</span>` : model.sizeUnknown ? ` <span class="muted">(size unknown)</span>` : ""}</span>
           <span class="hub-model-option-vram">${escapeHtml(formatHubVramMax(model))}</span>
         </button>`;
         })
@@ -923,11 +993,34 @@ function selectedCompiledVramMaxMiB() {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+function findLateInferHubCatalogModel(hubId) {
+  const id = String(hubId ?? "").trim();
+  if (!id) return undefined;
+  const merged = mergeLateInferHubWithFallback([
+    ...(lateInferHubCatalog.models ?? []),
+    ...(lateInferHubCatalog.groups ?? []).flatMap((group) => group.models ?? []),
+  ]);
+  return merged.find((model) => model.id === id);
+}
+
 function lateInferCheckStatusText(hubId) {
   const id = String(hubId ?? "").trim();
   if (!id) return "Select a Hub snapshot to see if it is already compiled on your computer.";
   if (lateInferCompiledIdSet().has(id)) {
     return `${id} is already compiled on your computer — it is in the pane on the right.`;
+  }
+  const model = findLateInferHubCatalogModel(id);
+  if (model?.configStatus === "missing") {
+    return `${id} has no config.json on Hugging Face — late-infer cannot compile it. Use a safetensors Instruct snapshot (GGUF → llama.cpp).`;
+  }
+  if (model && hubModelIsLoadable(model) === false) {
+    return `${id} is not loadable on this GPU${model.serveBlockedReason ? ` — ${model.serveBlockedReason}` : "."}`;
+  }
+  if (model?.gated || model?.gatedNeedsLicense) {
+    if (!lateInferHfTokenSet) {
+      return `${id} is gated. Accept the license on the Hugging Face model card, then save a read token in Settings → Local models before Download.`;
+    }
+    return `${id} is gated. Accept the Hugging Face license (if you have not), then Download with your saved read token.`;
   }
   return `${id} is not compiled on your computer yet. Download first.`;
 }
@@ -2534,6 +2627,7 @@ function renderLocalModels() {
   const lateInferDlBusy = lateInferBusy(localServers.lateinfer);
   const lateInferCompiledListHtml = renderLateInferCompiledListHtml();
   const hfTokenSet = Boolean(data.hfTokenSet);
+  lateInferHfTokenSet = hfTokenSet;
   $("main").innerHTML = `
     <div class="page-title">
       <div>
@@ -2579,7 +2673,7 @@ function renderLocalModels() {
         <div class="lateinfer-panes">
           <section class="lateinfer-pane lateinfer-store-pane" data-lateinfer-pane="store">
             <h3>Hub store</h3>
-            <p class="muted">Safetensors chat models for OpenVINO compile — not the full Hugging Face website. GGUF → llama.cpp. vLLM has its own weights pane. Search, click a row, or paste any Hub id, then Check / Download. Each row shows estimated VRAM at max usage.</p>
+            <p class="muted">Safetensors CausalLM chat models for OpenVINO / late-infer — not the full Hugging Face website. Compatible / loadable rows sort first (newest among those). Broken config.json and OV-incompatible graphs are demoted. GGUF → llama.cpp. vLLM has its own weights pane. Use the gated checkbox to hide or show locked gated repos.</p>
             <div class="lateinfer-hub-picker">
               <label class="field lateinfer-hub-field" for="lateinfer-hub">Hub id (Hugging Face Instruct)
                 <input id="lateinfer-hub" type="text" value="${escapeHtml(lateInferHubId)}" placeholder="${escapeHtml(lateInferHubDefaultId())}" autocomplete="off" spellcheck="false" />
@@ -2587,9 +2681,13 @@ function renderLocalModels() {
               <label class="field" for="lateinfer-hub-search">Search listed models
                 <input id="lateinfer-hub-search" type="search" value="${escapeHtml(lateInferHubSearch)}" placeholder="Qwen, Mistral, Gemma…" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="lateinfer-hub-list" aria-autocomplete="list" />
               </label>
-              <label class="check-row"><input type="checkbox" id="lateinfer-on-computer-only"${lateInferOnComputerOnly ? " checked" : ""} /> On your computer only</label>
+              <div class="lateinfer-hub-filters" role="group" aria-label="Hub store filters">
+                <label class="check-row"><input type="checkbox" id="lateinfer-on-computer-only"${lateInferOnComputerOnly ? " checked" : ""} /> On your computer only</label>
+                <label class="check-row" title="When off, gated repos are hidden. When on, they stay listed as locked until you accept the license and set a Hugging Face read token."><input type="checkbox" id="lateinfer-show-gated"${lateInferShowGated ? " checked" : ""} /> Show gated (locked until license + HF token)</label>
+              </div>
+              <p class="muted" id="lateinfer-gated-help">Gated rows need two steps before Download: accept the model license on Hugging Face, then save a read token under Settings → Local models. Unsloth GGUF stays under llama.cpp — this list is safetensors CausalLM only.</p>
               <p class="error" id="lateinfer-hub-status"${lateInferHubCatalog.offline ? "" : " hidden"}>${lateInferHubCatalog.offline ? "Hugging Face Hub is offline. Listed ids below still Download on your computer." : ""}</p>
-              <p class="muted" id="lateinfer-hub-list-label">Hugging Face store</p>
+              <p class="muted" id="lateinfer-hub-list-label">Hugging Face store (loadable + ungated first)</p>
               <div id="lateinfer-hub-list" class="lateinfer-hub-list" role="listbox" aria-labelledby="lateinfer-hub-list-label">${renderLateInferHubListHtml(lateInferHubSearch)}</div>
               <p class="muted" id="lateinfer-hub-hint">${escapeHtml(lateInferHubHintText())}</p>
               <p class="muted" id="lateinfer-check-status">${escapeHtml(lateInferCheckStatusText(lateInferHubId))}</p>
@@ -3093,6 +3191,16 @@ $("main").addEventListener("change", async (event) => {
     refreshLateInferHubList();
     return;
   }
+  if (event.target?.id === "lateinfer-show-gated") {
+    lateInferShowGated = event.target.checked === true;
+    try {
+      sessionStorage.setItem("orchestrator.lateinfer.showGated", lateInferShowGated ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    refreshLateInferHubList();
+    return;
+  }
   if (event.target?.id === "lateinfer-use-all-gpus") {
     lateInferUseAllGpus = event.target.checked === true;
     return;
@@ -3429,6 +3537,38 @@ $("main").addEventListener("click", async (event) => {
       const reason = gpu.compileReason || gpu.runtimeReason || "This compiler cannot compile for the GPU on your computer.";
       if ($("local-models-status")) $("local-models-status").innerHTML = flash(reason, "bad");
       return;
+    }
+    const catalogModel = findLateInferHubCatalogModel(hubId);
+    if (catalogModel && hubModelIsLoadable(catalogModel) === false) {
+      const reason =
+        catalogModel.serveBlockedReason ||
+        (catalogModel.configStatus === "missing"
+          ? "Hub config.json is missing — pick a safetensors Instruct snapshot. GGUF belongs under llama.cpp."
+          : "This snapshot is not loadable for late-infer on this GPU.");
+      if ($("local-models-status")) $("local-models-status").innerHTML = flash(reason, "bad");
+      refreshLateInferCheckStatus();
+      return;
+    }
+    if (catalogModel?.gated || catalogModel?.gatedNeedsLicense) {
+      if (!lateInferHfTokenSet) {
+        if ($("local-models-status")) {
+          $("local-models-status").innerHTML = flash(
+            `${hubId} is gated. Accept the license on the Hugging Face model card, then save a read token in Settings → Local models before Download.`,
+            "bad",
+          );
+        }
+        refreshLateInferCheckStatus();
+        const tokenForm = $("hf-token-form");
+        if (tokenForm?.scrollIntoView) tokenForm.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+      const proceed = window.confirm(
+        `${hubId} is gated on Hugging Face.\n\nBefore Download:\n1) Accept the model license on the Hub model card (while logged in)\n2) Ensure a read HF token is saved in Settings → Local models\n\nContinue Download?`,
+      );
+      if (!proceed) {
+        refreshLateInferCheckStatus();
+        return;
+      }
     }
     try {
       lateInferHubId = hubId;

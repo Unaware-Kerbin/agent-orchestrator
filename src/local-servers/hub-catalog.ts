@@ -10,6 +10,10 @@ import { DEFAULT_LATE_INFER_MODEL } from "./loopback.js";
 import {
   hubServeDecision,
   inferHubModelType,
+  openvinoCanExportCausalLm,
+  probeHubConfigJson,
+  resetHubConfigProbeCacheForTests,
+  type HubConfigProbeStatus,
   type HubServeVendor,
 } from "./hub-serve.js";
 import { attachHubBackends, type HubBackendSupport } from "./hub-backends.js";
@@ -151,6 +155,17 @@ export interface HubCatalogModel {
   gatedNeedsLicense?: boolean;
   /** False when gated without license, or this GPU cannot serve the graph. */
   downloadable?: boolean;
+  /** Optimum OpenVINO CausalLM export ok for this model_type (Intel path). */
+  ovExportOk?: boolean;
+  /**
+   * True when this idle GPU can compile/serve the graph and config.json is not known-broken.
+   * Gated repos can still be loadable (architecture ok) while downloadable is false.
+   */
+  loadable?: boolean;
+  /** Soft-fail config.json probe: missing/denied demote loadable; unprobed is fine. */
+  configStatus?: HubConfigProbeStatus;
+  /** Why Start/compile would fail on this GPU (empty when loadable). */
+  serveBlockedReason?: string;
   /** transformers config.model_type (inferred from the Hub id when missing). */
   modelType?: string;
   /** Built-in store row so the GUI is never an empty paste box. */
@@ -209,6 +224,7 @@ function hubCacheKey(search: string, hasToken: boolean): string {
 
 export function resetHubCatalogForTests(deps: CatalogDeps = {}): void {
   hubCache.clear();
+  resetHubConfigProbeCacheForTests();
   testDeps = deps;
 }
 
@@ -269,6 +285,10 @@ export function mergeHubCatalog(fromHub: readonly HubCatalogModel[], fallback = 
         params: next.params ?? prev?.params,
         bytes: next.bytes ?? prev?.bytes,
         modelType: next.modelType ?? prev?.modelType,
+        ovExportOk: next.ovExportOk ?? prev?.ovExportOk,
+        loadable: next.loadable ?? prev?.loadable,
+        configStatus: next.configStatus ?? prev?.configStatus,
+        serveBlockedReason: next.serveBlockedReason ?? prev?.serveBlockedReason,
         ...(isSeed ? { fallback: true, likelyTooBig: false, fits: true } : {}),
       }),
     );
@@ -296,8 +316,10 @@ export function emptyHubCatalog(input: {
   const budgetMiB = hardwareFitBudgetMiB(hardware);
   const budgetGiB = Math.round((budgetMiB / 1024) * 10) / 10;
   const q = String(input.q ?? "").trim();
-  const mapped = fallbackHubCatalogModelsForVendor(serve.vendor, serve.runtimeOk).filter((model) =>
-    matchesQuery(model, q),
+  const mapped = stampHubCatalogLoadability(
+    fallbackHubCatalogModelsForVendor(serve.vendor, serve.runtimeOk).filter((model) => matchesQuery(model, q)),
+    serve.vendor,
+    serve.runtimeOk,
   );
   const groups = groupHubModels(mapped);
   return {
@@ -317,8 +339,19 @@ export function emptyHubCatalog(input: {
 }
 
 function defaultHubIdForServe(models: readonly HubCatalogModel[]): string {
-  if (models.some((m) => m.id === DEFAULT_LATE_INFER_MODEL)) return DEFAULT_LATE_INFER_MODEL;
-  return models[0]?.id || DEFAULT_LATE_INFER_MODEL;
+  const list = [...models];
+  const prefer = (pred: (m: HubCatalogModel) => boolean) => list.find(pred)?.id;
+  if (list.some((m) => m.id === DEFAULT_LATE_INFER_MODEL && isHubLoadable(m))) {
+    return DEFAULT_LATE_INFER_MODEL;
+  }
+  const loadableUngated =
+    prefer((m) => isHubLoadable(m) && !m.gated && !isGemma2Primary(m)) ||
+    prefer((m) => isHubLoadable(m) && !m.gated);
+  if (loadableUngated) return loadableUngated;
+  const loadable = prefer((m) => isHubLoadable(m) && !isGemma2Primary(m)) || prefer((m) => isHubLoadable(m));
+  if (loadable) return loadable;
+  if (list.some((m) => m.id === DEFAULT_LATE_INFER_MODEL)) return DEFAULT_LATE_INFER_MODEL;
+  return list[0]?.id || DEFAULT_LATE_INFER_MODEL;
 }
 
 export function catalogHint(
@@ -336,7 +369,7 @@ export function catalogHint(
         : serve?.vendor === "amd"
           ? "the idle AMD GPU on your computer"
           : "the idle GPU on your computer");
-  const listed = `Safetensors chat models for OpenVINO / late-infer compile on ${gpu} (~${n} GB) — not the full Hugging Face website. GGUF-only models appear under llama.cpp. vLLM has its own weights pane. Each row can actually compile for this card. VRAM at max usage (weights plus KV cache) is shown. Gated repos need the Hugging Face license accepted first. Search, click a row, or paste any Hub org/model id, then Download.`;
+  const listed = `Safetensors CausalLM chat models for OpenVINO / late-infer compile on ${gpu} (~${n} GB) — not the full Hugging Face website. Loadable/OpenVINO-ready rows sort first (newest among those). Broken config.json or incompatible graphs are demoted. GGUF-only models appear under llama.cpp. vLLM has its own weights pane. Gated repos need license accept + HF read token before Download. Search, click a row, or paste any Hub org/model id, then Download.`;
   if (serve?.vendor === "amd" || serve?.runtimeOk === false) {
     return `${listed} This GPU cannot Start Hub Instruct snapshots yet.`;
   }
@@ -647,14 +680,139 @@ export function hubRowGated(row: HubRawModel): boolean {
   return false;
 }
 
+const CONFIG_PROBE_LIMIT = 12;
+
+/** Stamp ovExportOk / loadable / downloadable from known model_type + serve decision (no network). */
+export function applyHubLoadability(
+  model: HubCatalogModel,
+  vendor: HubServeVendor | undefined,
+  runtimeOk = true,
+): HubCatalogModel {
+  const modelType = inferHubModelType(model.id, model.modelType) || model.modelType;
+  const decision = hubServeDecision(vendor, { id: model.id, modelType }, runtimeOk);
+  const ovExportOk = modelType ? openvinoCanExportCausalLm(modelType) : false;
+  const configStatus: HubConfigProbeStatus = model.configStatus ?? "unprobed";
+  const configBroken = configStatus === "missing";
+  const archOk = decision.ok;
+  const loadable = archOk && !configBroken;
+  const gated = Boolean(model.gated) || configStatus === "denied";
+  return withVramEstimate({
+    ...model,
+    modelType: modelType || model.modelType,
+    ovExportOk,
+    loadable,
+    configStatus,
+    serveBlockedReason: decision.ok
+      ? configBroken
+        ? "Hub config.json is missing — late-infer cannot compile this snapshot."
+        : undefined
+      : decision.reason,
+    gated,
+    gatedNeedsLicense: gated || Boolean(model.gatedNeedsLicense),
+    downloadable: loadable && !gated,
+  });
+}
+
+export function stampHubCatalogLoadability(
+  models: readonly HubCatalogModel[],
+  vendor: HubServeVendor | undefined,
+  runtimeOk = true,
+): HubCatalogModel[] {
+  return models.map((model) => applyHubLoadability(model, vendor, runtimeOk));
+}
+
+function shouldProbeHubConfig(model: HubCatalogModel): boolean {
+  if (model.configStatus && model.configStatus !== "unprobed") return false;
+  // Optional lightweight probe only when model_type is unknown — Hub list usually expands config.
+  const type = String(model.modelType ?? "").trim();
+  return !type;
+}
+
+async function enrichHubCatalogWithConfigProbes(options: {
+  models: HubCatalogModel[];
+  fetchFn: HubFetchFn;
+  token?: string;
+  vendor: HubServeVendor;
+  runtimeOk: boolean;
+  now: number;
+}): Promise<HubCatalogModel[]> {
+  const stamped = stampHubCatalogLoadability(options.models, options.vendor, options.runtimeOk);
+  const probeTargets = stamped
+    .filter(shouldProbeHubConfig)
+    .sort(compareHubModels)
+    .slice(0, CONFIG_PROBE_LIMIT);
+  if (probeTargets.length === 0) return stamped;
+
+  const byId = new Map(stamped.map((m) => [m.id, m]));
+  await Promise.all(
+    probeTargets.map(async (model) => {
+      const probed = await probeHubConfigJson({
+        id: model.id,
+        fetchFn: options.fetchFn,
+        token: options.token,
+        now: options.now,
+      });
+      const prev = byId.get(model.id) ?? model;
+      const nextType = probed.modelType || prev.modelType;
+      let next: HubCatalogModel = {
+        ...prev,
+        modelType: nextType,
+        configStatus: probed.status,
+      };
+      if (probed.status === "denied") {
+        next = {
+          ...next,
+          gated: true,
+          gatedKnown: true,
+          gatedNeedsLicense: true,
+        };
+      }
+      if (probed.status === "missing") {
+        next = {
+          ...next,
+          loadable: false,
+          downloadable: false,
+          serveBlockedReason:
+            "Hub config.json is missing — late-infer needs a safetensors Instruct snapshot with config.json. GGUF-only packs belong under llama.cpp.",
+        };
+      }
+      byId.set(model.id, applyHubLoadability(next, options.vendor, options.runtimeOk));
+    }),
+  );
+  return [...byId.values()];
+}
+
 function lastModifiedMs(value: string | undefined): number {
   if (!value) return 0;
   const t = Date.parse(value);
   return Number.isFinite(t) ? t : 0;
 }
 
-/** Newest generation first, then Hub lastModified, then fit, then size, then name. Fallback is a seed of ids, not a sort key. */
+function isHubLoadable(model: HubCatalogModel): boolean {
+  return model.loadable !== false;
+}
+
+function isGemma2Primary(model: HubCatalogModel): boolean {
+  const t = String(model.modelType ?? "").toLowerCase();
+  if (t === "gemma2") return true;
+  return /gemma-?2/i.test(model.id);
+}
+
+/**
+ * Prefer loadable+ungated, then newest lastModified among loadable.
+ * Demote config-broken / OV-incompatible. Official seeds still beat noisy finetunes
+ * within the same loadable/gated tier. Gemma2 is never primary over Qwen3/other loadable.
+ */
 export function compareHubModels(a: HubCatalogModel, b: HubCatalogModel): number {
+  const aLoad = isHubLoadable(a);
+  const bLoad = isHubLoadable(b);
+  if (aLoad !== bLoad) return aLoad ? -1 : 1;
+  const aGate = Boolean(a.gated);
+  const bGate = Boolean(b.gated);
+  if (aLoad && bLoad && aGate !== bGate) return aGate ? 1 : -1;
+  const aGemma2 = isGemma2Primary(a);
+  const bGemma2 = isGemma2Primary(b);
+  if (aLoad && bLoad && aGemma2 !== bGemma2) return aGemma2 ? 1 : -1;
   const aSeed = a.fallback === true || FALLBACK_HUB_SEEDS.some((s) => s.id === a.id);
   const bSeed = b.fallback === true || FALLBACK_HUB_SEEDS.some((s) => s.id === b.id);
   if (aSeed !== bSeed) return aSeed ? -1 : 1;
@@ -837,18 +995,30 @@ export async function listHubModels(options: {
         continue;
       }
     }
-    const mapped = mergeHubCatalog(fromHub).filter((model) => matchesQuery(model, q));
-    const groups = groupHubModels(mapped);
+    const serve = resolveCatalogServe({ hardware });
+    const merged = mergeHubCatalog(fromHub).filter((model) => matchesQuery(model, q));
+    const enriched = await enrichHubCatalogWithConfigProbes({
+      models: merged,
+      fetchFn,
+      token,
+      vendor: serve.vendor,
+      runtimeOk: serve.runtimeOk,
+      now,
+    });
+    const groups = groupHubModels(enriched);
     const models = groups.flatMap((g) => g.models);
     return {
       models,
       groups,
-      defaultId: DEFAULT_LATE_INFER_MODEL,
+      defaultId: defaultHubIdForServe(models),
       budgetMiB,
       budgetGiB,
-      hint: catalogHint(budgetGiB, offline),
+      hint: catalogHint(budgetGiB, offline, serve),
       offline,
       usedFallback: offline || fromHub.length === 0,
+      serveVendor: serve.vendor,
+      serveLabel: serve.label,
+      runtimeOk: serve.runtimeOk,
       ...(offline && fetched.error ? { error: fetched.error } : {}),
     };
   } catch (error) {

@@ -809,6 +809,28 @@ input[type="file"] {
 #lateinfer-check-status.ok {
   color: var(--ok);
 }
+.lateinfer-hub-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin: 0.35rem 0 0.15rem;
+}
+#lateinfer-gated-help {
+  margin: 0.15rem 0 0.35rem;
+}
+.hub-model-option.is-demoted {
+  opacity: 0.55;
+}
+.hub-model-option.is-demoted .hub-model-option-main {
+  color: var(--muted, #8b93a7);
+}
+.hub-model-option.is-gated-locked:not(.is-demoted) {
+  border-style: dashed;
+}
+.pill.bad {
+  background: color-mix(in srgb, #c44 35%, transparent);
+  color: #ffd7d7;
+}
 .hub-model-option.is-on-computer {
   box-shadow: inset 3px 0 0 var(--ok);
 }

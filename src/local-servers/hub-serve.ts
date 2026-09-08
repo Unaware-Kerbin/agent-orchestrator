@@ -17,6 +17,15 @@ export type HubServeVendor = AcceleratorVendor | "cpu" | "";
 
 export type HubRepoAccess = "ok" | "denied" | "unknown";
 
+/** Lightweight config.json probe outcome for Hub browse pre-screen (soft-fail). */
+export type HubConfigProbeStatus = "ok" | "missing" | "denied" | "unknown" | "unprobed";
+
+export interface HubConfigProbeResult {
+  access: HubRepoAccess;
+  status: HubConfigProbeStatus;
+  modelType?: string;
+}
+
 const HF_HUB_ORIGIN = "https://huggingface.co";
 const PROBE_TIMEOUT_MS = 5_000;
 
@@ -354,4 +363,98 @@ export async function probeHubRepoAccess(options: {
   const head = await tryMethod("HEAD");
   if (head !== "unknown") return head;
   return tryMethod("GET");
+}
+
+const CONFIG_PROBE_CACHE_TTL_MS = 300_000;
+const configProbeCache = new Map<string, { at: number; result: HubConfigProbeResult }>();
+
+export function resetHubConfigProbeCacheForTests(): void {
+  configProbeCache.clear();
+}
+
+/**
+ * Soft-fail config.json probe for late-infer browse pre-screen.
+ * Never fetches safetensors shards. Cached briefly. Missing/denied demote loadable.
+ */
+export async function probeHubConfigJson(options: {
+  id: string;
+  fetchFn: (input: string | URL, init?: RequestInit) => Promise<Response>;
+  token?: string;
+  now?: number;
+}): Promise<HubConfigProbeResult> {
+  const id = String(options.id ?? "").trim();
+  const url = hubConfigResolveUrl(id);
+  if (!url) return { access: "unknown", status: "unknown" };
+  const hasToken = Boolean(options.token);
+  const cacheKey = `${hasToken ? "t" : "p"}:${id.toLowerCase()}`;
+  const now = options.now ?? Date.now();
+  const cached = configProbeCache.get(cacheKey);
+  if (cached && now - cached.at < CONFIG_PROBE_CACHE_TTL_MS) return cached.result;
+
+  const headers: Record<string, string> = {
+    accept: "application/json, application/octet-stream, */*",
+    "user-agent": "agent-orchestrator",
+  };
+  if (options.token) headers.authorization = `Bearer ${options.token}`;
+
+  let res: Response;
+  try {
+    res = await options.fetchFn(url, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+  } catch {
+    const result: HubConfigProbeResult = { access: "unknown", status: "unknown" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    const result: HubConfigProbeResult = { access: "denied", status: "denied" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+  if (res.status === 404) {
+    const result: HubConfigProbeResult = { access: "unknown", status: "missing" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+  if (!res.ok) {
+    const result: HubConfigProbeResult = { access: "unknown", status: "unknown" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("text/html")) {
+    const result: HubConfigProbeResult = { access: "unknown", status: "unknown" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+
+  let modelType: string | undefined;
+  try {
+    const body: unknown = await res.json();
+    if (body && typeof body === "object" && !Array.isArray(body)) {
+      const raw = (body as { model_type?: unknown }).model_type;
+      if (typeof raw === "string" && raw.trim()) {
+        modelType = normalizeHubModelType(raw);
+      }
+    }
+  } catch {
+    /* soft-fail: body unreadable — treat as unknown, not missing */
+    const result: HubConfigProbeResult = { access: "ok", status: "unknown" };
+    configProbeCache.set(cacheKey, { at: now, result });
+    return result;
+  }
+
+  const result: HubConfigProbeResult = {
+    access: "ok",
+    status: "ok",
+    ...(modelType ? { modelType } : {}),
+  };
+  configProbeCache.set(cacheKey, { at: now, result });
+  return result;
 }

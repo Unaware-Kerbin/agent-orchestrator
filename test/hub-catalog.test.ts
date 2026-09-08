@@ -20,15 +20,18 @@ import {
   hubFamily,
   isHubInstructCandidate,
   listHubModels,
+  applyHubLoadability,
   mergeHubCatalog,
   parseHubParamsB,
   parseHubVersion,
   resetHubCatalogForTests,
+  stampHubCatalogLoadability,
   toHubCatalogModel,
   withVramEstimate,
   type HubCatalogModel,
   type HubRawModel,
 } from "../src/local-servers/hub-catalog.js";
+import { openvinoCanExportCausalLm } from "../src/local-servers/hub-serve.js";
 
 afterEach(() => {
   resetHubCatalogForTests();
@@ -236,6 +239,12 @@ const CATALOG: HubRawModel[] = [
 function mockHubFetch(rows: HubRawModel[] = CATALOG): typeof fetch {
   return (async (input: RequestInfo | URL) => {
     const href = String(input instanceof Request ? input.url : input);
+    if (/\/resolve\/main\/config\.json(?:\?|$)/.test(href)) {
+      const id = href.replace(/^https:\/\/huggingface\.co\//, "").replace(/\/resolve\/main\/config\.json.*/, "");
+      const hit = rows.find((row) => String(row.id ?? row.modelId ?? "") === id);
+      if (hit?.config?.model_type) return jsonResponse({ model_type: hit.config.model_type });
+      return jsonResponse({ model_type: "qwen2" });
+    }
     assert.ok(href.startsWith(HF_HUB_MODELS_API), `must call official Hub API, got ${href}`);
     assert.equal(/huggingface\.co\/models\?/.test(href), false);
     assert.equal(href.includes("scrape"), false);
@@ -248,6 +257,9 @@ function mockHubFetchByFamily(): typeof fetch {
   const seen: string[] = [];
   const fn = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const href = String(input instanceof Request ? input.url : input);
+    if (/\/resolve\/main\/config\.json(?:\?|$)/.test(href)) {
+      return jsonResponse({ model_type: "qwen2" });
+    }
     assert.ok(href.startsWith(HF_HUB_MODELS_API), `must call official Hub API, got ${href}`);
     assert.equal(href.includes("filter=text-generation"), false);
     const url = new URL(href);
@@ -957,4 +969,153 @@ test("GET /api/local-servers/hub-models stays 200 when Hub is down", async () =>
   } finally {
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   }
+});
+
+test("applyHubLoadability stamps ovExportOk/loadable for Intel OpenVINO CausalLM", () => {
+  const qwen = applyHubLoadability(
+    {
+      id: "Qwen/Qwen3-8B-Instruct",
+      family: "Qwen",
+      fits: true,
+      likelyTooBig: false,
+      sizeUnknown: false,
+      gated: false,
+      modelType: "qwen3",
+    },
+    "intel",
+    true,
+  );
+  assert.equal(qwen.ovExportOk, true);
+  assert.equal(qwen.loadable, true);
+  assert.equal(qwen.downloadable, true);
+  assert.equal(openvinoCanExportCausalLm("qwen3"), true);
+
+  const gemma3 = applyHubLoadability(
+    {
+      id: "google/gemma-3-1b-it",
+      family: "Gemma",
+      fits: true,
+      likelyTooBig: false,
+      sizeUnknown: false,
+      gated: true,
+      modelType: "gemma3",
+    },
+    "intel",
+    true,
+  );
+  assert.equal(gemma3.ovExportOk, false);
+  assert.equal(gemma3.loadable, false);
+  assert.equal(gemma3.downloadable, false);
+  assert.ok(String(gemma3.serveBlockedReason ?? "").length > 0);
+});
+
+test("compareHubModels prefers loadable ungated over gated and demotes broken", () => {
+  const loadableUngated: HubCatalogModel = {
+    id: "Qwen/Qwen3-1.7B-Instruct",
+    family: "Qwen",
+    version: 3,
+    lastModified: "2025-01-01T00:00:00.000Z",
+    fits: true,
+    likelyTooBig: false,
+    sizeUnknown: false,
+    gated: false,
+    loadable: true,
+    ovExportOk: true,
+    modelType: "qwen3",
+  };
+  const loadableGated: HubCatalogModel = {
+    id: "meta-llama/Llama-3.2-1B-Instruct",
+    family: "Llama",
+    version: 3.2,
+    lastModified: "2026-01-01T00:00:00.000Z",
+    fits: true,
+    likelyTooBig: false,
+    sizeUnknown: false,
+    gated: true,
+    loadable: true,
+    ovExportOk: true,
+    modelType: "llama",
+  };
+  const broken: HubCatalogModel = {
+    id: "org/broken-instruct",
+    family: "other",
+    lastModified: "2026-06-01T00:00:00.000Z",
+    fits: true,
+    likelyTooBig: false,
+    sizeUnknown: true,
+    gated: false,
+    loadable: false,
+    configStatus: "missing",
+    ovExportOk: false,
+  };
+  assert.ok(compareHubModels(loadableUngated, loadableGated) < 0);
+  assert.ok(compareHubModels(loadableGated, broken) < 0);
+  assert.ok(compareHubModels(loadableUngated, broken) < 0);
+  const gemma2: HubCatalogModel = {
+    ...loadableUngated,
+    id: "google/gemma-2-2b-it",
+    family: "Gemma",
+    modelType: "gemma2",
+    gated: true,
+    version: 2,
+  };
+  const qwenLoadable = { ...loadableUngated, gated: false };
+  assert.ok(compareHubModels(qwenLoadable, gemma2) < 0, "Gemma2 must not sort as primary over loadable Qwen3");
+});
+
+test("listHubModels demotes missing config.json via soft-fail probe", async () => {
+  const hw = fakeIntelHardware({ vramMiB: 31_000 });
+  const broken: HubRawModel = {
+    id: "org/missing-config-instruct",
+    pipeline_tag: "text-generation",
+    tags: ["transformers", "safetensors", "text-generation", "instruct"],
+    lastModified: "2026-08-01T00:00:00.000Z",
+    siblings: [{ rfilename: "model.safetensors", size: 1_000 * 1024 * 1024 }],
+    safetensors: { total: 500_000_000, parameters: { BF16: 500_000_000 } },
+    // no config.model_type — forces probe
+  };
+  const base = mockHubFetch([broken, QWEN3]);
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.includes("/resolve/main/config.json") && url.includes("missing-config-instruct")) {
+      return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+    }
+    return base(input, init);
+  }) as typeof fetch;
+  const result = await listHubModels({ fetchFn, hardware: hw });
+  const miss = result.models.find((m) => m.id === "org/missing-config-instruct");
+  const qwen = result.models.find((m) => m.id === "Qwen/Qwen3-8B-Instruct");
+  assert.ok(miss, "broken row still listed (soft-fail)");
+  assert.equal(miss?.configStatus, "missing");
+  assert.equal(miss?.loadable, false);
+  assert.equal(qwen?.loadable, true);
+  assert.equal(qwen?.ovExportOk, true);
+  const qwenGroup = result.groups.find((g) => g.family === "Qwen");
+  assert.ok(qwenGroup);
+  assert.equal(qwenGroup?.models[0]?.id, "Qwen/Qwen3-8B-Instruct");
+  // default skips non-loadable / gemma2
+  assert.notEqual(result.defaultId, "google/gemma-2-2b-it");
+});
+
+test("stampHubCatalogLoadability keeps gated downloadable false while architecture loadable", () => {
+  const [llama] = stampHubCatalogLoadability(
+    [
+      {
+        id: "meta-llama/Llama-3.2-1B-Instruct",
+        family: "Llama",
+        fits: true,
+        likelyTooBig: false,
+        sizeUnknown: false,
+        gated: true,
+        gatedNeedsLicense: true,
+        modelType: "llama",
+      },
+    ],
+    "intel",
+    true,
+  );
+  assert.equal(llama.loadable, true);
+  assert.equal(llama.downloadable, false);
+  assert.equal(llama.gatedNeedsLicense, true);
+  assert.equal(llama.ovExportOk, true);
 });
