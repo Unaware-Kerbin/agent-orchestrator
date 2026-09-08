@@ -25,9 +25,11 @@ jobs:
           - os: macos-14
             target: mac-arm64
             artifact: darwin-arm64
-          - os: macos-13
+          # Intel Mac via cross-compile on Apple silicon (macos-13 runners are scarce/deprecated).
+          - os: macos-14
             target: mac-x64
             artifact: darwin-x64
+            rust_target: x86_64-apple-darwin
           - os: windows-latest
             target: win-x64
             artifact: win-x64
@@ -57,7 +59,27 @@ jobs:
         env:
           LATE_CHECKOUT: ${{ github.workspace }}/_late
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: bash scripts/build-late-infer.sh
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUST_TARGET}" && "${RUST_TARGET}" != "" ]]; then
+            rustup target add "${RUST_TARGET}"
+            crate="${LATE_CHECKOUT}/crates/late-infer"
+            workspace="$(cd "${crate}/../.." && pwd)"
+            echo "agent-orchestrator: cross-build late-infer --target ${RUST_TARGET}"
+            cargo build -p late-infer --release --target "${RUST_TARGET}" --manifest-path "${workspace}/Cargo.toml"
+            mkdir -p bin runtime/bin
+            src="${CARGO_TARGET_DIR}/${RUST_TARGET}/release/late-infer"
+            cp -a "$src" bin/late-infer
+            cp -a "$src" runtime/bin/late-infer
+            chmod +x bin/late-infer runtime/bin/late-infer
+            ver="$(node -p "require('./package.json').version")"
+            printf "%s\n" "$ver" > bin/late-infer.stamp
+            printf "%s\n" "$ver" > runtime/bin/.late-infer-built-for
+            echo "agent-orchestrator: packed cross late-infer -> bin/late-infer"
+          else
+            bash scripts/build-late-infer.sh
+          fi
       - name: Package
         shell: bash
         env:

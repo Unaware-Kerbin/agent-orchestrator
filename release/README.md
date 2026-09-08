@@ -19,7 +19,7 @@ Each archive includes Node 22 under `runtime/` and `runtime/bin/late-infer` (or 
 
 ## How CI publishes
 
-1. Ubuntu packs `--target linux-x64`, macOS-14 packs `mac-arm64`, macOS-13 packs `mac-x64`, Windows packs `win-x64`.
-2. Each job checks out [Unaware-Kerbin/late](https://github.com/Unaware-Kerbin/late), builds `late-infer` with Rust, then runs `scripts/pack.sh` for that native target.
+1. Ubuntu packs `--target linux-x64`, macOS-14 packs `mac-arm64`, macOS-14 also cross-packs `mac-x64` (`x86_64-apple-darwin`), Windows packs `win-x64`.
+2. Each job checks out [Unaware-Kerbin/late](https://github.com/Unaware-Kerbin/late), builds `late-infer` with Rust (native or cross), then runs `scripts/pack.sh` for that target.
 3. `actions/upload-artifact` keeps `release/*.tar.gz` and `release/*.zip` on the workflow run.
 4. On a `v*` tag, the `publish` job attaches `dist/*` to the GitHub Release.
