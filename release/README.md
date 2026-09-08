@@ -2,7 +2,7 @@
 
 Archives are **not** stored in git (`release/` is gitignored except this README). GitHub Actions **Build installers** runs `scripts/pack.sh` on `main` and on `v*` tags, then uploads workflow artifacts. A `v*` tag also attaches the files to the GitHub Release.
 
-Future installers are **new tags** (`v0.1.5`, then `v0.1.6`, …). Do not rewrite old tags.
+Future installers are **new tags** (`v0.1.6`, then `v0.1.7`, …). Do not rewrite old tags.
 
 Do not commit the 100MB+ tarballs/zips.
 

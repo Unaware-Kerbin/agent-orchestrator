@@ -112,12 +112,12 @@ jobs:
           body: |
             Portable GUI + Streamable HTTP `/mcp` (loopback only). Each archive includes Node 22 and packed `late-infer`.
 
-            ### v0.1.5
-            - Inference engines documented (late-infer / OpenVINO/Candle, Ollama, llama.cpp, vLLM Docker).
-            - late-infer Hub pre-screen: `ovExportOk` / `loadable` from `model_type` + soft-fail cached `config.json` probe; loadable ungated rows sort first.
-            - Chat tokens/sec (research, opt-in) in the composer — default off; not a billing meter.
-            - Soft-fail human messages for missing/denied Hub `config.json` on Download (real Instruct seed ids; no bare `Error: config.json`).
-            - CI packs `late-infer` by building Unaware-Kerbin/late on each runner (darwin-x64 cross-compiled on macos-14).
+            ### v0.1.6
+            - **Fits my GPU:** Hub store budgets ~80% of idle compile-target VRAM (not dual-GPU total); filter (default on) auto-hides over-budget rows.
+            - **Download / compile pipeline states:** distinct `probing` → `downloading` → `compiling` → `ready` (+ soft-fail errors) in jobs and Local models UI.
+            - **Research metrics panel (opt-in):** composer expands tokens/sec with latency, VRAM label, and model id (default off).
+            - **Intel Arc OpenVINO:** skip MLC preflight when `LATE_INFER_ACCEL=intel`; idle BDF + `ZE_AFFINITY_MASK` stay on the non-display B70.
+            - Also since v0.1.5: soft-fail Hub `config.json` Download messages, opt-in chat tokens/sec, Windows late-infer stamp path fix for CI.
 
             ### Install
             - **Linux / macOS:** extract, then `./bin/agent-orchestrator-gui`
