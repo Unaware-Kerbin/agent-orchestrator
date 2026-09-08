@@ -537,6 +537,11 @@ test("parseCompilePhase maps Hub download and compile lines", () => {
     ),
     /gated|license|token/i,
   );
+  assert.match(
+    compileErrorLine("Error: config.json"),
+    /Could not read Hub config\.json|safetensors Instruct|llama\.cpp/i,
+  );
+  assert.equal(compileErrorLine("Error: config.json").includes("Error: config.json"), false);
 });
 
 test("parseCompileProgress reads percent bytes totalBytes etaSec from compile-only lines", () => {

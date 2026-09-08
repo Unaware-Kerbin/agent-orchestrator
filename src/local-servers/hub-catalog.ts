@@ -50,10 +50,9 @@ export const FALLBACK_HUB_SEEDS: readonly {
   { id: "Qwen/Qwen2.5-3B-Instruct", weightsMiB: 6_000, params: 3_000_000_000, modelType: "qwen2" },
   { id: "Qwen/Qwen3-0.6B", weightsMiB: 1_200, params: 600_000_000, modelType: "qwen3" },
   { id: "Qwen/Qwen3-1.7B", weightsMiB: 3_400, params: 1_700_000_000, modelType: "qwen3" },
-  { id: "Qwen/Qwen3-1.7B-Instruct", weightsMiB: 3_400, params: 1_700_000_000, modelType: "qwen3" },
-  { id: "Qwen/Qwen3-4B-Instruct", weightsMiB: 8_000, params: 4_000_000_000, modelType: "qwen3" },
+  // Real Hub Instruct snapshot (Qwen/Qwen3-4B-Instruct is not a public config.json repo).
+  { id: "Qwen/Qwen3-4B-Instruct-2507", weightsMiB: 8_000, params: 4_000_000_000, modelType: "qwen3" },
   { id: "Qwen/Qwen3-8B", weightsMiB: 16_000, params: 8_000_000_000, modelType: "qwen3" },
-  { id: "Qwen/Qwen3-8B-Instruct", weightsMiB: 16_000, params: 8_000_000_000, modelType: "qwen3" },
   { id: "Qwen/Qwen2.5-7B-Instruct", weightsMiB: 14_000, params: 7_000_000_000, modelType: "qwen2" },
   { id: "google/gemma-2-2b-it", gated: true, weightsMiB: 5_000, params: 2_600_000_000, modelType: "gemma2" },
   { id: "google/gemma-2-9b-it", gated: true, weightsMiB: 18_000, params: 9_200_000_000, modelType: "gemma2" },
@@ -680,7 +679,7 @@ export function hubRowGated(row: HubRawModel): boolean {
   return false;
 }
 
-const CONFIG_PROBE_LIMIT = 12;
+const CONFIG_PROBE_LIMIT = 36;
 
 /** Stamp ovExportOk / loadable / downloadable from known model_type + serve decision (no network). */
 export function applyHubLoadability(
@@ -723,7 +722,10 @@ export function stampHubCatalogLoadability(
 
 function shouldProbeHubConfig(model: HubCatalogModel): boolean {
   if (model.configStatus && model.configStatus !== "unprobed") return false;
-  // Optional lightweight probe only when model_type is unknown — Hub list usually expands config.
+  // Always probe built-in fallback seeds. Inferred model_type alone can stamp OV-ok / loadable
+  // while Hub has no reachable config.json (phantom Instruct ids).
+  if (model.fallback === true) return true;
+  // Optional lightweight probe when model_type is unknown — Hub list usually expands config.
   const type = String(model.modelType ?? "").trim();
   return !type;
 }

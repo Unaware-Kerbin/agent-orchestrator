@@ -1043,3 +1043,31 @@ input[type="file"] {
   background: var(--bg);
 }
 .local-engine-row .actions { margin: 0; flex-wrap: wrap; }
+
+
+.composer-extras {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+  align-items: center;
+  margin: 0.35rem 0 0;
+}
+.research-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.research-toggle input {
+  margin: 0;
+}
+.tok-per-sec {
+  margin-left: 0.35rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+}

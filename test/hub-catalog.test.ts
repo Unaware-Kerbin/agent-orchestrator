@@ -85,6 +85,15 @@ function jsonResponse(body: unknown, status = 200, contentType = "application/js
   return new Response(JSON.stringify(body), { status, headers: { "content-type": contentType } });
 }
 
+function isHubConfigProbeUrl(href: string): boolean {
+  return /\/resolve\/main\/config\.json(?:\?|$)/.test(href);
+}
+
+/** Soft config.json reply for catalog probes — mocks that only cover /api/models must not assert-fail here. */
+function mockConfigProbeResponse(href: string): Response {
+  return jsonResponse({ model_type: "qwen2" });
+}
+
 const QWEN25: HubRawModel = {
   id: "Qwen/Qwen2.5-0.5B-Instruct",
   pipeline_tag: "text-generation",
@@ -344,7 +353,10 @@ test("listHubModels groups at least two families and sorts newest version first"
   assert.ok(families.length >= 2);
   const qwen = result.groups.find((g) => g.family === "Qwen");
   assert.ok(qwen);
-  assert.equal(qwen.models[0]?.id, "Qwen/Qwen3-8B-Instruct"); // newest Qwen version first
+  assert.ok(
+    ["Qwen/Qwen3-8B-Instruct", "Qwen/Qwen3-8B"].includes(qwen.models[0]?.id ?? ""),
+    `expected a Qwen3-8B primary, got ${qwen.models[0]?.id}`,
+  ); // newest Qwen3 first (Hub Instruct mock and/or real seed)
   const qwenIds = qwen.models.map((m) => m.id);
   assert.ok(qwenIds.includes("Qwen/Qwen3-8B-Instruct"));
   assert.ok(qwenIds.includes("Qwen/Qwen2.5-0.5B-Instruct"));
@@ -588,6 +600,7 @@ test("listing sends HF_TOKEN when present and still lists public models without 
   const headers: string[] = [];
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const href = String(input instanceof Request ? input.url : input);
+    if (isHubConfigProbeUrl(href)) return mockConfigProbeResponse(href);
     assert.ok(href.startsWith(HF_HUB_MODELS_API));
     headers.push(String((init?.headers as Record<string, string> | undefined)?.authorization ?? ""));
     return jsonResponse([QWEN25, GEMMA_IT]);
@@ -778,6 +791,7 @@ test("HTML Hub payload is treated as offline, not scraped", async () => {
   const hw = fakeHardware({ vramMiB: 8_192 });
   const fetchFn = (async (input: RequestInfo | URL) => {
     const href = String(input instanceof Request ? input.url : input);
+    if (isHubConfigProbeUrl(href)) return mockConfigProbeResponse(href);
     assert.ok(href.startsWith(HF_HUB_MODELS_API));
     return new Response("<html><body>models</body></html>", {
       status: 200,
@@ -1092,7 +1106,10 @@ test("listHubModels demotes missing config.json via soft-fail probe", async () =
   assert.equal(qwen?.ovExportOk, true);
   const qwenGroup = result.groups.find((g) => g.family === "Qwen");
   assert.ok(qwenGroup);
-  assert.equal(qwenGroup?.models[0]?.id, "Qwen/Qwen3-8B-Instruct");
+  assert.ok(
+    ["Qwen/Qwen3-8B-Instruct", "Qwen/Qwen3-8B"].includes(qwenGroup?.models[0]?.id ?? ""),
+    `expected a Qwen3-8B primary, got ${qwenGroup?.models[0]?.id}`,
+  );
   // default skips non-loadable / gemma2
   assert.notEqual(result.defaultId, "google/gemma-2-2b-it");
 });
@@ -1118,4 +1135,36 @@ test("stampHubCatalogLoadability keeps gated downloadable false while architectu
   assert.equal(llama.downloadable, false);
   assert.equal(llama.gatedNeedsLicense, true);
   assert.equal(llama.ovExportOk, true);
+});
+
+test("fallback seed with denied config.json is not ready-to-download", async () => {
+  const hw = fakeIntelHardware({ vramMiB: 31_000 });
+  const base = mockHubFetch([]);
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.includes("/resolve/main/config.json") && url.includes("Qwen3-4B-Instruct-2507")) {
+      return new Response("Unauthorized", { status: 401, headers: { "content-type": "text/plain" } });
+    }
+    if (url.includes("/resolve/main/config.json")) {
+      return jsonResponse({ model_type: "qwen3" });
+    }
+    return base(input, init);
+  }) as typeof fetch;
+  const result = await listHubModels({ fetchFn, hardware: hw });
+  const bad = result.models.find((m) => m.id === "Qwen/Qwen3-4B-Instruct-2507");
+  assert.ok(bad, "fallback seed still listed");
+  assert.equal(bad?.fallback, true);
+  assert.equal(bad?.configStatus, "denied");
+  assert.equal(bad?.downloadable, false);
+  assert.equal(bad?.gatedNeedsLicense, true);
+});
+
+test("FALLBACK_HUB_SEEDS no longer lists phantom Qwen3-*-Instruct ids", () => {
+  const ids = FALLBACK_HUB_SEEDS.map((s) => s.id);
+  assert.equal(ids.includes("Qwen/Qwen3-4B-Instruct"), false);
+  assert.equal(ids.includes("Qwen/Qwen3-1.7B-Instruct"), false);
+  assert.equal(ids.includes("Qwen/Qwen3-8B-Instruct"), false);
+  assert.ok(ids.includes("Qwen/Qwen3-4B-Instruct-2507"));
+  assert.ok(ids.includes("Qwen/Qwen3-1.7B"));
+  assert.ok(ids.includes("Qwen/Qwen3-8B"));
 });

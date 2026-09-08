@@ -171,10 +171,8 @@ const FALLBACK_LATE_INFER_HUB_MODELS = [
   { id: "Qwen/Qwen2.5-3B-Instruct", family: "Qwen", weightsMiB: 6000, params: 3000000000 },
   { id: "Qwen/Qwen3-0.6B", family: "Qwen", weightsMiB: 1200, params: 600000000 },
   { id: "Qwen/Qwen3-1.7B", family: "Qwen", weightsMiB: 3400, params: 1700000000 },
-  { id: "Qwen/Qwen3-1.7B-Instruct", family: "Qwen", weightsMiB: 3400, params: 1700000000 },
-  { id: "Qwen/Qwen3-4B-Instruct", family: "Qwen", weightsMiB: 8000, params: 4000000000 },
+  { id: "Qwen/Qwen3-4B-Instruct-2507", family: "Qwen", weightsMiB: 8000, params: 4000000000 },
   { id: "Qwen/Qwen3-8B", family: "Qwen", weightsMiB: 16000, params: 8000000000 },
-  { id: "Qwen/Qwen3-8B-Instruct", family: "Qwen", weightsMiB: 16000, params: 8000000000 },
   { id: "Qwen/Qwen2.5-7B-Instruct", family: "Qwen", weightsMiB: 14000, params: 7000000000 },
   { id: "google/gemma-2-2b-it", family: "Gemma", gated: true, weightsMiB: 5000, params: 2600000000 },
   { id: "google/gemma-2-9b-it", family: "Gemma", gated: true, weightsMiB: 18000, params: 9200000000 },
@@ -217,6 +215,15 @@ let lateInferHubId = (() => {
 })();
 let lateInferCompiledId = "";
 let lateInferDownloadBusy = false;
+/** Research opt-in: show estimated tokens/sec on chat replies (default off). */
+let chatShowTokensPerSec = (() => {
+  try {
+    return localStorage.getItem("orchestrator.chat.showTps") === "1";
+  } catch {
+    return false;
+  }
+})();
+
 const LATE_INFER_HUB_FAMILY_ORDER = ["Qwen", "Mistral", "Gemma", "Llama", "Phi", "other"];
 let lateInferHubCatalog = {
   models: fallbackLateInferHubModels(),
@@ -314,6 +321,9 @@ function lateInferErrorLine(text) {
     /Token is set but Hugging Face still denied access[\s\S]*?Do not commit the token\.|Repo is gated\.[\s\S]*?Do not commit the token\./i,
   );
   if (license) return license[0].replace(/\s+/g, " ").slice(0, 400);
+  if (/^\s*Error:\s*config\.json\s*$/i.test(cleaned) || (/Error:\s*config\.json\b/i.test(cleaned) && !/\b(401|403|404|status code|request error|denied|not found|authorization required)\b/i.test(cleaned))) {
+    return "Could not read Hub config.json for this model — late-infer needs a safetensors Instruct snapshot with config.json. Check the Hub id (wrong or private repos fail here). GGUF packs belong under llama.cpp.";
+  }
   if (/config\.json/i.test(cleaned) && /\b401\b|\b403\b|denied|authorization required/i.test(cleaned)) {
     return "Hub denied config.json (gated or private) — accept the model license on Hugging Face, then set a read token in Settings → Local models.";
   }
@@ -1711,7 +1721,39 @@ function suggestedButton(action) {
   return `<div class="suggested"><button type="button" class="btn" data-chat-action="${escapeHtml(action.action)}" data-payload="${escapeHtml(JSON.stringify(action.payload ?? {}))}">${escapeHtml(action.label)}</button></div>`;
 }
 
+function estimateCompletionTokens(text) {
+  const s = String(text ?? "");
+  if (!s) return 0;
+  // Rough research estimate (not tokenizer-accurate): ~4 chars per token for English/code mix.
+  return Math.max(1, Math.round(s.length / 4));
+}
+
+function formatTokensPerSec(tps) {
+  const n = Number(tps);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 100) return `${Math.round(n)} tok/s`;
+  if (n >= 10) return `${n.toFixed(1)} tok/s`;
+  return `${n.toFixed(2)} tok/s`;
+}
+
+function messageTokensPerSec(m, now = Date.now()) {
+  if (!chatShowTokensPerSec || !m || m.role === "user") return "";
+  if (typeof m.tokensPerSec === "number" && Number.isFinite(m.tokensPerSec) && m.tokensPerSec > 0) {
+    return formatTokensPerSec(m.tokensPerSec);
+  }
+  const body = String(m.content || "");
+  if (!body.trim()) return "";
+  const started = m.thinkingStartedAt || m.createdAt;
+  if (!started) return "";
+  const elapsedSec = Math.max(0.05, (now - started) / 1000);
+  const tokens = typeof m.completionTokensEst === "number" && m.completionTokensEst > 0
+    ? m.completionTokensEst
+    : estimateCompletionTokens(body);
+  return formatTokensPerSec(tokens / elapsedSec);
+}
+
 function thinkingChipLabel(m, now = Date.now()) {
+
   const phase = m.thinkingPhase || (m.status === "streaming" ? "streaming" : "waiting");
   const started = m.thinkingStartedAt || m.createdAt || now;
   const elapsed = Math.max(0, Math.floor((now - started) / 1000));
@@ -1751,6 +1793,12 @@ function renderMessages() {
           ${avatarMarkup(m.speaker)}
           <span class="speaker">${escapeHtml(m.label || m.speaker || role)}</span>
           <span>${escapeHtml(formatTime(m.createdAt))}${escapeHtml(round)}</span>
+          ${(() => {
+            const tps = messageTokensPerSec(m, now);
+            return tps
+              ? `<span class="tok-per-sec" title="Research estimate (chars÷4 / elapsed) — not a billing meter">${escapeHtml(tps)}</span>`
+              : "";
+          })()}
         </div>
         ${chip}
         ${bubble}
@@ -1871,6 +1919,12 @@ function ensureChatLayout() {
           <textarea id="composer-input" name="message" required placeholder="Troubleshoot this PR, draft a plan, ask what fits your GPUs…"></textarea>
           <button type="submit" id="composer-send">Send</button>
         </div>
+        <div class="composer-extras">
+          <label class="research-toggle" title="Research: estimate tokens per second for the active reply (chars÷4 / elapsed). Default off.">
+            <input type="checkbox" id="chat-show-tps" ${chatShowTokensPerSec ? "checked" : ""} />
+            Show tokens/sec <span class="muted">(research)</span>
+          </label>
+        </div>
         <p class="hint">Auto | Debate | Single chooses speakers. Implement/install requires Approve before writes or host installs; Q&A and debate text stay unblocked. Drag a folder here to grant it (path must exist on this computer). Repo writes go to Cursor local or Approve apply-patch inside the allowlist.</p>
         <div id="grant-card" class="grant-card hidden">
           <p class="muted">Grant this folder for writes. It must already exist on this computer (the one running this GUI).</p>
@@ -1904,6 +1958,19 @@ function ensureChatLayout() {
   renderMessages();
   renderThreadList();
   bindChatDrop();
+  const tpsToggle = $("chat-show-tps");
+  if (tpsToggle) {
+    tpsToggle.checked = chatShowTokensPerSec;
+    tpsToggle.addEventListener("change", () => {
+      chatShowTokensPerSec = Boolean(tpsToggle.checked);
+      try {
+        localStorage.setItem("orchestrator.chat.showTps", chatShowTokensPerSec ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      renderMessages();
+    });
+  }
 }
 
 function droppedFilePath(file) {

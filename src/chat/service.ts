@@ -67,6 +67,21 @@ const SYNTHESIS_PLAN_ONLY = `You are the closer for a multi-agent round-table.
 Merge the debate into one recommended plan for the user. List proposed cwd, specialist, and commands (file writes, apt, Unity Hub, etc.).
 Do not modify files, run shell installs, or claim to have installed anything. A human must click Approve before writes or host packages.`;
 
+/** Research estimate only — not tokenizer-accurate. */
+export function estimateCompletionTokens(text: string): number {
+  const s = String(text ?? "");
+  if (!s) return 0;
+  return Math.max(1, Math.round(s.length / 4));
+}
+
+export function estimateTokensPerSec(text: string, startedAt: number | undefined, finishedAt = Date.now()): number | undefined {
+  if (!startedAt || !Number.isFinite(startedAt)) return undefined;
+  const elapsedSec = Math.max(0.05, (finishedAt - startedAt) / 1000);
+  const tokens = estimateCompletionTokens(text);
+  if (tokens <= 0) return undefined;
+  return tokens / elapsedSec;
+}
+
 export class ChatService {
   readonly store = new ChatStore();
   private readonly queues = new Map<string, Promise<void>>();
@@ -724,6 +739,10 @@ export class ChatService {
     const label = current?.label || current?.nickname || current?.speaker || "Speaker";
     const error = run.status === "error" ? speakerErrorText(label, run.error) : undefined;
     const content = error ?? run.text?.trim() ?? "";
+    const finishedAt = Date.now();
+    const startedAt = current?.thinkingStartedAt ?? current?.createdAt;
+    const completionTokensEst = error ? undefined : estimateCompletionTokens(content);
+    const tokensPerSec = error ? undefined : estimateTokensPerSec(content, startedAt, finishedAt);
     this.store.patchMessage(threadId, messageId, {
       content,
       status: error ? "error" : "finished",
@@ -734,6 +753,8 @@ export class ChatService {
       thinkingPhase: undefined,
       thinkingStartedAt: undefined,
       suggestedAction: suggestedForRunError(run.error, decision),
+      completionTokensEst,
+      tokensPerSec,
     });
     this.stopHeartbeatIfIdle(threadId);
     this.emit(this.store.get(threadId));

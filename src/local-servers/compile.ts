@@ -512,6 +512,10 @@ export function compileErrorLine(text: string): string {
   );
   if (license) return license[0].replace(/\s+/g, " ").slice(0, 400);
   // Soft-fail Hub repo issues: surface gated / missing config clearly (not a cryptic config.json dump).
+  // late-infer often prints "Error: config.json" on its own line before Caused-by / status codes.
+  if (/^\s*Error:\s*config\.json\s*$/i.test(cleaned) || (/Error:\s*config\.json\b/i.test(cleaned) && !/\b(401|403|404|status code|request error|denied|not found|authorization required)\b/i.test(cleaned))) {
+    return "Could not read Hub config.json for this model — late-infer needs a safetensors Instruct snapshot with config.json. Check the Hub id (wrong or private repos fail here). GGUF packs belong under llama.cpp.";
+  }
   if (/config\.json/i.test(cleaned) && /\b401\b|\b403\b|denied|authorization required/i.test(cleaned)) {
     return "Hub denied config.json (gated or private) — accept the model license on Hugging Face, then set a read token in Settings → Local models.";
   }
@@ -712,6 +716,13 @@ function applyChunk(chunk: string, now: number): void {
   if (currentJob.phase === "error" || currentJob.phase === "done") return;
   const phase = parseCompilePhase(chunk);
   if (phase === "error") {
+    // Bare first line is often just "Error: config.json"; Caused-by / HTTP status follow.
+    // Do not kill yet — finishJob upgrades from full stderr.
+    if (/^\s*Error:\s*config\.json\s*$/i.test(chunk.trim())) {
+      currentJob.message = chunk.trim();
+      currentJob.updatedAt = now;
+      return;
+    }
     markJobError(chunk, now);
     killCompileChild();
     return;
@@ -754,7 +765,9 @@ function finishJob(code: number | null, stderr: string, stdout: string, now: num
   currentJob.updatedAt = now;
   if (currentJob.phase === "error") {
     currentJob.downloading = false;
-    if (!currentJob.error) markJobError(stderr, now);
+    // Prefer full stderr — applyChunk may have seen only the first "Error: config.json" line.
+    if (stderr.trim()) markJobError(stderr, now);
+    else if (!currentJob.error) markJobError(stderr, now);
     return;
   }
   if (code === 0) {

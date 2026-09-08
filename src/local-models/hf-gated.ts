@@ -62,10 +62,20 @@ export async function probeHubGatedAccess(
   if (isDeniedHubStatus(cardStatus)) {
     throw new Error(redactSecretText(`401 ${hubGatedDeniedMessage(present)}`));
   }
+  if (cardStatus === 404) {
+    throw new Error(
+      "Hugging Face Hub repo not found — check the org/model id. late-infer needs a safetensors Instruct snapshot with config.json.",
+    );
+  }
   const configHeaders = { ...headers, Range: "bytes=0-0" };
   const configStatus = await hubProbeStatus(fetchFn, urls.config, configHeaders, timeoutMs);
   if (isDeniedHubStatus(configStatus)) {
     throw new Error(redactSecretText(`401 ${hubGatedDeniedMessage(present)}`));
+  }
+  if (configStatus === 404) {
+    throw new Error(
+      "Hub repo has no config.json (missing on Hugging Face) — late-infer needs a safetensors Instruct snapshot with config.json. GGUF-only packs belong under llama.cpp.",
+    );
   }
 }
 

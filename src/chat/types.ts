@@ -34,6 +34,10 @@ export interface ChatMessage {
   hasLogo?: boolean;
   /** Loopback URL (no token). Late/GUI fetch with Bearer. */
   logoUrl?: string;
+  /** Research: estimated completion tokens (chars÷4) when the reply finished. */
+  completionTokensEst?: number;
+  /** Research: estimated tokens per second for the finished reply. */
+  tokensPerSec?: number;
 }
 
 export interface ChatHeartbeatPayload {
