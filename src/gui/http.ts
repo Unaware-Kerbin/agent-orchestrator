@@ -1695,7 +1695,7 @@ async function localServersSnapshot(orchestrator: Orchestrator) {
   const compile = lateInferCompileView();
   const compiledModels = listCompiledLateInferIds();
   const doneJob = lateInferCompileJob();
-  if (doneJob?.phase === "done" && doneJob.model && !compiledModels.includes(doneJob.model)) {
+  if (doneJob?.phase === "ready" && doneJob.model && !compiledModels.includes(doneJob.model)) {
     compiledModels.push(doneJob.model);
   }
   const serve = lateInferServeSnapshot(lateinfer);
