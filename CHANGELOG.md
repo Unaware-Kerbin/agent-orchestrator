@@ -5,7 +5,23 @@ What shipped in each tag, in plain language. Newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are America/New_York.
 
-This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Ollama and llama-server. vLLM Start still needs Docker.
+This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Node 22 and `late-infer`. Ollama / llama-server / vLLM remain optional local engines; vLLM Start still needs Docker.
+
+## [0.1.5] - 2026-09-08
+
+New GitHub tag [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.5) so this build is trackable. Tag [v0.1.4](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.4) stays frozen — future installers are new tags; do not rewrite old tags.
+
+### Documented
+
+- **Inference engines on your computer.** README local-inference section: late-infer (OpenVINO / Candle), Ollama, llama.cpp, vLLM Docker; loopback-only binds; Start/Stop and demo clips (`6f39611`).
+
+### Added
+
+- **late-infer Hub pre-screen.** Local models HF store stamps `ovExportOk` / `loadable` from known `model_type` plus a soft-fail cached `config.json` probe; loadable ungated rows sort first; broken config / OV-incompatible graphs are demoted (`a776eee`).
+
+### Fixed
+
+- **Build installers CI.** Packaging after v0.1.4 requires a host-built `late-infer` binary; CI had no sibling Late checkout, so every `main` pack failed. Workflow now checks out `Unaware-Kerbin/late`, builds `late-infer` on each runner, and packs one native target per job (linux / darwin-arm64 / darwin-x64 / win-x64).
 
 ## [0.1.4] - 2026-08-31
 
@@ -60,6 +76,7 @@ Portable GUI + `/mcp` archives with apply-patch and a Debate README clip.
 
 First portable GUI + Streamable HTTP `/mcp` archives (Linux, macOS, Windows). Loopback only. Extract, then `./bin/agent-orchestrator-gui` (Windows: `bin\agent-orchestrator-gui.cmd`). Copy the printed `/mcp` URL for Late.
 
+[0.1.5]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.1...v0.1.2

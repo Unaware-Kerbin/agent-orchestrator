@@ -18,12 +18,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # One OS/arch per job so late-infer builds natively (pack only auto-builds host os-arch).
           - os: ubuntu-22.04
-            args: "--target linux-x64"
-          - os: macos-latest
-            args: "--target mac-arm64 --target mac-x64"
+            target: linux-x64
+            artifact: linux-x64
+          - os: macos-14
+            target: mac-arm64
+            artifact: darwin-arm64
+          - os: macos-13
+            target: mac-x64
+            artifact: darwin-x64
           - os: windows-latest
-            args: "--target win-x64"
+            target: win-x64
+            artifact: win-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -34,17 +41,31 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      - name: Checkout late (late-infer crate)
+        uses: actions/checkout@v4
+        with:
+          repository: Unaware-Kerbin/late
+          path: _late
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
       - name: Linux unpack tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Build late-infer for this runner
+        shell: bash
+        env:
+          LATE_CHECKOUT: ${{ github.workspace }}/_late
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash scripts/build-late-infer.sh
       - name: Package
         shell: bash
         env:
           PACK_OVERWRITE: "1"
-        run: bash scripts/pack.sh ${{ matrix.args }}
+        run: bash scripts/pack.sh --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-orchestrator-${{ matrix.os }}
+          name: agent-orchestrator-${{ matrix.artifact }}
           path: |
             release/*.tar.gz
             release/*.zip
@@ -67,11 +88,17 @@ jobs:
           fail_on_unmatched_files: true
           files: dist/*
           body: |
-            Portable GUI + Streamable HTTP `/mcp` (loopback only). Each archive includes Node 22.
+            Portable GUI + Streamable HTTP `/mcp` (loopback only). Each archive includes Node 22 and packed `late-infer`.
 
+            ### v0.1.5
+            - Inference engines documented (late-infer / OpenVINO/Candle, Ollama, llama.cpp, vLLM Docker).
+            - late-infer Hub pre-screen: `ovExportOk` / `loadable` from `model_type` + soft-fail cached `config.json` probe; loadable ungated rows sort first.
+            - CI packs `late-infer` by building Unaware-Kerbin/late on each runner (no sibling checkout required).
+
+            ### Install
             - **Linux / macOS:** extract, then `./bin/agent-orchestrator-gui`
             - **Windows:** extract, then `bin\agent-orchestrator-gui.cmd`
             - Copy the printed `/mcp` URL for Late. Stop with `--stop`.
-            - Archives include Node 22 plus Ollama and llama-server (Vulkan/Metal). Model weights are not included. vLLM Start still needs Docker.
+            - Model weights are not included. vLLM Start still needs Docker. Bind defaults to `127.0.0.1` (or one private `listen_host`).
 
-            Bind stays `127.0.0.1`.
+            See CHANGELOG.md for details.
