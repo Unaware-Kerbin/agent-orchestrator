@@ -12,13 +12,14 @@
     "start": "tsx src/index.ts",
     "mcp:http": "tsx src/mcp-http.ts",
     "dev": "tsx watch src/index.ts",
-    "gui": "tsx src/gui.ts",
+    "gui": "node scripts/ensure-late-infer.js && tsx src/gui.ts",
     "gui:open": "tsx src/gui.ts --open",
     "gui:stop": "tsx src/gui.ts --stop",
     "gui:restart": "tsx src/gui.ts --restart",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "infer:build": "bash scripts/build-late-infer.sh",
     "pack": "bash scripts/pack.sh"
   },
   "engines": {

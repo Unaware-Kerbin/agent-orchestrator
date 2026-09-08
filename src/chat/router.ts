@@ -20,7 +20,8 @@ export { wantsHostInstall } from "./approval.js";
 export const DEFAULT_ROUNDS = 2;
 export const MAX_ROUNDS = 3;
 
-const DEBATE_INTENTS = new Set<ChatIntent>(["code", "review", "reason"]);
+/** Auto round-table only for review/multi-backend critique — not general Q&A or code writes. */
+const DEBATE_INTENTS = new Set<ChatIntent>(["review"]);
 
 /**
  * Late (and similar MCP clients) wrap the operator turn after SYSTEM + untrusted
@@ -75,7 +76,7 @@ export function detectIntent(message: string): ChatIntent {
   if (
     /\b(allowlist|allowed director(?:y|ies)|grant (?:a )?director)/i.test(text) ||
     /\b(stop vllm|vllm status|is vllm (?:running|up))\b/i.test(text) ||
-    /\b(start (?:the )?(?:recommended )?(?:local )?(?:model|vllm|server)|start vllm)\b/i.test(text) ||
+    /\b(start (?:the )?(?:recommended )?(?:local )?(?:model|brain|server|late[- ]?infer)|start late[- ]?infer|start vllm)\b/i.test(text) ||
     /\bdownload (?:the )?(?:local |recommended )?model\b/i.test(text) ||
     /\b(what models? fit|recommend(?:ed)? (?:local )?models?|list (?:local )?models)\b/i.test(text) ||
     /\b(hardware|vram|\bgpus?\b|accelerators?|intel (?:arc|xpu)|nvidia|rocm|what (?:gpu|models) (?:do i|have))\b/i.test(
@@ -149,23 +150,29 @@ export function detectNamedBackend(message: string, backends: RouterBackend[] = 
   if (/\b(cursor local|local cursor)\b/.test(text)) return "cursor-local";
   if (/\b(llama\.cpp|llamacpp|llama-server|llama cpp)\b/.test(text) && !/\bcursor\b/.test(text)) return "llamacpp";
   if (/\bollama\b/.test(text)) return "ollama";
+  if (/\b(late[- ]?infer|late infer)\b/.test(text)) return "late-infer";
   const families = LOCAL_FAMILY_NEEDLES.filter((row) => row.re.test(text));
   if (families.length === 1 && backends.length) {
     const matches = backendsMatchingFamily(backends, families[0]!.needle);
-    const pick = matches.find((b) => b.ready) ?? matches[0];
+    const pick =
+      matches.find((b) => isLateInferBackend(b) && b.ready) ??
+      matches.find((b) => b.ready) ??
+      matches[0];
     if (pick) return pick.id;
   }
   if (families.length > 1 && backends.length) {
     // Two named locals (e.g. Qwen + Gemma): do not pin the first YAML row.
     return undefined;
   }
+  if (/\b(vllm|local vllm)\b/.test(text) && !/\bcursor\b/.test(text)) return "vllm";
   if (
-    (/\b(vllm|local vllm|local model)\b/.test(text) || families.length > 0) &&
+    (/\blocal model\b/.test(text) || families.length > 0) &&
     !/\bcursor\b/.test(text)
   ) {
     return "local";
   }
   if (/\b(gemini|google gemini)\b/.test(text)) return "gemini";
+  if (/\b(grok|xai)\b/.test(text)) return "grok";
   if (/\b(anthropic|claude)\b/.test(text)) return "anthropic";
   if (/\b(openai|gpt-4|gpt4)\b/.test(text)) return "openai";
   return undefined;
@@ -174,10 +181,13 @@ export function detectNamedBackend(message: string, backends: RouterBackend[] = 
 export function detectControl(message: string): ControlKind | undefined {
   const text = message.trim();
   if (/\b(allowlist|allowed director)/i.test(text)) return "allowlist";
+  if (/\bstop (?:late[- ]?infer)\b/i.test(text)) return "stop_late_infer";
   if (/\bstop vllm\b/i.test(text)) return "stop_vllm";
-  if (/\b(start (?:the )?(?:recommended )?(?:local )?(?:model|vllm|server)|start vllm)\b/i.test(text)) {
-    return "start_vllm";
+  if (/\bstart vllm\b/i.test(text)) return "start_vllm";
+  if (/\b(start (?:the )?(?:recommended )?(?:local )?(?:model|brain|server|late[- ]?infer)|start late[- ]?infer)\b/i.test(text)) {
+    return "start_late_infer";
   }
+  if (/\b(late[- ]?infer status|is late[- ]?infer (?:running|up))\b/i.test(text)) return "late_infer_status";
   if (/\b(vllm status|is vllm (?:running|up))\b/i.test(text)) return "vllm_status";
   if (/\bdownload (?:the )?(?:local |recommended )?model\b/i.test(text) || /\blist (?:local )?models\b/i.test(text)) {
     return "models";
@@ -264,6 +274,9 @@ export function speakerLabel(backend: RouterBackend, vllmModelId?: string, speci
     const model = backend.model || vllmModelId;
     return `Procedural 3D (${shortModelName(model)} local)`;
   }
+  if (backend.type === "lateinfer" || isLateInferId(backend.id)) {
+    return backend.model ? `${shortModelName(backend.model)} (Late infer)` : "Late infer";
+  }
   if (backend.type === "vllm" || backend.id.startsWith("vllm")) {
     const model = backend.model || vllmModelId;
     return `${shortModelName(model)} local`;
@@ -275,6 +288,7 @@ export function speakerLabel(backend: RouterBackend, vllmModelId?: string, speci
     return backend.model ? `${shortModelName(backend.model)} (llama.cpp)` : "llama.cpp";
   }
   if (backend.id === "gemini" || /gemini/i.test(backend.id)) return "Gemini";
+  if (backend.id === "grok" || /grok|\bxai\b/i.test(backend.id)) return "Grok";
   if (backend.id === "cursor-cloud" || backend.runtime === "cloud") return "Cursor cloud";
   if (backend.id === "cursor-local" || (backend.type === "cursor" && backend.runtime === "local")) {
     return "Cursor local";
@@ -317,7 +331,10 @@ function specialistFor(
     if (intent === "review") return pick(["reviewer", "builder"]) ?? "builder";
     return pick(["planner", "builder"]) ?? "builder";
   }
-  if (backendId.startsWith("vllm") || backendId === "local") {
+  if (isLateInferId(backendId) || backendId === "local") {
+    return matching[0]?.id ?? pick(["late-infer-chat"]) ?? matching[0]?.id ?? "late-infer-chat";
+  }
+  if (backendId.startsWith("vllm")) {
     return matching[0]?.id ?? pick(["vllm-chat"]) ?? matching[0]?.id ?? "vllm-chat";
   }
   if (isOllamaId(backendId)) {
@@ -327,6 +344,9 @@ function specialistFor(
     return matching[0]?.id ?? pick(["llamacpp-chat"]) ?? matching[0]?.id ?? "llamacpp-chat";
   }
   if (backendId === "gemini") return pick(["gemini-planner"]) ?? matching[0]?.id ?? "gemini-planner";
+  if (backendId === "grok" || /grok/i.test(backendId)) {
+    return pick(["grok-chat"]) ?? matching[0]?.id ?? "grok-chat";
+  }
   if (intent === "review") return pick(["reviewer"]) ?? matching[0]?.id ?? backendId;
   if (intent === "reason" || intent === "general") {
     return pick(["planner", "gemini-planner", "vllm-chat"]) ?? matching[0]?.id ?? backendId;
@@ -336,6 +356,22 @@ function specialistFor(
 
 function findBackend(backends: RouterBackend[], id: string): RouterBackend | undefined {
   return backends.find((b) => b.id === id);
+}
+
+function isLateInferId(id: string): boolean {
+  return id === "late-infer" || id === "lateinfer" || id.startsWith("late-infer") || id.startsWith("lateinfer");
+}
+
+function isLateInferBackend(backend: RouterBackend): boolean {
+  return backend.type === "lateinfer" || isLateInferId(backend.id);
+}
+
+function isVllmId(id: string): boolean {
+  return id === "vllm" || id.startsWith("vllm");
+}
+
+function lateInferBackend(backends: RouterBackend[]): RouterBackend | undefined {
+  return backends.find((b) => isLateInferBackend(b) && b.ready) ?? backends.find(isLateInferBackend);
 }
 
 function vllmBackend(backends: RouterBackend[]): RouterBackend | undefined {
@@ -377,15 +413,23 @@ function resolvePinTarget(
   _vllmRunning: boolean,
 ): { backend?: RouterBackend; error?: string; suggestedAction?: ChatSuggestedAction } {
   const normalized = pin.trim().toLowerCase();
-  if (normalized === "local") {
-    const vllm = vllmBackend(backends);
-    if (vllm?.ready) return { backend: vllm };
+  if (normalized === "local" || normalized === "late-infer" || normalized === "lateinfer") {
+    const late = lateInferBackend(backends);
+    if (late?.ready) return { backend: late };
     return {
-      error: "Local vLLM is not running.",
-      suggestedAction: {
-        label: "Start recommended local model",
-        action: "start_vllm",
-      },
+      error:
+        late?.reason ??
+        "Late infer is not running on this computer (127.0.0.1:8010). Use Local models → Start on your computer.",
+      suggestedAction: startLateInferAction(),
+      backend: undefined,
+    };
+  }
+  if (normalized === "vllm") {
+    const found = vllmBackend(backends);
+    if (found?.ready) return { backend: found };
+    return {
+      error: found?.reason ?? "vLLM is not running on this computer.",
+      suggestedAction: startLateInferAction(),
       backend: undefined,
     };
   }
@@ -418,9 +462,10 @@ function resolvePinTarget(
   const direct = findBackend(backends, pin) ?? findBackend(backends, normalized);
   if (direct) {
     if (direct.ready) return { backend: direct };
-    const suggested =
-      direct.type === "vllm"
-        ? { label: "Start recommended local model", action: "start_vllm" as const }
+    const suggested = isLateInferBackend(direct)
+      ? startLateInferAction()
+      : direct.type === "vllm"
+        ? startLateInferAction()
         : { label: "Open backends", action: "open_settings" as const, payload: { page: "backends" } };
     return { error: direct.reason ?? `Backend "${direct.id}" is not ready.`, suggestedAction: suggested };
   }
@@ -486,28 +531,44 @@ function asSpeaker(backend: RouterBackend, intent: ChatIntent, ctx: RouterContex
   };
 }
 
-const DEBATE_PREFERENCE = ["vllm", "ollama", "llamacpp", "gemini", "anthropic", "openai", "cursor-local", "cursor-cloud"];
+const DEBATE_PREFERENCE = [
+  "lateinfer",
+  "ollama",
+  "llamacpp",
+  "vllm",
+  "gemini",
+  "grok",
+  "anthropic",
+  "openai",
+  "cursor-local",
+  "cursor-cloud",
+];
 
 function debateRank(backend: RouterBackend): number {
-  if (isLocalServerBackend(backend)) return 0;
+  if (isLateInferBackend(backend)) return 0;
+  if (isLocalServerBackend(backend)) return 1;
   const idx = DEBATE_PREFERENCE.indexOf(backend.id);
   return idx === -1 ? 50 : idx;
 }
 
 function isVllmBackend(backend: RouterBackend): boolean {
-  return backend.type === "vllm" || backend.id.startsWith("vllm");
+  return backend.type === "vllm" || isVllmId(backend.id);
 }
 
 function isLocalServerBackend(backend: RouterBackend): boolean {
+  return isLateInferBackend(backend);
+}
+
+function isLegacyLocalEngine(backend: RouterBackend): boolean {
   return isVllmBackend(backend) || isOllamaBackend(backend) || isLlamaCppBackend(backend);
 }
 
 /** Cloud/API specialists that join a round-table when ready. Not SKIP_UNLESS_NAMED. */
 function isRoundtableCloud(backend: RouterBackend): boolean {
   const id = backend.id;
-  if (id === "gemini" || id === "anthropic" || id === "openai") return true;
+  if (id === "gemini" || id === "grok" || id === "anthropic" || id === "openai") return true;
   if (id === "cursor-local" || id === "cursor-cloud" || backend.type === "cursor") return true;
-  if (/gemini/i.test(id)) return true;
+  if (/gemini/i.test(id) || /grok|\bxai\b/i.test(id)) return true;
   return false;
 }
 
@@ -525,6 +586,7 @@ function pickDebateSpeakers(
   needsWrites: boolean,
   preferLocal: boolean,
   visual3d: boolean,
+  includeLegacy: boolean,
 ): RouteSpeaker[] {
   const sorted = [...ready].sort((a, b) => {
     if (visual3d && isVllmBackend(a) && isVllmBackend(b)) {
@@ -535,7 +597,12 @@ function pickDebateSpeakers(
   });
   const locals = sorted.filter(isLocalServerBackend);
   const clouds = sorted.filter((b) => !isLocalServerBackend(b) && isRoundtableCloud(b));
-  const others = sorted.filter((b) => !isLocalServerBackend(b) && !isRoundtableCloud(b));
+  const others = sorted.filter(
+    (b) =>
+      !isLocalServerBackend(b) &&
+      !isRoundtableCloud(b) &&
+      (includeLegacy || !isLegacyLocalEngine(b)),
+  );
   const maxSpeakers = Math.max(8, locals.length + clouds.length);
   const chosen: RouterBackend[] = [];
   const take = (backend: RouterBackend) => {
@@ -572,6 +639,28 @@ function pickCloser(
   return asSpeaker(ready[0]!, intent, ctx, visual3d);
 }
 
+/** Token-cheap locals for simple/general asks: late-infer → ollama → llamacpp → vllm. */
+function pickCheapLocal(ready: RouterBackend[]): RouterBackend | undefined {
+  return (
+    ready.find(isLateInferBackend) ??
+    ready.find(isOllamaBackend) ??
+    ready.find(isLlamaCppBackend) ??
+    ready.find(isVllmBackend)
+  );
+}
+
+/** Cloud/API escalation for hard reasoning when locals are skipped or unavailable. */
+function pickCloudEscalation(ready: RouterBackend[]): RouterBackend | undefined {
+  return (
+    ready.find((b) => b.id === "gemini" || /gemini/i.test(b.id)) ??
+    ready.find((b) => b.id === "grok" || /grok|\bxai\b/i.test(b.id)) ??
+    ready.find((b) => b.id === "anthropic") ??
+    ready.find((b) => b.id === "openai" || b.id === "openrouter") ??
+    ready.find((b) => b.id === "cursor-local") ??
+    ready.find((b) => b.id === "cursor-cloud" || b.runtime === "cloud")
+  );
+}
+
 function pickSingle(
   intent: ChatIntent,
   ready: RouterBackend[],
@@ -583,25 +672,27 @@ function pickSingle(
   if (needsWrites || intent === "code") {
     const cursor = writerBackend(ready, preferLocal);
     if (cursor) return asSpeaker(cursor, intent, ctx, visual3d);
+    // No Cursor writer: draft on a ready local (apply-patch path may follow).
+    const localDraft = pickCheapLocal(ready);
+    if (localDraft) return asSpeaker(localDraft, intent, ctx, visual3d);
   }
   if (visual3d) {
-    const gemini = ready.find((b) => b.id === "gemini");
+    const gemini = ready.find((b) => b.id === "gemini" || /gemini/i.test(b.id));
     if (gemini) return asSpeaker(gemini, intent, ctx, visual3d);
-    const mistral = ready.find((b) => b.id === "vllm-mistral-7b-instruct");
-    if (mistral && ctx.vllmRunning !== false) return asSpeaker(mistral, intent, ctx, visual3d);
   }
-  const vllm = ready.find((b) => b.type === "vllm" || b.id.startsWith("vllm"));
-  if (vllm && ctx.vllmRunning !== false) return asSpeaker(vllm, intent, ctx, visual3d);
-  const ollama = ready.find(isOllamaBackend);
-  if (ollama) return asSpeaker(ollama, intent, ctx, visual3d);
-  const llamaCpp = ready.find(isLlamaCppBackend);
-  if (llamaCpp) return asSpeaker(llamaCpp, intent, ctx, visual3d);
-  const gemini = ready.find((b) => b.id === "gemini");
-  if (gemini) return asSpeaker(gemini, intent, ctx, visual3d);
-  const cursor = ready.find((b) => b.id === "cursor-local") ?? ready.find((b) => b.id === "cursor-cloud");
-  if (cursor) return asSpeaker(cursor, intent, ctx, visual3d);
-  const first = ready[0];
-  return first ? asSpeaker(first, intent, ctx, visual3d) : undefined;
+  // Hard reasoning → cloud/Cursor when ready; otherwise fall back to cheap local.
+  if (intent === "reason") {
+    const cloud = pickCloudEscalation(ready);
+    if (cloud) return asSpeaker(cloud, intent, ctx, visual3d);
+    const local = pickCheapLocal(ready);
+    if (local) return asSpeaker(local, intent, ctx, visual3d);
+  }
+  // Simple/general Q&A → smallest ready local, then cloud only if no local is up.
+  const cheap = pickCheapLocal(ready);
+  if (cheap) return asSpeaker(cheap, intent, ctx, visual3d);
+  const cloud = pickCloudEscalation(ready);
+  if (cloud) return asSpeaker(cloud, intent, ctx, visual3d);
+  return ready[0] ? asSpeaker(ready[0], intent, ctx, visual3d) : undefined;
 }
 
 function formatChip(kind: RouteDecision["kind"], speakers: RouteSpeaker[], closer?: RouteSpeaker): string {
@@ -614,15 +705,15 @@ function formatChip(kind: RouteDecision["kind"], speakers: RouteSpeaker[], close
   return labels[0] ?? "Auto";
 }
 
-function startVllmAction(): ChatSuggestedAction {
-  return { label: "Start recommended local model", action: "start_vllm" };
+function startLateInferAction(): ChatSuggestedAction {
+  return { label: "Start Late infer on your computer", action: "start_late_infer" };
 }
 
 function cursorKeyError(preferLocal: boolean): { error: string; suggestedAction: ChatSuggestedAction } {
   return {
     error: preferLocal
-      ? "File-changing work needs Cursor local with a write-allowlisted cwd. Tiny local vLLM cannot edit the repo. Set CURSOR_API_KEY in Settings → Backends (or .env), then Reload env. Get a key from Cursor Dashboard → Integrations."
-      : "File-changing work needs Cursor (local or cloud). Tiny local vLLM cannot edit the repo. Set CURSOR_API_KEY in Settings → Backends (or .env), then Reload env. Get a key from Cursor Dashboard → Integrations.",
+      ? "File-changing work needs Cursor local with a write-allowlisted cwd. Late infer and other local models cannot edit the repo. Set CURSOR_API_KEY in Settings → Backends (or .env), then Reload env. Get a key from Cursor Dashboard → Integrations."
+      : "File-changing work needs Cursor (local or cloud). Late infer and other local models cannot edit the repo. Set CURSOR_API_KEY in Settings → Backends (or .env), then Reload env. Get a key from Cursor Dashboard → Integrations.",
     suggestedAction: { label: "Open backends", action: "open_settings", payload: { page: "backends" } },
   };
 }
@@ -752,13 +843,7 @@ export function routeChat(ctx: RouterContext): RouteDecision {
   }
 
   if (ready.length === 0) {
-    const vllm = vllmBackend(ctx.backends);
     const gemini = findBackend(ctx.backends, "gemini");
-    const suggested = !vllm?.ready || ctx.vllmRunning === false ? startVllmAction() : {
-      label: "Open backends",
-      action: "open_settings" as const,
-      payload: { page: "backends" },
-    };
     return {
       kind: "error",
       pin: pinLower,
@@ -766,8 +851,8 @@ export function routeChat(ctx: RouterContext): RouteDecision {
       chip: "none ready",
       error: gemini && !gemini.ready
         ? `No backends are ready. ${gemini.reason ?? "Gemini is not ready."}`
-        : "No backends are ready. Start local vLLM, connect Ollama or llama.cpp, or add an API key in Settings.",
-      suggestedAction: suggested,
+        : "No backends are ready. Start Late infer on your computer (Local models → Start on your computer, 127.0.0.1:8010), or add an API key in Settings.",
+      suggestedAction: startLateInferAction(),
     };
   }
 
@@ -795,16 +880,11 @@ export function routeChat(ctx: RouterContext): RouteDecision {
   const debateReady =
     ready.length >= 2 &&
     (!needsWrites || Boolean(cursorWriter) || applyPatch);
-  const multipleVllm = ready.filter(isVllmBackend).length >= 2;
-  const multipleOtherLocal =
-    ready.filter(isVllmBackend).length === 0 &&
-    ready.filter((b) => isOllamaBackend(b) || isLlamaCppBackend(b)).length >= 2;
-  const multipleLocalModels = multipleVllm || multipleOtherLocal;
-  const autoDebate =
-    mode === "auto" && debateReady && (DEBATE_INTENTS.has(intent) || multipleLocalModels);
+  // Auto debate only for review (or explicit debate pin). Code writes stay on Cursor single.
+  const autoDebate = mode === "auto" && debateReady && DEBATE_INTENTS.has(intent);
 
   if (forceDebate || autoDebate) {
-    const speakers = pickDebateSpeakers(intent, ready, ctx, needsWrites, preferLocal, visual3d);
+    const speakers = pickDebateSpeakers(intent, ready, ctx, needsWrites, preferLocal, visual3d, forceDebate);
     if (speakers.length >= 2) {
       const closer = pickCloser(intent, speakers, ready, ctx, needsWrites, preferLocal, visual3d);
       const rounds = ctx.followUp ? 1 : DEFAULT_ROUNDS;
@@ -834,7 +914,7 @@ export function routeChat(ctx: RouterContext): RouteDecision {
       intent,
       chip: "none ready",
       error: "No backends are ready.",
-      suggestedAction: startVllmAction(),
+      suggestedAction: startLateInferAction(),
     };
   }
 
@@ -861,8 +941,8 @@ export function routeChat(ctx: RouterContext): RouteDecision {
     ...approval,
     ...(applyPatch ? { applyPatch: true } : {}),
     suggestedAction:
-      speaker.backendId !== "vllm-local" && ctx.vllmRunning === false && !needsWrites
-        ? startVllmAction()
+      speaker.backendId !== "late-infer" && !needsWrites && !ready.some(isLateInferBackend)
+        ? startLateInferAction()
         : undefined,
   };
 }

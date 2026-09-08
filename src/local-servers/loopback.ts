@@ -1,6 +1,9 @@
 /** Loopback bind/connect host for local model HTTP. Never 0.0.0.0. */
 export const LOOPBACK_HOST = "127.0.0.1" as const;
 
+export const LATE_INFER_PORT = 8010;
+export const DEFAULT_LATE_INFER_BASE = `http://${LOOPBACK_HOST}:${LATE_INFER_PORT}/v1`;
+export const DEFAULT_LATE_INFER_MODEL = "Qwen/Qwen2.5-0.5B-Instruct";
 export const DEFAULT_OLLAMA_BASE = `http://${LOOPBACK_HOST}:11434/v1`;
 export const DEFAULT_LLAMACPP_BASE = `http://${LOOPBACK_HOST}:8080/v1`;
 

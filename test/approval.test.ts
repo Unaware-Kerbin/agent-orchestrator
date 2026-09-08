@@ -26,6 +26,14 @@ function mockOrchestrator(cwd: string, dispatches: DispatchInput[]): Orchestrato
     catalog: async () => ({
       backends: [
         {
+          id: "late-infer",
+          type: "lateinfer",
+          ready: true,
+          writesLocalFiles: false,
+          runtime: "local",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
+        },
+        {
           id: "vllm-local",
           type: "vllm",
           ready: true,
@@ -212,7 +220,7 @@ test("Late MCP wrap asking for interface descriptions does not dump the write al
   }
 });
 
-test("vLLM without Cursor writes fenced files after Approve (no Cursor dispatch)", async () => {
+test("Late infer without Cursor writes fenced files after Approve (no Cursor dispatch)", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "orch-patch-chat-"));
   const prevState = process.env.AGENT_ORCHESTRATOR_STATE_DIR;
   process.env.AGENT_ORCHESTRATOR_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-chat-state-"));
@@ -226,22 +234,21 @@ test("vLLM without Cursor writes fenced files after Approve (no Cursor dispatch)
     catalog: async () => ({
       backends: [
         {
-          id: "vllm-local",
-          type: "vllm",
+          id: "late-infer",
+          type: "lateinfer",
           ready: true,
           writesLocalFiles: false,
           runtime: "local",
           model: "Qwen/Qwen2.5-0.5B-Instruct",
         },
       ],
-      specialists: [{ id: "vllm-chat", backend: "vllm-local" }],
+      specialists: [{ id: "late-infer-chat", backend: "late-infer" }],
       localRuntime: {
-        vllm: {
+        lateinfer: {
           running: true,
           healthy: true,
-          backendId: "vllm-local",
-          modelId: "Qwen/Qwen2.5-0.5B-Instruct",
-          instances: [{ backendId: "vllm-local", healthy: true, running: true }],
+          backendId: "late-infer",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
         },
       },
     }),
@@ -252,7 +259,7 @@ test("vLLM without Cursor writes fenced files after Approve (no Cursor dispatch)
         status: "finished" as const,
         text: `Plan.\nsudo apt-get install pwned-package\n\`\`\`orchestrator-files\n{"files":[{"path":"README.md","content":"hello from patch\\n"}]}\n\`\`\``,
         specialist: input.specialist,
-        backend: input.backend ?? "vllm-local",
+        backend: input.backend ?? "late-infer",
         prompt: input.task,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -266,7 +273,7 @@ test("vLLM without Cursor writes fenced files after Approve (no Cursor dispatch)
       snapshot: () => ({
         hardware: { accelerators: [], ramMiB: 8192, primaryBackend: "cpu" },
         recommended: [],
-        vllm: { running: true },
+        lateinfer: { running: true },
         models: [],
       }),
     },
@@ -335,22 +342,21 @@ test("apply-patch Approve refuses an absolute path in the fence", async () => {
     catalog: async () => ({
       backends: [
         {
-          id: "vllm-local",
-          type: "vllm",
+          id: "late-infer",
+          type: "lateinfer",
           ready: true,
           writesLocalFiles: false,
           runtime: "local",
           model: "Qwen/Qwen2.5-0.5B-Instruct",
         },
       ],
-      specialists: [{ id: "vllm-chat", backend: "vllm-local" }],
+      specialists: [{ id: "late-infer-chat", backend: "late-infer" }],
       localRuntime: {
-        vllm: {
+        lateinfer: {
           running: true,
           healthy: true,
-          backendId: "vllm-local",
-          modelId: "Qwen/Qwen2.5-0.5B-Instruct",
-          instances: [{ backendId: "vllm-local", healthy: true, running: true }],
+          backendId: "late-infer",
+          model: "Qwen/Qwen2.5-0.5B-Instruct",
         },
       },
     }),
@@ -361,7 +367,7 @@ test("apply-patch Approve refuses an absolute path in the fence", async () => {
         status: "finished" as const,
         text: `Plan.\n\`\`\`orchestrator-files\n${JSON.stringify({ files: [{ path: sibling, content: "PWNED" }] })}\n\`\`\``,
         specialist: input.specialist,
-        backend: input.backend ?? "vllm-local",
+        backend: input.backend ?? "late-infer",
         prompt: input.task,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -375,7 +381,7 @@ test("apply-patch Approve refuses an absolute path in the fence", async () => {
       snapshot: () => ({
         hardware: { accelerators: [], ramMiB: 8192, primaryBackend: "cpu" },
         recommended: [],
-        vllm: { running: true },
+        lateinfer: { running: true },
         models: [],
       }),
     },

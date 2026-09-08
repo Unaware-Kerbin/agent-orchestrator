@@ -8,6 +8,9 @@ export const GEMINI_KEY_ENV_NAMES = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
 ] as const;
 
+/** xAI Grok (OpenAI-compatible). Config default is XAI_API_KEY; GROK_API_KEY is an alias. */
+export const XAI_KEY_ENV_NAMES = ["XAI_API_KEY", "GROK_API_KEY"] as const;
+
 /** Bearer value for loopback OpenAI-compat servers when the client requires a token. Not a real secret. */
 export const VLLM_LOCAL_DUMMY_KEY = "sk-local";
 export const LOCAL_OPENAI_DUMMY_KEY = VLLM_LOCAL_DUMMY_KEY;
@@ -51,6 +54,17 @@ export function isOpenRouterBackend(id: string, config: OpenAIBackendConfig): bo
   return /openrouter/i.test(id) || base.includes("openrouter.ai");
 }
 
+export function isGrokBackend(id: string, config: OpenAIBackendConfig): boolean {
+  const base = (config.baseUrl ?? "").toLowerCase();
+  const env = (config.apiKeyEnv ?? "").toUpperCase();
+  return (
+    /^grok\b/i.test(id) ||
+    /^xai\b/i.test(id) ||
+    base.includes("api.x.ai") ||
+    XAI_KEY_ENV_NAMES.includes(env as (typeof XAI_KEY_ENV_NAMES)[number])
+  );
+}
+
 export function envNamesForBackend(id: string, config: BackendConfig): string[] {
   switch (config.type) {
     case "cursor":
@@ -59,12 +73,16 @@ export function envNamesForBackend(id: string, config: BackendConfig): string[] 
       return uniqueNames([config.apiKeyEnv, "ANTHROPIC_API_KEY"]);
     case "vllm":
       return uniqueNames([config.apiKeyEnv, "VLLM_API_KEY"]);
+    case "lateinfer":
     case "ollama":
     case "llamacpp":
       return [];
     case "openai":
       if (isGeminiBackend(id, config)) {
         return uniqueNames([config.apiKeyEnv, ...GEMINI_KEY_ENV_NAMES]);
+      }
+      if (isGrokBackend(id, config)) {
+        return uniqueNames([config.apiKeyEnv, ...XAI_KEY_ENV_NAMES]);
       }
       if (isOpenRouterBackend(id, config)) {
         return uniqueNames([config.apiKeyEnv, "OPENROUTER_API_KEY", "OPENAI_API_KEY"]);
@@ -80,7 +98,7 @@ export function backendNeedsKey(id: string, config: BackendConfig): boolean {
   if (config.type === "anthropic") return true;
   if (config.type === "http") return false;
   if (config.type === "vllm") return false;
-  if (config.type === "ollama" || config.type === "llamacpp") return false;
+  if (config.type === "lateinfer" || config.type === "ollama" || config.type === "llamacpp") return false;
   if (config.type === "openai") {
     if (config.apiKey === "ollama") return false;
     if (isLocalOpenAiUrl(config.baseUrl)) return false;
@@ -92,6 +110,7 @@ export function backendNeedsKey(id: string, config: BackendConfig): boolean {
 export function defaultBaseUrl(config: BackendConfig): string | undefined {
   if (config.type === "openai") return config.baseUrl ?? "https://api.openai.com/v1";
   if (config.type === "vllm") return config.baseUrl ?? "http://127.0.0.1:8000/v1";
+  if (config.type === "lateinfer") return config.baseUrl ?? "http://127.0.0.1:8010/v1";
   if (config.type === "ollama") return config.baseUrl ?? "http://127.0.0.1:11434/v1";
   if (config.type === "llamacpp") return config.baseUrl ?? "http://127.0.0.1:8080/v1";
   if (config.type === "anthropic") return config.baseUrl;
@@ -105,6 +124,7 @@ export function backendModel(config: BackendConfig): string | undefined {
     config.type === "openai" ||
     config.type === "anthropic" ||
     config.type === "vllm" ||
+    config.type === "lateinfer" ||
     config.type === "ollama" ||
     config.type === "llamacpp"
   ) {

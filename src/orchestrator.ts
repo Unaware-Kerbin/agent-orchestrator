@@ -181,6 +181,7 @@ export class Orchestrator {
     }));
     const ollama = backends.find((b) => b.type === "ollama");
     const llamacpp = backends.filter((b) => b.type === "llamacpp");
+    const lateinfer = backends.find((b) => b.type === "lateinfer");
     return {
       backends,
       specialists,
@@ -192,6 +193,15 @@ export class Orchestrator {
       },
       localRuntime: {
         ...this.localModels.catalogSummary(),
+        lateinfer: lateinfer
+          ? {
+              running: lateinfer.ready,
+              model: lateinfer.model,
+              baseUrl: lateinfer.baseUrl,
+              reason: lateinfer.reason,
+              models: lateinfer.modelChoices,
+            }
+          : { running: false, reason: "late-infer idle on 127.0.0.1:8010" },
         ollama: ollama
           ? {
               running: ollama.ready,

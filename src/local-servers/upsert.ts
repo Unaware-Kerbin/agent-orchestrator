@@ -6,6 +6,16 @@ export const DEFAULT_OLLAMA_BACKEND_ID = "ollama";
 export const DEFAULT_OLLAMA_SPECIALIST_ID = "ollama-chat";
 export const DEFAULT_LLAMACPP_BACKEND_ID = "llamacpp";
 export const DEFAULT_LLAMACPP_SPECIALIST_ID = "llamacpp-chat";
+export const DEFAULT_LATE_INFER_BACKEND_ID = "late-infer";
+export const DEFAULT_LATE_INFER_SPECIALIST_ID = "late-infer-chat";
+
+export type LocalCompatType = "lateinfer" | "ollama" | "llamacpp";
+
+function localLabel(type: LocalCompatType): string {
+  if (type === "lateinfer") return "Late infer";
+  if (type === "ollama") return "Ollama";
+  return "llama.cpp";
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -31,7 +41,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Re-parse after a text patch and refuse type/baseUrl drift off loopback. */
 export function assertLocalBackendPatch(
   yamlText: string,
-  fields: { backendId: string; type: "ollama" | "llamacpp"; baseUrl: string; model: string },
+  fields: { backendId: string; type: LocalCompatType; baseUrl: string; model: string },
 ): void {
   const parsed = parseYaml(yamlText);
   if (!isRecord(parsed) || !isRecord(parsed.backends)) {
@@ -44,7 +54,7 @@ export function assertLocalBackendPatch(
   if (backend.type !== fields.type) {
     throw new Error(`Refusing config write: backend "${fields.backendId}" type must remain ${fields.type}`);
   }
-  const label = fields.type === "ollama" ? "Ollama" : "llama.cpp";
+  const label = localLabel(fields.type);
   if (typeof backend.baseUrl !== "string") {
     throw new Error(`Refusing config write: ${label} baseUrl missing`);
   }
@@ -81,7 +91,7 @@ export function patchLocalBackendYaml(
   yamlText: string,
   fields: {
     backendId: string;
-    type: "ollama" | "llamacpp";
+    type: LocalCompatType;
     baseUrl: string;
     model: string;
     apiKey?: string;
@@ -89,7 +99,7 @@ export function patchLocalBackendYaml(
 ): string {
   const id = fields.backendId.trim();
   if (!id) throw new Error("backend id required");
-  const label = fields.type === "ollama" ? "Ollama" : "llama.cpp";
+  const label = localLabel(fields.type);
   const model = parseModelId(fields.model);
   const baseUrl = normalizeLoopbackOpenAiUrl(fields.baseUrl, label);
   const found = mappingBlocksInSection(yamlText, "backends").find((block) => block.id === id);
@@ -150,7 +160,7 @@ export function patchLocalOrchestratorYaml(
   yamlText: string,
   fields: {
     backendId: string;
-    type: "ollama" | "llamacpp";
+    type: LocalCompatType;
     baseUrl: string;
     model: string;
     apiKey?: string;
@@ -172,4 +182,8 @@ export function ollamaSpecialistDescription(): string {
 
 export function llamaCppSpecialistDescription(): string {
   return "Local llama.cpp llama-server (text only; file writes stay on Cursor)";
+}
+
+export function lateInferSpecialistDescription(): string {
+  return "Late infer on your computer (OpenAI-compatible, loopback 127.0.0.1:8010; file writes stay on Cursor)";
 }

@@ -23,9 +23,11 @@ const SPECIALISTS: RouterSpecialist[] = [
   { id: "reviewer", backend: "openai" },
   { id: "pr-triage", backend: "cursor-local" },
   { id: "gemini-planner", backend: "gemini" },
+  { id: "grok-chat", backend: "grok" },
   { id: "procedural-3d-artist", backend: "gemini" },
   { id: "procedural-3d-local", backend: "vllm-mistral-7b-instruct" },
   { id: "vllm-mistral-7b-instruct", backend: "vllm-mistral-7b-instruct" },
+  { id: "late-infer-chat", backend: "late-infer" },
   { id: "vllm-chat", backend: "vllm-local" },
   { id: "ollama-chat", backend: "ollama" },
   { id: "llamacpp-chat", backend: "llamacpp" },
@@ -37,6 +39,8 @@ function backend(id: string, extra: Partial<RouterBackend> = {}): RouterBackend 
     extra.type ??
     (id.startsWith("vllm")
       ? "vllm"
+      : id === "late-infer" || id.startsWith("late-infer") || id.startsWith("lateinfer")
+        ? "lateinfer"
       : id.startsWith("cursor")
         ? "cursor"
         : id === "anthropic"
@@ -91,10 +95,10 @@ test("hardware / Arc GPU questions are control, not a chat model", () => {
   assert.equal(decision.chip, "orchestrator");
 });
 
-test("start vLLM is a control action", () => {
-  const decision = routeChat(ctx({ message: "start the recommended local model", backends: [backend("vllm-local", { ready: false })] }));
+test("start Late infer is a control action", () => {
+  const decision = routeChat(ctx({ message: "start the recommended local model", backends: [backend("late-infer", { ready: false, type: "lateinfer" })] }));
   assert.equal(decision.kind, "control");
-  assert.equal(decision.control, "start_vllm");
+  assert.equal(decision.control, "start_late_infer");
 });
 
 test("allowlist questions stay on control tools", () => {
@@ -104,43 +108,35 @@ test("allowlist questions stay on control tools", () => {
   assert.equal(decision.control, "allowlist");
 });
 
-test("code/fix/PR with two or more ready backends is a round-table debate", () => {
+test("code/fix/PR with Cursor ready stays single on Cursor (no default debate)", () => {
   const decision = routeChat(
     ctx({
       message: "troubleshoot this PR and propose a fix",
       backends: [
-        backend("vllm-local", { model: "Qwen/Qwen2.5-14B-Instruct" }),
+        backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-14B-Instruct" }),
         backend("gemini"),
         backend("cursor-local"),
       ],
-      vllmRunning: true,
-      vllmModelId: "Qwen/Qwen2.5-14B-Instruct",
     }),
   );
-  assert.equal(decision.kind, "debate");
-  assert.equal(decision.rounds, DEFAULT_ROUNDS);
-  assert.ok((decision.speakers?.length ?? 0) >= 2);
-  assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
-  assert.ok(decision.speakers?.some((s) => s.backendId === "gemini"));
-  assert.equal(decision.closer?.backendId, "cursor-local");
-  assert.equal(decision.chip, "Debate");
-  for (const speaker of decision.speakers ?? []) {
-    assert.equal(speaker.label.includes(" · "), false, "speaker labels must not merge model names");
-  }
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.intent, "code");
+  assert.equal(decision.speakers?.[0]?.backendId, "cursor-local");
+  assert.equal(decision.speakers?.[0]?.specialist, "builder");
+  assert.equal(decision.rounds, undefined);
 });
 
-test("cloud-with-local-draft shape becomes bounce debate, not a one-way workflow", () => {
+test("code implement with Cursor cloud (no local writer) stays single on Cursor cloud", () => {
   const decision = routeChat(
     ctx({
       message: "implement the login rate limiter",
-      backends: [backend("vllm-local"), backend("cursor-cloud", { writesLocalFiles: false })],
+      backends: [backend("late-infer"), backend("cursor-cloud", { writesLocalFiles: false })],
       vllmRunning: true,
     }),
   );
-  assert.equal(decision.kind, "debate");
-  assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
-  assert.ok(decision.speakers?.some((s) => s.backendId === "cursor-cloud"));
-  assert.equal(decision.closer?.backendId, "cursor-cloud");
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.intent, "code");
+  assert.equal(decision.speakers?.[0]?.backendId, "cursor-cloud");
 });
 
 test("pin skips debate even when several backends are ready", () => {
@@ -161,6 +157,10 @@ test("explicitly naming a backend honors it", () => {
   assert.equal(detectNamedBackend("use gemini to draft a plan"), "gemini");
   assert.equal(detectNamedBackend("start gemma locally"), "local");
   assert.equal(detectNamedBackend("pin the phi-4 model"), "local");
+  assert.equal(detectNamedBackend("use late-infer"), "late-infer");
+  assert.equal(detectNamedBackend("ask late infer"), "late-infer");
+  assert.equal(detectNamedBackend("use vllm"), "vllm");
+  assert.equal(detectNamedBackend("use local vllm"), "vllm");
   const decision = routeChat(
     ctx({
       message: "use gemini to draft a plan",
@@ -184,10 +184,41 @@ test("only one ready backend is single-agent chat", () => {
   assert.equal(decision.speakers?.[0]?.backendId, "gemini");
 });
 
-test("general Q&A prefers ready local vLLM, then Gemini, then Cursor", () => {
+test("general Q&A prefers late-infer → ollama → llamacpp → vllm, then cloud", () => {
+  const withLate = routeChat(
+    ctx({
+      message: "what is a stock trading bot?",
+      backends: [backend("late-infer"), backend("ollama"), backend("vllm-local"), backend("gemini"), backend("cursor-local")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(withLate.kind, "single");
+  assert.equal(withLate.intent, "general");
+  assert.equal(withLate.speakers?.[0]?.backendId, "late-infer");
+
+  const withOllama = routeChat(
+    ctx({
+      message: "what is a stock trading bot?",
+      backends: [backend("ollama"), backend("llamacpp"), backend("vllm-local"), backend("gemini")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(withOllama.kind, "single");
+  assert.equal(withOllama.speakers?.[0]?.backendId, "ollama");
+
+  const withLlama = routeChat(
+    ctx({
+      message: "what is a stock trading bot?",
+      backends: [backend("llamacpp"), backend("vllm-local"), backend("gemini")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(withLlama.kind, "single");
+  assert.equal(withLlama.speakers?.[0]?.backendId, "llamacpp");
+
   const withVllm = routeChat(
     ctx({
-      message: "what is MCP?",
+      message: "what is a stock trading bot?",
       backends: [backend("vllm-local"), backend("gemini"), backend("cursor-local")],
       vllmRunning: true,
     }),
@@ -195,14 +226,14 @@ test("general Q&A prefers ready local vLLM, then Gemini, then Cursor", () => {
   assert.equal(withVllm.kind, "single");
   assert.equal(withVllm.speakers?.[0]?.backendId, "vllm-local");
 
-  const withGemini = routeChat(
+  const withCloud = routeChat(
     ctx({
-      message: "what is MCP?",
+      message: "what is a stock trading bot?",
       backends: [backend("vllm-local", { ready: false }), backend("gemini"), backend("cursor-local")],
-      vllmRunning: false,
     }),
   );
-  assert.equal(withGemini.speakers?.[0]?.backendId, "gemini");
+  assert.equal(withCloud.kind, "single");
+  assert.equal(withCloud.speakers?.[0]?.backendId, "gemini");
 });
 
 test("operator-started vLLM that probed ready still debates when the docker manager is stopped", () => {
@@ -224,40 +255,89 @@ test("operator-started vLLM that probed ready still debates when the docker mana
   assert.ok(ids.includes("gemini"), JSON.stringify(ids));
 });
 
-test("plan/review with two text backends debates; closer is last speaker when Cursor cannot write", () => {
+test("plan/reason escalates to cloud (Gemini) instead of debating or burning local tokens", () => {
   const decision = routeChat(
     ctx({
       message: "draft a plan for migrating off Redux",
-      backends: [backend("vllm-local"), backend("gemini")],
+      backends: [backend("late-infer"), backend("gemini")],
       vllmRunning: true,
     }),
   );
-  assert.equal(decision.kind, "debate");
+  assert.equal(decision.kind, "single");
   assert.equal(decision.intent, "reason");
-  assert.ok(decision.closer);
-  assert.notEqual(decision.closer?.backendId, "cursor-local");
+  assert.equal(decision.speakers?.[0]?.backendId, "gemini");
 });
 
-test("pin local when vLLM is down returns a start action", () => {
+test("review with two text backends still auto-debates", () => {
+  const decision = routeChat(
+    ctx({
+      message: "review this diff for merge readiness",
+      backends: [backend("late-infer"), backend("gemini")],
+    }),
+  );
+  assert.equal(decision.kind, "debate");
+  assert.equal(decision.intent, "review");
+  assert.ok((decision.speakers?.length ?? 0) >= 2);
+});
+
+test("pin local when Late infer is down returns a start_late_infer action", () => {
   const decision = routeChat(
     ctx({
       message: "summarize src/server.ts",
       pin: "local",
-      backends: [backend("vllm-local", { ready: false, reason: "vLLM not running at http://127.0.0.1:8000/v1" })],
+      backends: [backend("late-infer", { type: "lateinfer", ready: false, reason: "Late infer not running at http://127.0.0.1:8010/v1" })],
       vllmRunning: false,
     }),
   );
   assert.equal(decision.kind, "error");
-  assert.equal(decision.suggestedAction?.action, "start_vllm");
+  assert.equal(decision.suggestedAction?.action, "start_late_infer");
+  assert.match(decision.error ?? "", /your computer|8010/);
 });
 
-test("follow-up debate uses a single extra round", () => {
+test("pin local / late-infer does not fall back to vLLM on :8000", () => {
+  const backends = [
+    backend("late-infer", { type: "lateinfer", ready: false, reason: "Late infer not running at http://127.0.0.1:8010/v1" }),
+    backend("vllm-local", { model: "Qwen/Qwen2.5-7B-Instruct" }),
+    backend("gemini"),
+  ];
+  for (const pin of ["local", "late-infer", "lateinfer"]) {
+    const decision = routeChat(
+      ctx({
+        message: "what is MCP?",
+        pin,
+        backends,
+        vllmRunning: true,
+        vllmBackendIds: ["vllm-local"],
+      }),
+    );
+    assert.equal(decision.kind, "error", pin);
+    assert.equal(decision.speakers, undefined, pin);
+    assert.notEqual(decision.speakers?.[0]?.backendId, "vllm-local", pin);
+    assert.equal(decision.suggestedAction?.action, "start_late_infer", pin);
+    assert.match(decision.error ?? "", /8010|Late infer/i);
+  }
+});
+
+test("pin late-infer when ready stays on Late infer, not vLLM", () => {
   const decision = routeChat(
     ctx({
-      message: "implement the safer variant we discussed",
-      followUp: true,
-      backends: [backend("vllm-local"), backend("gemini"), backend("cursor-local")],
+      message: "what is MCP?",
+      pin: "late-infer",
+      backends: [backend("late-infer"), backend("vllm-local"), backend("gemini")],
       vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "late-infer");
+  assert.match(decision.speakers?.[0]?.label ?? "", /Late infer/i);
+});
+
+test("follow-up review debate uses a single extra round", () => {
+  const decision = routeChat(
+    ctx({
+      message: "review this diff for merge readiness",
+      followUp: true,
+      backends: [backend("late-infer"), backend("gemini"), backend("cursor-local")],
     }),
   );
   assert.equal(decision.kind, "debate");
@@ -275,13 +355,13 @@ test("code with only Cursor ready is a single builder, not a debate", () => {
   assert.equal(decision.speakers?.[0]?.specialist, "builder");
 });
 
-test("build + allowlisted path uses Cursor write closer, not vLLM-only", () => {
+test("build + allowlisted path routes Cursor single writer (Approve path)", () => {
   const path = "/tmp/example-app";
   const decision = routeChat(
     ctx({
       message: `I want you to build a stock trading bot here ${path}`,
       backends: [
-        backend("vllm-local", { model: "Qwen/Qwen2.5-0.5B-Instruct" }),
+        backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-0.5B-Instruct" }),
         backend("vllm-0.25b", { type: "vllm", model: "Qwen/Qwen2.5-0.25B-Instruct" }),
         backend("cursor-local"),
       ],
@@ -292,17 +372,12 @@ test("build + allowlisted path uses Cursor write closer, not vLLM-only", () => {
   );
   assert.equal(detectIntent(`I want you to build a stock trading bot here ${path}`), "code");
   assert.deepEqual(extractFilesystemPaths(`here ${path}`), [path]);
-  assert.equal(decision.kind, "debate");
+  assert.equal(decision.kind, "single");
   assert.equal(decision.needsWrites, true);
   assert.equal(decision.cwd, path);
-  assert.equal(decision.closer?.backendId, "cursor-local");
-  assert.equal(decision.closer?.writesLocalFiles, true);
+  assert.equal(decision.speakers?.[0]?.backendId, "cursor-local");
+  assert.equal(decision.speakers?.[0]?.writesLocalFiles, true);
   assert.equal(decision.applyPatch, undefined);
-  assert.equal(decision.chip, "Debate");
-  const labels = (decision.speakers ?? []).map((s) => s.label);
-  assert.equal(new Set(labels).size, labels.length);
-  assert.ok(!labels.some((l) => l.includes(" · ")));
-  assert.ok(decision.speakers?.some((s) => s.backendId === "cursor-local") || decision.closer?.backendId === "cursor-local");
 });
 
 test("extractFilesystemPaths accepts Windows drive-letter paths", () => {
@@ -379,7 +454,7 @@ test("two running vLLM models both speak in debate, even when Gemini is ready", 
   assert.equal(new Set(labels).size, labels.length, "each local model needs its own bubble");
 });
 
-test("Auto Q&A with two local vLLMs is a round-table, not a single speaker", () => {
+test("Auto Q&A uses one ready vLLM (not a round-table of leftover rows)", () => {
   const decision = routeChat(
     ctx({
       message: "what is a stock trading bot?",
@@ -390,8 +465,9 @@ test("Auto Q&A with two local vLLMs is a round-table, not a single speaker", () 
       vllmRunning: true,
     }),
   );
-  assert.equal(decision.kind, "debate");
-  assert.equal(decision.speakers?.length, 2);
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
+  assert.equal(decision.suggestedAction?.action, "start_late_infer");
 });
 
 test("a leftover Gemma yaml row does not join chat when only Qwen is running", () => {
@@ -411,7 +487,7 @@ test("a leftover Gemma yaml row does not join chat when only Qwen is running", (
   assert.equal(qa.kind, "single");
   assert.equal(qa.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
   assert.equal(
-    qa.speakers?.some((s) => s.backendId === "vllm-gemma-4-e2b-it"),
+    (qa.speakers ?? []).some((s) => s.backendId === "vllm-gemma-4-e2b-it"),
     false,
   );
 
@@ -423,23 +499,25 @@ test("a leftover Gemma yaml row does not join chat when only Qwen is running", (
       vllmBackendIds: ["vllm-qwen25-7b-instruct"],
     }),
   );
+  // Gemma row is not ready — pin/name should not silently fall through to Qwen as "gemma".
   assert.equal(named.kind, "error");
-  assert.equal(named.suggestedAction?.action, "start_vllm");
+  assert.equal(named.suggestedAction?.action, "start_late_infer");
 
   const localPin = routeChat(
     ctx({
-      message: "what is MCP?",
+      message: "what is the color of the sky now?",
       pin: "local",
       backends,
       vllmRunning: true,
       vllmBackendIds: ["vllm-qwen25-7b-instruct"],
     }),
   );
-  assert.equal(localPin.kind, "single");
-  assert.equal(localPin.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
+  assert.equal(localPin.kind, "error");
+  assert.equal(localPin.suggestedAction?.action, "start_late_infer");
+  assert.notEqual(localPin.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
 });
 
-test("Q&A prefers local vLLM and does not require Cursor writes", () => {
+test("Q&A prefers ready vLLM over Cursor when Late infer is down", () => {
   const decision = routeChat(
     ctx({
       message: "what is a stock trading bot?",
@@ -484,23 +562,20 @@ test("Single pin skips debate on a plan", () => {
   assert.equal(decision.speakers?.length, 1);
 });
 
-test("build with two tiny vLLMs and no Cursor uses apply-patch after Approve", () => {
+test("build with Late infer and no Cursor uses apply-patch after Approve", () => {
   const decision = routeChat(
     ctx({
       message: "build a stock trading bot here /tmp/demo-app",
       backends: [
-        backend("vllm-local", { model: "Qwen/Qwen2.5-0.5B-Instruct" }),
-        backend("vllm-tiny", { type: "vllm", model: "Qwen/Qwen2.5-0.25B-Instruct" }),
+        backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-0.5B-Instruct" }),
       ],
-      vllmRunning: true,
       allowedDirectories: ["/tmp/demo-app"],
     }),
   );
-  assert.equal(decision.kind, "debate");
+  assert.equal(decision.kind, "single");
   assert.equal(decision.applyPatch, true);
   assert.equal(decision.needsApproval, true);
-  assert.equal(decision.closer?.writesLocalFiles, false);
-  assert.equal(decision.closer?.backendId?.startsWith("vllm"), true);
+  assert.equal(decision.speakers?.[0]?.backendId, "late-infer");
 });
 
 test("pin vLLM for a build still uses Cursor when Cursor local is ready", () => {
@@ -551,7 +626,7 @@ test("debate speaker labels stay unmerged", () => {
     ctx({
       message: "review this diff for merge readiness",
       backends: [
-        backend("vllm-local", { model: "Qwen/Qwen2.5-0.5B-Instruct" }),
+        backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-0.5B-Instruct" }),
         backend("gemini"),
       ],
       vllmRunning: true,
@@ -572,6 +647,8 @@ test("speakerLabel prefers nickname over vendor defaults", () => {
     "Arc Qwen",
   );
   assert.equal(speakerLabel(backend("gemini")), "Gemini");
+  assert.equal(speakerLabel(backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-0.5B-Instruct" })), "Qwen2.5 0.5B (Late infer)");
+  assert.equal(speakerLabel(backend("late-infer", { type: "lateinfer" })), "Late infer");
 });
 
 test("debate speakers use nicknames when set", () => {
@@ -579,16 +656,14 @@ test("debate speakers use nicknames when set", () => {
     ctx({
       message: "review this diff for merge readiness",
       backends: [
-        backend("vllm-local", { model: "Qwen/Qwen2.5-0.5B-Instruct", nickname: "Arc Qwen" }),
+        backend("late-infer", { type: "lateinfer", model: "Qwen/Qwen2.5-0.5B-Instruct", nickname: "Home Qwen" }),
         backend("gemini", { nickname: "Flash" }),
       ],
-      vllmRunning: true,
-      vllmModelId: "Qwen/Qwen2.5-0.5B-Instruct",
     }),
   );
   assert.equal(decision.kind, "debate");
   const labels = (decision.speakers ?? []).map((s) => s.label);
-  assert.ok(labels.includes("Arc Qwen"));
+  assert.ok(labels.includes("Home Qwen"));
   assert.ok(labels.includes("Flash"));
 });
 
@@ -599,6 +674,7 @@ test("3D art questions route the procedural-3d-artist specialist in debate", () 
   const decision = routeChat(
     ctx({
       message: "create procedural 3D ship meshes and export OBJ files",
+      pin: "debate",
       backends: [
         backend("vllm-mistral-7b-instruct", { model: "mistralai/Mistral-7B-Instruct-v0.3" }),
         backend("gemini"),
@@ -626,8 +702,25 @@ test("3D Q&A without writes prefers procedural-3d-artist on Gemini", () => {
     }),
   );
   assert.equal(decision.intent, "reason");
-  assert.equal(decision.kind, "debate");
-  assert.ok(decision.speakers?.some((s) => s.specialist === "procedural-3d-artist"));
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "gemini");
+  assert.equal(decision.speakers?.[0]?.specialist, "procedural-3d-artist");
+});
+
+
+test("naming grok or xai pins the Grok backend", () => {
+  assert.equal(detectNamedBackend("use grok for this"), "grok");
+  assert.equal(detectNamedBackend("ask xai"), "grok");
+  assert.equal(speakerLabel(backend("grok")), "Grok");
+  const decision = routeChat(
+    ctx({
+      message: "use grok to summarize this",
+      backends: [backend("grok"), backend("gemini"), backend("late-infer")],
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "grok");
+  assert.equal(decision.speakers?.[0]?.label, "Grok");
 });
 
 test("naming ollama or llama.cpp pins that local server, not vLLM", () => {
@@ -662,7 +755,19 @@ test("naming ollama or llama.cpp pins that local server, not vLLM", () => {
   assert.equal(llama.speakers?.[0]?.backendId, "llamacpp");
 });
 
-test("Auto Q&A with Ollama and llama.cpp ready is a local round-table", () => {
+test("naming vLLM still pins vLLM, not Late infer", () => {
+  const decision = routeChat(
+    ctx({
+      message: "use vllm to summarize this",
+      backends: [backend("late-infer"), backend("vllm-local"), backend("gemini")],
+      vllmRunning: true,
+    }),
+  );
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "vllm-local");
+});
+
+test("Auto Q&A with leftover Ollama and llama.cpp prefers Ollama single, not round-table", () => {
   const decision = routeChat(
     ctx({
       message: "what is a stock trading bot?",
@@ -672,13 +777,12 @@ test("Auto Q&A with Ollama and llama.cpp ready is a local round-table", () => {
       ],
     }),
   );
-  assert.equal(decision.kind, "debate");
-  assert.equal(decision.speakers?.length, 2);
-  assert.ok(decision.speakers?.some((s) => s.backendId === "ollama"));
-  assert.ok(decision.speakers?.some((s) => s.backendId === "llamacpp"));
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "ollama");
+  assert.equal(decision.suggestedAction?.action, "start_late_infer");
 });
 
-test("ready Ollama joins Auto debate with vLLM", () => {
+test("Auto plan escalates to Cursor and does not add leftover Ollama or vLLM speakers", () => {
   const decision = routeChat(
     ctx({
       message: "draft a plan for the cache layer",
@@ -690,12 +794,14 @@ test("ready Ollama joins Auto debate with vLLM", () => {
       vllmRunning: true,
     }),
   );
-  assert.equal(decision.kind, "debate");
-  assert.ok(decision.speakers?.some((s) => s.backendId === "vllm-local"));
-  assert.ok(decision.speakers?.some((s) => s.backendId === "ollama"));
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.intent, "reason");
+  assert.equal(decision.speakers?.[0]?.backendId, "cursor-local");
+  assert.equal(decision.speakers?.some((s) => s.backendId === "vllm-local"), false);
+  assert.equal(decision.speakers?.some((s) => s.backendId === "ollama"), false);
 });
 
-test("Auto Q&A with one running vLLM does not pull in Ollama Gemma", () => {
+test("Auto Q&A prefers Ollama over running vLLM when both are ready", () => {
   const decision = routeChat(
     ctx({
       message: "what is the color of the sky now?",
@@ -708,7 +814,7 @@ test("Auto Q&A with one running vLLM does not pull in Ollama Gemma", () => {
     }),
   );
   assert.equal(decision.kind, "single");
-  assert.equal(decision.speakers?.[0]?.backendId, "vllm-qwen25-7b-instruct");
+  assert.equal(decision.speakers?.[0]?.backendId, "ollama");
 });
 
 test("plain GUI chat_send is unchanged: wrap extract is identity", () => {
@@ -764,6 +870,21 @@ test("Late MCP isolation wrap is routed on the operator turn, not the allowlist 
   assert.equal(decision.intent, "general");
 });
 
+test("Late MCP wrap Auto uses chat routing to late-infer, not a silent vLLM fallback", () => {
+  const decision = routeChat(
+    ctx({
+      message: lateWrap("show vlan"),
+      pin: "auto",
+      backends: [backend("late-infer"), backend("vllm-local"), backend("gemini")],
+      vllmRunning: true,
+    }),
+  );
+  assert.notEqual(decision.kind, "control");
+  assert.equal(decision.kind, "single");
+  assert.equal(decision.speakers?.[0]?.backendId, "late-infer");
+  assert.equal(decision.speakers?.[0]?.specialist, "late-infer-chat");
+});
+
 test("Late wrap with debate pin is a round-table, not Gemma-only and not an allowlist dump", () => {
   const question = "Are you guys able to find the interface descriptions on this device I am connected to?";
   const wrapped = lateWrap(question);
@@ -797,8 +918,7 @@ test("Late follow-up '?' is not an allowlist dump", () => {
     ctx({
       message: lateWrap("?"),
       pin: "single",
-      backends: [backend("vllm-local")],
-      vllmRunning: true,
+      backends: [backend("late-infer")],
     }),
   );
   assert.equal(decision.kind, "single");
@@ -859,7 +979,7 @@ test("Late wrap playbook with granted cwd uses apply-patch after Approve", () =>
     ctx({
       message: lateWrap(question),
       pin: "debate",
-      backends: [backend("vllm-local"), backend("cursor-local"), backend("gemini")],
+      backends: [backend("late-infer"), backend("cursor-local"), backend("gemini")],
       vllmRunning: true,
       workspace: { path: cwd, allowed: true, cwd },
     }),

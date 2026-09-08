@@ -12,7 +12,7 @@ import { isEnvVarName } from "./providers/keys.js";
 import { isGeminiOpenAiConfig, parseGeminiModelId } from "./providers/gemini.js";
 import { parseModelId, parseNickname } from "./identity.js";
 import { normalizeLoopbackOpenAiUrl } from "./local-servers/loopback.js";
-import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./local-servers/loopback.js";
+import { DEFAULT_LATE_INFER_BASE, DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./local-servers/loopback.js";
 import { bindMcpListenHost, isAutoListenHost, MCP_AUTO_LISTEN_HOST } from "./mcp/bind.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -118,9 +118,10 @@ function parseBackend(id: string, raw: unknown): BackendConfig {
       probeTimeoutMs: typeof raw.probeTimeoutMs === "number" ? raw.probeTimeoutMs : undefined,
     });
   }
-  if (type === "ollama" || type === "llamacpp") {
-    const label = type === "ollama" ? "Ollama" : "llama.cpp";
-    const fallback = type === "ollama" ? DEFAULT_OLLAMA_BASE : DEFAULT_LLAMACPP_BASE;
+  if (type === "lateinfer" || type === "ollama" || type === "llamacpp") {
+    const label = type === "lateinfer" ? "Late infer" : type === "ollama" ? "Ollama" : "llama.cpp";
+    const fallback =
+      type === "lateinfer" ? DEFAULT_LATE_INFER_BASE : type === "ollama" ? DEFAULT_OLLAMA_BASE : DEFAULT_LLAMACPP_BASE;
     const rawUrl = typeof raw.baseUrl === "string" && raw.baseUrl.trim() ? raw.baseUrl.trim() : fallback;
     return withNickname(id, raw, {
       type,

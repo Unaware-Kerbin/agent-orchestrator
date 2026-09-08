@@ -192,6 +192,10 @@ test("Gemma 4 E2B Intel args stay TP=1 and include mamba cache dtype", () => {
     "float16",
   ]);
   assert.deepEqual(gemma4VllmExtraArgs("Qwen/Qwen2.5-7B-Instruct", "/llm/models/qwen"), []);
+  assert.ok(gemma4VllmExtraArgs("google/gemma-4-12B-it", "/llm/models/google--gemma-4-12B-it").includes("--quantization"));
+  assert.ok(gemma4VllmExtraArgs("google/gemma-4-12B-it", "/m").includes("fp8"));
+  assert.ok(gemma4VllmExtraArgs("google/gemma-4-12B-it", "/m").includes("--limit-mm-per-prompt"));
+  assert.equal(gemma4VllmExtraArgs("google/gemma-4-E2B-it", "/m").includes("--quantization"), false);
   const plan = buildIntelDockerRunArgs({
     image: PREFERRED_LLM_SCALER_REF,
     hostPort: 8001,

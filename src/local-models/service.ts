@@ -103,7 +103,7 @@ export class LocalModelService {
     const intelDocker = vllm.intelDocker ?? this.vllm.dockerCatalog();
     const hardwareWithDocker: HardwareSnapshot = {
       ...hardware,
-      notes: dockerHardwareNotes(hardware, intelDocker),
+      notes: dockerHardwareNotes(hardware),
       intelDocker,
     };
     const cloud = this.getConfig().backends["cursor-cloud"];
@@ -139,7 +139,7 @@ export class LocalModelService {
     const intelDocker = this.vllm.dockerCatalog();
     return {
       ...hardware,
-      notes: dockerHardwareNotes(hardware, intelDocker),
+      notes: dockerHardwareNotes(hardware),
       intelDocker,
       preferredRuntime: intelDocker.preferred && hardware.primaryBackend === "intel-xpu" ? "docker" : "host",
     };
@@ -435,14 +435,9 @@ export class LocalModelService {
   }
 }
 
-function dockerHardwareNotes(hardware: HardwareSnapshot, docker: IntelDockerCatalog): string[] {
-  const notes = hardware.notes.filter((note) => !note.startsWith("Intel vLLM Docker"));
-  if (docker.preferred) {
-    notes.push(
-      `Intel vLLM Docker: ${docker.images.map((row) => `${row.ref} (${row.size || row.id})`).join(", ")}. Preferred: ${docker.preferred.ref}. Default start path on intel-xpu is Docker.`,
-    );
-  } else if (hardware.primaryBackend === "intel-xpu") {
-    notes.push(`Intel vLLM Docker: ${docker.error ?? "no matching local images."}`);
-  }
-  return notes;
+function dockerHardwareNotes(hardware: HardwareSnapshot): string[] {
+  // Local models is late-infer on your computer. Do not advertise leftover Intel vLLM Docker images.
+  return hardware.notes.filter(
+    (note) => !/^Intel vLLM Docker/i.test(note) && !/llm-scaler-vllm/i.test(note) && !/intel\/vllm/i.test(note),
+  );
 }

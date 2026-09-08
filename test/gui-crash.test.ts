@@ -34,7 +34,7 @@ function finished(input: DispatchInput, text: string): OrchestratedRun {
     status: "finished",
     text,
     specialist: input.specialist,
-    backend: input.backend ?? "vllm-local",
+    backend: input.backend ?? "late-infer",
     prompt: input.task,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -52,28 +52,27 @@ function crashHarness(cwd: string, allow: WriteAllowlist) {
     catalog: async () => ({
       backends: [
         {
-          id: "vllm-local",
-          type: "vllm",
+          id: "late-infer",
+          type: "lateinfer",
           ready: true,
           writesLocalFiles: false,
           runtime: "local",
           model: "gemma",
         },
       ],
-      specialists: [{ id: "vllm-chat", backend: "vllm-local" }],
+      specialists: [{ id: "late-infer-chat", backend: "late-infer" }],
       localRuntime: {
-        vllm: {
+        lateinfer: {
           running: true,
           healthy: true,
-          backendId: "vllm-local",
-          modelId: "gemma",
-          instances: [{ backendId: "vllm-local", healthy: true, running: true }],
+          backendId: "late-infer",
+          model: "gemma",
         },
       },
     }),
     localModels: {
       snapshot: () => ({
-        vllm: { running: true, modelId: "gemma" },
+        lateinfer: { running: true, model: "gemma" },
         models: [],
         recommended: [],
         jobs: [],

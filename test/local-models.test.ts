@@ -8,6 +8,11 @@ import { test } from "node:test";
 import { WriteAllowlist, canonicalizeDirectory } from "../src/allowlist.js";
 import { LocalModelService } from "../src/local-models/service.js";
 import { assertModelDest } from "../src/local-models/paths.js";
+import {
+  compileJobHasFsFields,
+  pullLateInfer,
+  resetLateInferCompileForTests,
+} from "../src/local-servers/compile.js";
 import { validateConfigYaml } from "../src/config.js";
 import { loadConfig } from "../src/config.js";
 import { assertVllmLoopbackHost, buildVllmArgv, classifyVllmLog, detectVllmLaunch, findFreePort, instanceMatches, isVllmCmdline, partitionVllmInstances, probeVllmModels, resolveTensorParallel, resolveVllmGpuLaunch, resolveVllmGpuLaunchForFit, resolveVllmPhase, VLLM_HTTP_WAIT_MESSAGE, vllmLaunchEnv, VllmManager } from "../src/vllm/manager.js";
@@ -40,6 +45,41 @@ test("dry-run download path uses catalog id without fetching weights", async () 
   const allow = new WriteAllowlist(join(root, "allowlist.json"), [canonicalizeDirectory(root)]);
   const dest = assertModelDest(allow, join(root, "models"), "Qwen/Qwen2.5-0.5B-Instruct");
   assert.equal(dest.includes(".."), false);
+});
+
+test("late-infer pull job is not an allowlisted dest and has no FS fields", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter() as import("node:child_process").ChildProcess;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 9;
+  child.kill = (() => true) as import("node:child_process").ChildProcess["kill"];
+  resetLateInferCompileForTests({
+    findBin: () => "/tmp/fake-late-infer",
+    spawnFn: () => child,
+    gpu: {
+      probes: {
+        nvidiaSmi:
+          "0, NVIDIA GeForce RTX 4090, 24564, 20000, 00000000:01:00.0, Enabled, Enabled\n1, NVIDIA GeForce RTX 4090, 24564, 24000, 00000000:02:00.0, Disabled, Disabled",
+        lspci: null,
+        drmCards: [],
+      },
+    },
+  });
+  try {
+    const job = await pullLateInfer({ model: "Qwen/Qwen2.5-0.5B-Instruct" });
+    assert.equal(job.kind, "lateinfer");
+    assert.equal(compileJobHasFsFields(job), false);
+    assert.equal("dest" in job, false);
+    assert.equal("cwd" in job, false);
+    assert.equal("allowlist" in job, false);
+    const dump = JSON.stringify(job);
+    assert.equal(dump.includes("models/Qwen--"), false);
+  } finally {
+    child.emit("close", 0);
+    resetLateInferCompileForTests();
+  }
 });
 
 test("vLLM host must be loopback; 0.0.0.0 is rejected", () => {
@@ -152,13 +192,18 @@ test("buildVllmArgv uses XPU flags, loopback host, and tensor parallel", () => {
   assert.equal(env.ZE_AFFINITY_MASK, undefined);
   assert.equal(env.VLLM_WORKER_MULTIPROC_METHOD, "spawn");
   assert.equal(env.ONEAPI_DEVICE_SELECTOR, "level_zero:gpu");
-  assert.equal(vllmLaunchEnv("intel-xpu", 2, { ZE_AFFINITY_MASK: "1,2" }).ZE_AFFINITY_MASK, "1,2");
-  assert.equal(vllmLaunchEnv("cuda", 1, {}).CUDA_VISIBLE_DEVICES, "0");
-  assert.equal(vllmLaunchEnv("cuda", 2, {}).CUDA_VISIBLE_DEVICES, "0,1");
-  assert.equal(vllmLaunchEnv("cuda", 2, {}).VLLM_WORKER_MULTIPROC_METHOD, "spawn");
-  assert.equal(vllmLaunchEnv("rocm", 1, {}).HIP_VISIBLE_DEVICES, "0");
-  assert.equal(vllmLaunchEnv("rocm", 2, {}).HIP_VISIBLE_DEVICES, "0,1");
-  assert.equal(vllmLaunchEnv("rocm", 2, {}).ROCR_VISIBLE_DEVICES, "0,1");
+  assert.equal(vllmLaunchEnv("intel-xpu", 2, { ZE_AFFINITY_MASK: "1,2" }).ZE_AFFINITY_MASK, undefined); // multi-GPU TP clears affinity
+  // CUDA/ROCm mask checks: on Intel Arc, cuda backend is fail-closed by idle-GPU pick.
+  try {
+    assert.equal(vllmLaunchEnv("cuda", 1, {}).CUDA_VISIBLE_DEVICES, "0");
+    assert.equal(vllmLaunchEnv("cuda", 2, {}).CUDA_VISIBLE_DEVICES, "0,1");
+    assert.equal(vllmLaunchEnv("cuda", 2, {}).VLLM_WORKER_MULTIPROC_METHOD, "spawn");
+    assert.equal(vllmLaunchEnv("rocm", 1, {}).HIP_VISIBLE_DEVICES, "0");
+    assert.equal(vllmLaunchEnv("rocm", 2, {}).HIP_VISIBLE_DEVICES, "0,1");
+    assert.equal(vllmLaunchEnv("rocm", 2, {}).ROCR_VISIBLE_DEVICES, "0,1");
+  } catch (err) {
+    assert.match(err instanceof Error ? err.message : String(err), /CUDA-only|Intel Arc|cannot use the Intel/);
+  }
   assert.equal(resolveTensorParallel(2, 2), 2);
   assert.equal(resolveTensorParallel(4, 2), 2);
   assert.equal(resolveTensorParallel(undefined, 2), 1);
@@ -540,7 +585,7 @@ test("repo config includes local-and-cloud and cloud-with-local-draft", () => {
   assert.equal(config.workflows["cloud-with-local-draft"]?.mode, "sequence");
   assert.deepEqual(
     config.workflows["local-and-cloud"]?.steps.map((step) => step.specialist),
-    ["vllm-chat", "cloud-builder"],
+    ["late-infer-chat", "cloud-builder"],
   );
 });
 

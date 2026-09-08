@@ -11,13 +11,40 @@ import type { ChatSuggestedAction } from "../chat/types.js";
 import type { Orchestrator } from "../orchestrator.js";
 import { decodeLogoDataUrl, hasLogo, parseModelId, parseNickname, readLogo, removeLogo, saveLogo } from "../identity.js";
 import { envNamesForBackend, isEnvVarName } from "../providers/keys.js";
-import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, normalizeLoopbackOpenAiUrl } from "../local-servers/loopback.js";
-import { llamaServerOnPath, ollamaOnPath, probeLlamaCpp, probeOllama } from "../local-servers/status.js";
-import { startLlamaServer, startOllama, stopLocalServer } from "../local-servers/spawn.js";
+import { DEFAULT_LATE_INFER_BASE, DEFAULT_LATE_INFER_MODEL, DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, normalizeLoopbackOpenAiUrl } from "../local-servers/loopback.js";
+import { lateInferOnPath, llamaServerOnPath, ollamaOnPath, probeLateInfer, probeLlamaCpp, probeOllama } from "../local-servers/status.js";
 import {
+  convertLateInfer,
+  startLateInfer,
+  startOllama,
+  startLlamaServer,
+  stopLocalServer,
+  pullLateInfer,
+  deleteLateInferCompiled,
+  lateInferServeSnapshot,
+} from "../local-servers/spawn.js";
+import {
+  lateInferCompileView,
+  lateInferCompileJob,
+  listCompiledLateInferIds,
+  listCompiledLateInferRows,
+  pickLateInferGpuPlanModel,
+  isLateInferCompiledDeleteError,
+} from "../local-servers/compile.js";
+import { publicGpuPlan, resolveLateInferGpuPlan, vramMaxMiBForHubId } from "../local-servers/gpu-pick.js";
+import { emptyHubCatalog, listHubModels } from "../local-servers/hub-catalog.js";
+import { listGgufHubModels } from "../local-servers/hub-gguf-catalog.js";
+import { listGgufDownloadJobs, startGgufDownload } from "../local-servers/gguf-download.js";
+import {
+  DEFAULT_LATE_INFER_BACKEND_ID,
+  DEFAULT_LATE_INFER_SPECIALIST_ID,
+  DEFAULT_LLAMACPP_BACKEND_ID,
+  DEFAULT_LLAMACPP_SPECIALIST_ID,
   DEFAULT_OLLAMA_BACKEND_ID,
   DEFAULT_OLLAMA_SPECIALIST_ID,
   assertLocalBackendPatch,
+  lateInferSpecialistDescription,
+  llamaCppSpecialistDescription,
   ollamaSpecialistDescription,
   patchLocalOrchestratorYaml,
 } from "../local-servers/upsert.js";
@@ -62,6 +89,24 @@ export interface GuiListen {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** gpuId / useAllGpus / vramMaxMiB from Start or Download POST. Intel compile still fail-closes. */
+function lateInferGpuOptionsFromBody(rec: Record<string, unknown>): {
+  gpuId?: string;
+  useAllGpus: boolean;
+  vramMaxMiB?: number;
+} {
+  const gpuIdRaw = typeof rec.gpuId === "string" ? rec.gpuId : typeof rec.gpu_id === "string" ? rec.gpu_id : undefined;
+  const gpuId = gpuIdRaw?.trim() ? gpuIdRaw.trim() : undefined;
+  const useAllGpus = rec.useAllGpus === true || rec.use_all_gpus === true;
+  const vramMaxMiB =
+    typeof rec.vramMaxMiB === "number"
+      ? rec.vramMaxMiB
+      : typeof rec.vram_max_mib === "number"
+        ? rec.vram_max_mib
+        : undefined;
+  return { gpuId, useAllGpus, vramMaxMiB };
 }
 
 function responseAlive(res: ServerResponse): boolean {
@@ -881,7 +926,7 @@ export function startGuiServer(options: {
           }
         }
         yaml = patchBackendModelYaml(yaml, id, model);
-        if (type === "ollama" || type === "llamacpp") {
+        if (type === "lateinfer" || type === "ollama" || type === "llamacpp") {
           assertLocalBackendPatch(yaml, {
             backendId: id,
             type,
@@ -956,14 +1001,16 @@ export function startGuiServer(options: {
         send(res, 400, { error: "Backend id must match [a-zA-Z][a-zA-Z0-9_-]*" });
         return;
       }
-      const type = typeof body.type === "string" ? body.type : "vllm";
-      if (type !== "vllm" && type !== "openai" && type !== "ollama" && type !== "llamacpp") {
-        send(res, 400, { error: "GUI add-backend supports type vllm, openai, ollama, or llamacpp" });
+      const type = typeof body.type === "string" ? body.type : "lateinfer";
+      if (type !== "lateinfer" && type !== "vllm" && type !== "openai" && type !== "ollama" && type !== "llamacpp") {
+        send(res, 400, { error: "GUI add-backend supports type lateinfer, vllm, openai, ollama, or llamacpp" });
         return;
       }
-      let model = parseModelId(typeof body.model === "string" ? body.model : "");
+      let model = parseModelId(typeof body.model === "string" ? body.model : type === "lateinfer" ? DEFAULT_LATE_INFER_MODEL : "");
       const defaultBase =
-        type === "vllm"
+        type === "lateinfer"
+          ? DEFAULT_LATE_INFER_BASE
+          : type === "vllm"
           ? "http://127.0.0.1:8000/v1"
           : type === "ollama"
             ? DEFAULT_OLLAMA_BASE
@@ -972,8 +1019,9 @@ export function startGuiServer(options: {
               : "https://api.openai.com/v1";
       let baseUrl =
         typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : defaultBase;
-      if (type === "vllm" || type === "ollama" || type === "llamacpp") {
-        const label = type === "vllm" ? "vLLM" : type === "ollama" ? "Ollama" : "llama.cpp";
+      if (type === "lateinfer" || type === "vllm" || type === "ollama" || type === "llamacpp") {
+        const label =
+          type === "lateinfer" ? "Late infer" : type === "vllm" ? "vLLM" : type === "ollama" ? "Ollama" : "llama.cpp";
         try {
           baseUrl = normalizeLoopbackOpenAiUrl(baseUrl, label);
         } catch (error) {
@@ -1012,7 +1060,7 @@ export function startGuiServer(options: {
         model,
       };
       if (apiKeyEnv) record.apiKeyEnv = apiKeyEnv;
-      if ((type === "vllm" || type === "ollama" || type === "llamacpp") && body.probe === false) {
+      if ((type === "lateinfer" || type === "vllm" || type === "ollama" || type === "llamacpp") && body.probe === false) {
         record.probe = false;
       }
       if (type === "ollama") record.apiKey = "ollama";
@@ -1046,16 +1094,17 @@ export function startGuiServer(options: {
         currentParsed.specialists = specialists;
       }
       const yaml = stringifyYaml(currentParsed, { indent: 2, lineWidth: 0 });
-      if (type === "ollama" || type === "llamacpp") {
+      if (type === "lateinfer" || type === "ollama" || type === "llamacpp") {
         assertLocalBackendPatch(yaml, { backendId: id, type, baseUrl, model });
       }
       const parsed = writeConfigYaml(yaml, orchestrator.configPath);
-      if (type === "ollama" || type === "llamacpp") {
+      if (type === "lateinfer" || type === "ollama" || type === "llamacpp") {
         const written = parsed.backends[id];
         if (!written || written.type !== type) {
           throw new Error(`Refusing config write: backend "${id}" type must remain ${type}`);
         }
-        const label = type === "ollama" ? "Ollama" : "llama.cpp";
+        const label =
+          type === "lateinfer" ? "Late infer" : type === "ollama" ? "Ollama" : "llama.cpp";
         normalizeLoopbackOpenAiUrl(written.baseUrl ?? "", label);
       }
       orchestrator.reloadConfig(parsed);
@@ -1192,14 +1241,173 @@ export function startGuiServer(options: {
       return;
     }
 
+    if (path === "/api/local-servers/hub-models" && method === "GET") {
+      const q = url.searchParams.get("q") ?? "";
+      try {
+        refreshRuntimeEnv();
+        const catalog = await listHubModels({ q });
+        send(res, 200, catalog);
+      } catch (error) {
+        send(
+          res,
+          200,
+          emptyHubCatalog({
+            error: error instanceof Error ? error.message : String(error),
+            offline: true,
+            q,
+          }),
+        );
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/hub-gguf-models" && method === "GET") {
+      const q = url.searchParams.get("q") ?? "";
+      try {
+        refreshRuntimeEnv();
+        send(res, 200, await listGgufHubModels({ q }));
+      } catch (error) {
+        send(res, 200, {
+          models: [],
+          budgetMiB: 0,
+          budgetGiB: 0,
+          hint: "GGUF Hub store unavailable.",
+          offline: true,
+          ggufDir: "",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/gguf-download" && method === "GET") {
+      send(res, 200, { jobs: listGgufDownloadJobs() });
+      return;
+    }
+
+    if (path === "/api/local-servers/gguf-download" && method === "POST") {
+      try {
+        const rec = isRecord(body) ? body : {};
+        const repo =
+          typeof rec.repo === "string" && rec.repo.trim()
+            ? rec.repo.trim()
+            : typeof rec.model === "string" && rec.model.trim()
+              ? rec.model.trim()
+              : "";
+        if (!repo) {
+          send(res, 400, { error: "repo (Hub org/model) required" });
+          return;
+        }
+        const filename = typeof rec.filename === "string" && rec.filename.trim() ? rec.filename.trim() : undefined;
+        refreshRuntimeEnv();
+        const job = await startGgufDownload({ repo, filename });
+        send(res, 200, job);
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/download" && method === "POST") {
+      try {
+        const kindRaw = isRecord(body) && typeof body.kind === "string" ? body.kind : "lateinfer";
+        if (kindRaw === "llamacpp" || kindRaw === "gguf") {
+          const rec = isRecord(body) ? body : {};
+          const repo =
+            typeof rec.repo === "string" && rec.repo.trim()
+              ? rec.repo.trim()
+              : typeof rec.model === "string" && rec.model.trim()
+                ? rec.model.trim()
+                : "";
+          if (!repo) {
+            send(res, 400, { error: "repo or model (Hub org/model) required for GGUF download" });
+            return;
+          }
+          const filename = typeof rec.filename === "string" && rec.filename.trim() ? rec.filename.trim() : undefined;
+          refreshRuntimeEnv();
+          send(res, 200, await startGgufDownload({ repo, filename }));
+          return;
+        }
+        if (kindRaw !== "lateinfer") {
+          send(res, 400, { error: "kind must be lateinfer or llamacpp" });
+          return;
+        }
+        const rec = isRecord(body) ? body : {};
+        const model = typeof rec.model === "string" && rec.model.trim() ? parseModelId(rec.model) : DEFAULT_LATE_INFER_MODEL;
+        const gpu = lateInferGpuOptionsFromBody(rec);
+        refreshRuntimeEnv();
+        const job = await pullLateInfer({
+          model,
+          gpuId: gpu.gpuId,
+          useAllGpus: gpu.useAllGpus,
+          vramMaxMiB: gpu.vramMaxMiB ?? vramMaxMiBForHubId(model),
+        });
+        send(res, 200, job);
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/convert" && method === "POST") {
+      try {
+        const rec = isRecord(body) ? body : {};
+        const model = typeof rec.model === "string" && rec.model.trim() ? parseModelId(rec.model) : "";
+        if (!model) {
+          send(res, 400, { error: "model string required" });
+          return;
+        }
+        const gpu = lateInferGpuOptionsFromBody(rec);
+        refreshRuntimeEnv();
+        const job = await convertLateInfer({
+          model,
+          gpuId: gpu.gpuId,
+          useAllGpus: gpu.useAllGpus,
+          vramMaxMiB: gpu.vramMaxMiB ?? vramMaxMiBForHubId(model),
+        });
+        send(res, 200, job);
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
     if (path === "/api/local-servers/start" && method === "POST") {
       try {
-        const kind = isRecord(body) && body.kind === "llamacpp" ? "llamacpp" : "ollama";
-        if (kind === "llamacpp") {
-          const modelPath = isRecord(body) && typeof body.modelPath === "string" ? body.modelPath.trim() : "";
+        const kindRaw = isRecord(body) && typeof body.kind === "string" ? body.kind : "lateinfer";
+        if (kindRaw === "lateinfer") {
+          const rec = isRecord(body) ? body : {};
+          const model =
+            typeof rec.model === "string" && rec.model.trim()
+              ? parseModelId(rec.model)
+              : DEFAULT_LATE_INFER_MODEL;
+          const gpu = lateInferGpuOptionsFromBody(rec);
+          const vramMaxMiB = gpu.vramMaxMiB ?? vramMaxMiBForHubId(model);
+          const started = await startLateInfer({
+            model,
+            useAllGpus: gpu.useAllGpus,
+            gpuId: gpu.gpuId,
+            vramMaxMiB,
+          });
+          const yaml = readConfigYaml(orchestrator.configPath);
+          const next = patchLocalOrchestratorYaml(yaml, {
+            backendId: DEFAULT_LATE_INFER_BACKEND_ID,
+            type: "lateinfer",
+            baseUrl: DEFAULT_LATE_INFER_BASE,
+            model,
+            specialistId: DEFAULT_LATE_INFER_SPECIALIST_ID,
+            description: lateInferSpecialistDescription(),
+          });
+          orchestrator.reloadConfig(writeConfigYaml(next, orchestrator.configPath));
+          send(res, 200, { ...started, catalog: await orchestrator.catalog() });
+        } else if (kindRaw === "ollama") {
+          send(res, 200, await startOllama());
+        } else if (kindRaw === "llamacpp") {
+          const modelPath =
+            isRecord(body) && typeof body.modelPath === "string" ? body.modelPath.trim() : "";
           send(res, 200, await startLlamaServer(modelPath));
         } else {
-          send(res, 200, await startOllama());
+          send(res, 400, { error: "kind must be lateinfer, ollama, or llamacpp" });
         }
       } catch (error) {
         send(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1209,10 +1417,46 @@ export function startGuiServer(options: {
 
     if (path === "/api/local-servers/stop" && method === "POST") {
       try {
-        const kind = isRecord(body) && body.kind === "llamacpp" ? "llamacpp" : "ollama";
-        send(res, 200, stopLocalServer(kind));
+        const kindRaw = isRecord(body) && typeof body.kind === "string" ? body.kind : "lateinfer";
+        if (kindRaw !== "lateinfer" && kindRaw !== "ollama" && kindRaw !== "llamacpp") {
+          send(res, 400, { error: "kind must be lateinfer, ollama, or llamacpp" });
+          return;
+        }
+        send(res, 200, stopLocalServer(kindRaw));
       } catch (error) {
         send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    if (path === "/api/local-servers/delete" && method === "POST") {
+      try {
+        const kindRaw = isRecord(body) && typeof body.kind === "string" ? body.kind : "lateinfer";
+        if (kindRaw !== "lateinfer") {
+          send(res, 400, { error: "kind must be lateinfer" });
+          return;
+        }
+        const rec = isRecord(body) ? body : {};
+        const modelRaw =
+          typeof rec.model === "string"
+            ? rec.model
+            : typeof rec.id === "string"
+              ? rec.id
+              : typeof rec.hubId === "string"
+                ? rec.hubId
+                : "";
+        if (!modelRaw.trim()) {
+          send(res, 400, { error: "model string required" });
+          return;
+        }
+        const result = await deleteLateInferCompiled({
+          model: modelRaw,
+          confirm: rec.confirm === true,
+        });
+        send(res, 200, result);
+      } catch (error) {
+        const status = isLateInferCompiledDeleteError(error) ? error.httpStatus : 400;
+        send(res, status, { error: error instanceof Error ? error.message : String(error) });
       }
       return;
     }
@@ -1297,6 +1541,73 @@ export function startGuiServer(options: {
       return;
     }
 
+    if (path === "/api/llamacpp/connect" && method === "POST") {
+      try {
+        const configured = Object.values(orchestrator.config.backends).find((b) => b.type === "llamacpp");
+        const requestedUrl =
+          isRecord(body) && typeof body.baseUrl === "string" && body.baseUrl.trim()
+            ? normalizeLoopbackOpenAiUrl(body.baseUrl.trim(), "llama.cpp")
+            : configured?.type === "llamacpp"
+              ? configured.baseUrl
+              : DEFAULT_LLAMACPP_BASE;
+        const probe = await probeLlamaCpp({
+          baseUrl: requestedUrl,
+          apiKey: configured?.type === "llamacpp" ? configured.apiKey : undefined,
+        });
+        if (!probe.running) {
+          send(res, 400, { error: probe.reason, llamacpp: probe });
+          return;
+        }
+        const backendId =
+          isRecord(body) && typeof body.id === "string" && body.id.trim()
+            ? body.id.trim()
+            : DEFAULT_LLAMACPP_BACKEND_ID;
+        if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(backendId)) {
+          send(res, 400, { error: "Backend id must match [a-zA-Z][a-zA-Z0-9_-]*" });
+          return;
+        }
+        const model = parseModelId(
+          isRecord(body) && typeof body.model === "string" && body.model.trim()
+            ? body.model
+            : probe.models[0] ||
+              (configured?.type === "llamacpp" ? configured.model : undefined) ||
+              "local",
+        );
+        const yaml = readConfigYaml(orchestrator.configPath);
+        const next = patchLocalOrchestratorYaml(yaml, {
+          backendId,
+          type: "llamacpp",
+          baseUrl: probe.baseUrl,
+          model,
+          specialistId: DEFAULT_LLAMACPP_SPECIALIST_ID,
+          description: llamaCppSpecialistDescription(),
+        });
+        assertLocalBackendPatch(next, {
+          backendId,
+          type: "llamacpp",
+          baseUrl: probe.baseUrl,
+          model,
+        });
+        const parsed = writeConfigYaml(next, orchestrator.configPath);
+        const written = parsed.backends[backendId];
+        if (!written || written.type !== "llamacpp") {
+          throw new Error(`Refusing config write: backend "${backendId}" type must remain llamacpp`);
+        }
+        normalizeLoopbackOpenAiUrl(written.baseUrl ?? DEFAULT_LLAMACPP_BASE, "llama.cpp");
+        orchestrator.reloadConfig(parsed);
+        send(res, 200, {
+          ok: true,
+          id: backendId,
+          model,
+          llamacpp: probe,
+          catalog: await orchestrator.catalog(),
+        });
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
     if (path === "/api/llamacpp" && method === "GET") {
       try {
         const q = url.searchParams.get("baseUrl");
@@ -1353,8 +1664,13 @@ export function bindLoopbackOnly(requestedHost: string | undefined): string {
 }
 
 async function localServersSnapshot(orchestrator: Orchestrator) {
+  const lateCfg = Object.values(orchestrator.config.backends).find((b) => b.type === "lateinfer");
   const ollamaCfg = Object.values(orchestrator.config.backends).find((b) => b.type === "ollama");
   const llamaCfgs = Object.entries(orchestrator.config.backends).filter(([, b]) => b.type === "llamacpp");
+  const lateinfer = await probeLateInfer({
+    baseUrl: lateCfg?.type === "lateinfer" ? lateCfg.baseUrl : DEFAULT_LATE_INFER_BASE,
+    apiKey: lateCfg?.type === "lateinfer" ? lateCfg.apiKey : undefined,
+  });
   const ollama = await probeOllama({
     baseUrl: ollamaCfg?.type === "ollama" ? ollamaCfg.baseUrl : DEFAULT_OLLAMA_BASE,
     apiKey: ollamaCfg?.type === "ollama" ? ollamaCfg.apiKey : undefined,
@@ -1370,9 +1686,55 @@ async function localServersSnapshot(orchestrator: Orchestrator) {
           ),
         )
       : [];
+  const compile = lateInferCompileView();
+  const compiledModels = listCompiledLateInferIds();
+  const doneJob = lateInferCompileJob();
+  if (doneJob?.phase === "done" && doneJob.model && !compiledModels.includes(doneJob.model)) {
+    compiledModels.push(doneJob.model);
+  }
+  const serve = lateInferServeSnapshot(lateinfer);
+  const compiledRowsProbe = listCompiledLateInferRows(process.env);
+  const modelGuess = pickLateInferGpuPlanModel({
+    servingModel: lateinfer.models[0],
+    yamlModel: lateCfg?.type === "lateinfer" ? lateCfg.model : undefined,
+    compiledRows: compiledRowsProbe,
+    compiledIds: compiledModels,
+  });
+  const plan = resolveLateInferGpuPlan({ model: modelGuess });
+  const compiledRows = listCompiledLateInferRows(
+    process.env,
+    plan.visible[0]?.vendor ?? plan.primary?.vendor,
+  );
   return {
+    lateinfer: {
+      ...lateinfer,
+      downloading: compile.downloading,
+      phase: compile.phase,
+      message: compile.message,
+      error: compile.error,
+      percent: compile.percent,
+      bytes: compile.bytes,
+      totalBytes: compile.totalBytes,
+      etaSec: compile.etaSec,
+      compiledModels,
+      compiledRows,
+      starting: serve.starting,
+      processAlive: serve.processAlive,
+      servePhase: serve.servePhase,
+    },
     ollama,
     llamacpp,
+    gpu: publicGpuPlan(plan, {
+      processAlive: serve.processAlive,
+      pidFilePresent: serve.pidFilePresent,
+      ready: lateinfer.ready,
+      running: lateinfer.running,
+      device: lateinfer.device,
+      deviceKind: lateinfer.deviceKind,
+      weightsInHostRam: lateinfer.weightsInHostRam,
+      servePhase: serve.servePhase,
+    }),
+    lateInferBinary: lateInferOnPath() ?? null,
     llamaServerBinary: llamaServerOnPath() ?? null,
     ollamaBinary: ollamaOnPath() ?? null,
   };
@@ -1404,6 +1766,8 @@ function collectSecretMutations(body: Record<string, unknown>): {
 
 function secretNamesForConfig(orchestrator: Orchestrator): string[] {
   const names = new Set<string>(KNOWN_SECRET_NAMES);
+  names.add("XAI_API_KEY");
+  names.add("GROK_API_KEY");
   for (const [id, config] of Object.entries(orchestrator.config.backends)) {
     for (const name of envNamesForBackend(id, config)) names.add(name);
   }

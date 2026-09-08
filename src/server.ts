@@ -3,7 +3,18 @@ import * as z from "zod/v4";
 import { compactChatToolError } from "./chat/mcp-error.js";
 import type { ChatService } from "./chat/service.js";
 import type { Orchestrator } from "./orchestrator.js";
-import { probeLlamaCpp, probeOllama } from "./local-servers/status.js";
+import { probeLateInfer, probeLlamaCpp, probeOllama } from "./local-servers/status.js";
+import * as localServerSpawn from "./local-servers/spawn.js";
+import {
+  DEFAULT_LATE_INFER_BACKEND_ID,
+  DEFAULT_LATE_INFER_SPECIALIST_ID,
+  lateInferSpecialistDescription,
+  patchLocalOrchestratorYaml,
+} from "./local-servers/upsert.js";
+import { DEFAULT_LATE_INFER_BASE, DEFAULT_LATE_INFER_MODEL } from "./local-servers/loopback.js";
+import { listHubModels } from "./local-servers/hub-catalog.js";
+import { readConfigYaml, writeConfigYaml } from "./config.js";
+import { parseHubModelId, parseModelId } from "./identity.js";
 import { toRunView } from "./views.js";
 
 function json(data: unknown): string {
@@ -23,6 +34,19 @@ export function mcpChatToolIsError(_thread: unknown): boolean {
   return false;
 }
 
+function persistLateInferBackend(orchestrator: Orchestrator, model: string): void {
+  const yaml = readConfigYaml(orchestrator.configPath);
+  const next = patchLocalOrchestratorYaml(yaml, {
+    backendId: DEFAULT_LATE_INFER_BACKEND_ID,
+    type: "lateinfer",
+    baseUrl: DEFAULT_LATE_INFER_BASE,
+    model,
+    specialistId: DEFAULT_LATE_INFER_SPECIALIST_ID,
+    description: lateInferSpecialistDescription(),
+  });
+  orchestrator.reloadConfig(writeConfigYaml(next, orchestrator.configPath));
+}
+
 export function createServer(orchestrator: Orchestrator, chat: ChatService): McpServer {
   const server = new McpServer({
     name: "agent-orchestrator",
@@ -33,7 +57,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     "list_agents",
     {
       description:
-        "List specialist agents, backends (Cursor + external), workflows, write-allowlist directories, default cwd, and local-runtime status (hardware summary, vLLM running vs stopped, Cursor cloud / CURSOR_API_KEY). Call this before dispatching work so you pick a ready backend. Re-reads .env and GUI secrets on each call so newly added keys take effect without restarting Cursor. Local Cursor agents may only write inside allowed directories. Cloud Cursor agents cannot reach local vLLM; use local-and-cloud or cloud-with-local-draft workflows.",
+        "List specialist agents, backends (Cursor + external), workflows, write-allowlist directories, default cwd, and local-runtime status (late-infer running vs idle, Cursor cloud / CURSOR_API_KEY). Call this before dispatching work so you pick a ready backend. Re-reads .env and GUI secrets on each call so newly added keys take effect without restarting Cursor. Local Cursor agents may only write inside allowed directories. Cloud Cursor agents cannot reach localhost late-infer; use local-and-cloud or cloud-with-local-draft workflows.",
       inputSchema: z.object({}),
     },
     async () => textResult(await orchestrator.catalog()),
@@ -52,7 +76,7 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
         backend: z
           .string()
           .optional()
-          .describe("Override backend id from config, e.g. cursor-local, anthropic, openai, openrouter, gemini, vllm-local"),
+          .describe("Override backend id from config, e.g. cursor-local, anthropic, openai, openrouter, gemini, late-infer"),
         cwd: z
           .string()
           .optional()
@@ -380,6 +404,21 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
   );
 
   server.registerTool(
+    "list_hub_models",
+    {
+      description:
+        "List Hugging Face Instruct/chat safetensors for Late infer on your computer (same searchable catalog as the GUI). Always includes well-known Qwen/Gemma/Mistral/Llama/Phi Instruct ids; Hub API rows merge on top when reachable. Each row includes estimated VRAM at max usage (weights plus KV cache). Optional query (Gemma, Qwen, …). No filesystem path. Does not download. Public Hub ids are listed without Cloud AI; HF_TOKEN from Settings is used when present so gated listings appear. Extra pull_late_infer / delete_late_infer still wait for Approve.",
+      inputSchema: z.object({
+        q: z
+          .string()
+          .optional()
+          .describe("Optional search string, e.g. Gemma. Empty lists all families (newest first)."),
+      }),
+    },
+    async ({ q }) => textResult(await listHubModels({ q })),
+  );
+
+  server.registerTool(
     "recommend_local_models",
     {
       description:
@@ -520,6 +559,97 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
   );
 
   server.registerTool(
+    "pull_late_infer",
+    {
+      description:
+        "Pull a Hugging Face model snapshot and compile it for late-infer on this computer. Detects the idle GPU first (NVIDIA / AMD / Intel) and compiles for that vendor — Intel is never treated as NVIDIA. Requires a Hub org/model id. Extra calls wait for Late Approve. The destination is fixed by late-infer; this tool accepts no cwd, allowlist, write directory, or filesystem path.",
+      inputSchema: z.object({
+        model: z.string().describe("Hugging Face Hub model id, for example Qwen/Qwen2.5-0.5B-Instruct"),
+      }),
+    },
+    async ({ model }) => {
+      try {
+        return textResult(await localServerSpawn.pullLateInfer({ model: parseHubModelId(model) }));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_late_infer",
+    {
+      description:
+        "Start late-infer on this computer (OpenAI /v1 on 127.0.0.1:8010 only, never 0.0.0.0 or LAN). Spawns the late-infer binary (PATH or sibling Late target/release). First start loads Hugging Face safetensors (not packed). Extra calls wait for Late Approve — this is not auto-run.",
+      inputSchema: z.object({
+        model: z
+          .string()
+          .optional()
+          .describe("Hugging Face Instruct id (default Qwen/Qwen2.5-0.5B-Instruct)"),
+        use_all_gpus: z
+          .boolean()
+          .optional()
+          .describe(
+            "Override on your computer. Default Start pins the idle (non-display) GPU at full VRAM. Display GPUs stay at 70% — this runtime cannot apply that cap, so they are not attached. Does not start vLLM.",
+          ),
+      }),
+    },
+    async (args) => {
+      try {
+        const model = parseModelId(args.model?.trim() || DEFAULT_LATE_INFER_MODEL);
+        const started = await localServerSpawn.startLateInfer({
+          model,
+          useAllGpus: args.use_all_gpus === true,
+        });
+        persistLateInferBackend(orchestrator, model);
+        return textResult({ ...started, baseUrl: DEFAULT_LATE_INFER_BASE, model });
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "stop_late_infer",
+    {
+      description:
+        "Stop the late-infer process this orchestrator started (owned pid only). Does not kill a late-infer Late started.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        return textResult(localServerSpawn.stopLocalServer("lateinfer"));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_late_infer",
+    {
+      description:
+        "Remove a compiled late-infer snapshot from this computer (compiled dir only, not the Hub cache). Requires a Hub org/model id and confirm=true. Extra calls wait for Late Approve. If that snapshot is serving on 127.0.0.1:8010, Stop then delete. Does not delete bin/late-infer. Accepts no cwd, allowlist, write directory, or filesystem path.",
+      inputSchema: z.object({
+        model: z.string().describe("Hugging Face Hub model id, for example Qwen/Qwen2.5-0.5B-Instruct"),
+        confirm: z.boolean().describe("Must be true; refuses otherwise"),
+      }),
+    },
+    async (args) => {
+      try {
+        return textResult(
+          await localServerSpawn.deleteLateInferCompiled({
+            model: parseHubModelId(args.model),
+            confirm: args.confirm,
+          }),
+        );
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
     "delete_local_model",
     {
       description:
@@ -537,6 +667,27 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
             confirm: args.confirm,
           }),
         );
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "late_infer_status",
+    {
+      description:
+        "Probe loopback late-infer (default http://127.0.0.1:8010/v1). Does not start a process. Non-loopback URLs are rejected.",
+      inputSchema: z.object({
+        base_url: z
+          .string()
+          .optional()
+          .describe("OpenAI-compat base such as http://127.0.0.1:8010/v1; must be 127.0.0.1/localhost"),
+      }),
+    },
+    async (args) => {
+      try {
+        return textResult(await probeLateInfer({ baseUrl: args.base_url }));
       } catch (error) {
         return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
       }
@@ -589,6 +740,70 @@ export function createServer(orchestrator: Orchestrator, chat: ChatService): Mcp
     async (args) => {
       try {
         return textResult(await probeLlamaCpp({ baseUrl: args.base_url }));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_ollama",
+    {
+      description:
+        "Start Ollama serve on this computer (127.0.0.1:11434 only). Extra calls wait for Late Approve. Does not pull models.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        return textResult(await localServerSpawn.startOllama());
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "stop_ollama",
+    {
+      description: "Stop the Ollama process this orchestrator started (owned pid only).",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        return textResult(localServerSpawn.stopLocalServer("ollama"));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_llamacpp",
+    {
+      description:
+        "Start llama-server on this computer (127.0.0.1:8080 only) with an absolute .gguf path. Extra calls wait for Late Approve.",
+      inputSchema: z.object({
+        model_path: z.string().describe("Absolute path to a .gguf file on this computer"),
+      }),
+    },
+    async ({ model_path }) => {
+      try {
+        return textResult(await localServerSpawn.startLlamaServer(model_path));
+      } catch (error) {
+        return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "stop_llamacpp",
+    {
+      description: "Stop the llama-server process this orchestrator started (owned pid only).",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        return textResult(localServerSpawn.stopLocalServer("llamacpp"));
       } catch (error) {
         return textResult({ error: error instanceof Error ? error.message : String(error) }, true);
       }

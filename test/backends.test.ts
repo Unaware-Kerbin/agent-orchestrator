@@ -7,8 +7,10 @@ import { loadConfig, parseOrchestratorConfig, patchBackendModelYaml, patchBacken
 import { loadEnvFile } from "../src/env.js";
 import { GEMINI_ONE_ID_ERROR, parseGeminiModelId } from "../src/providers/gemini.js";
 import { OpenAIProvider } from "../src/providers/openai.js";
+import { LateInferProvider } from "../src/providers/local-openai.js";
 import { VllmProvider } from "../src/providers/vllm.js";
-import { isEnvVarName } from "../src/providers/keys.js";
+import { createProvider } from "../src/providers/index.js";
+import { defaultBaseUrl, envNamesForBackend, isEnvVarName, isGrokBackend } from "../src/providers/keys.js";
 
 const GEMINI_CFG = {
   type: "openai" as const,
@@ -48,6 +50,35 @@ test("isEnvVarName rejects secret-looking values", () => {
   assert.equal(isEnvVarName("AQ.not-a-real-key"), false);
   assert.equal(isEnvVarName("not.an.ENV"), false);
 });
+
+test("grok / xAI key aliases and default base URL", () => {
+  const cfg = {
+    type: "openai" as const,
+    baseUrl: "https://api.x.ai/v1",
+    model: "grok-4.6",
+    apiKeyEnv: "XAI_API_KEY",
+  };
+  assert.equal(isGrokBackend("grok", cfg), true);
+  assert.equal(isGrokBackend("openai", { ...cfg, baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" }), false);
+  const names = envNamesForBackend("grok", cfg);
+  assert.ok(names.includes("XAI_API_KEY"));
+  assert.ok(names.includes("GROK_API_KEY"));
+
+  withEnv({ ...GEMINI_ENV_CLEAR, XAI_API_KEY: undefined, GROK_API_KEY: undefined, OPENAI_API_KEY: undefined }, () => {
+    const health = new OpenAIProvider("grok", cfg).health();
+    assert.equal(health.ready, false);
+    assert.equal(health.needsKey, true);
+    assert.ok(health.secretNames?.includes("XAI_API_KEY"));
+    assert.ok(health.secretNames?.includes("GROK_API_KEY"));
+    assert.equal(health.baseUrl, "https://api.x.ai/v1");
+  });
+
+  withEnv({ XAI_API_KEY: undefined, GROK_API_KEY: "xai-test-key", OPENAI_API_KEY: undefined }, () => {
+    const health = new OpenAIProvider("grok", cfg).health();
+    assert.equal(health.ready, true);
+  });
+});
+
 
 test("gemini model must be a single id, not a list", () => {
   assert.equal(parseGeminiModelId("gemini-3.6-flash"), "gemini-3.6-flash");
@@ -344,7 +375,7 @@ test("config parse rejects secret stuffed into apiKeyEnv without echoing it", ()
   );
 });
 
-test("repo agents.config.yaml names GEMINI_API_KEY and includes vllm", () => {
+test("repo agents.config.yaml names GEMINI_API_KEY and defaults local to late-infer :8010", () => {
   const config = loadConfig();
   const gemini = config.backends.gemini;
   assert.equal(gemini?.type, "openai");
@@ -353,6 +384,13 @@ test("repo agents.config.yaml names GEMINI_API_KEY and includes vllm", () => {
     assert.equal(gemini.model, "gemini-3.6-flash");
     assert.match(gemini.baseUrl ?? "", /generativelanguage\.googleapis\.com/);
   }
+  const late = config.backends["late-infer"];
+  assert.equal(late?.type, "lateinfer");
+  if (late?.type === "lateinfer") {
+    assert.equal(late.baseUrl, "http://127.0.0.1:8010/v1");
+    assert.ok(late.model.length > 0);
+  }
+  assert.equal(config.specialists["late-infer-chat"]?.backend, "late-infer");
   const vllm = config.backends["vllm-local"];
   assert.equal(vllm?.type, "vllm");
   if (vllm?.type === "vllm") {
@@ -367,6 +405,120 @@ test("repo agents.config.yaml names GEMINI_API_KEY and includes vllm", () => {
     assert.ok(ollama.model.length > 0);
   }
   assert.equal(config.specialists["ollama-chat"]?.backend, "ollama");
+  const grok = config.backends.grok;
+  assert.equal(grok?.type, "openai");
+  if (grok?.type === "openai") {
+    assert.equal(grok.apiKeyEnv, "XAI_API_KEY");
+    assert.equal(grok.baseUrl, "https://api.x.ai/v1");
+    assert.match(grok.model ?? "", /^grok-/);
+  }
+  assert.equal(config.specialists["grok-chat"]?.backend, "grok");
+});
+
+test("lateinfer type defaults to 127.0.0.1:8010 and does not need Cloud AI", () => {
+  const parsed = validateConfigYaml(`
+backends:
+  late-infer:
+    type: lateinfer
+    model: Qwen/Qwen2.5-0.5B-Instruct
+specialists:
+  chat:
+    description: t
+    backend: late-infer
+`);
+  const late = parsed.backends["late-infer"];
+  assert.equal(late?.type, "lateinfer");
+  if (late?.type !== "lateinfer") throw new Error("expected lateinfer");
+  assert.equal(late.baseUrl, "http://127.0.0.1:8010/v1");
+  assert.equal(defaultBaseUrl(late), "http://127.0.0.1:8010/v1");
+  assert.notEqual(late.baseUrl, "http://127.0.0.1:8000/v1");
+
+  withEnv(
+    {
+      CURSOR_API_KEY: undefined,
+      GEMINI_API_KEY: undefined,
+      GOOGLE_API_KEY: undefined,
+      OPENAI_API_KEY: undefined,
+    },
+    () => {
+      const provider = new LateInferProvider("late-infer", { ...late, probe: false });
+      const health = provider.health();
+      assert.equal(health.ready, true);
+      assert.equal(health.needsKey, false);
+      assert.equal(health.writesLocalFiles, false);
+      assert.equal(health.type, "lateinfer");
+      assert.match(health.baseUrl ?? "", /127\.0\.0\.1:8010\/v1/);
+      assert.doesNotMatch(health.baseUrl ?? "", /:8000\//);
+      assert.equal(health.reason?.includes("Cloud AI"), false);
+    },
+  );
+});
+
+test("lateinfer health is not ready until /models probe succeeds", () => {
+  const provider = new LateInferProvider("late-infer", {
+    type: "lateinfer",
+    baseUrl: "http://127.0.0.1:8010/v1",
+    model: "Qwen/Qwen2.5-0.5B-Instruct",
+  });
+  const health = provider.health();
+  assert.equal(health.ready, false);
+  assert.equal(health.needsKey, false);
+  assert.match(health.reason ?? "", /will probe/);
+  assert.match(health.baseUrl ?? "", /8010\/v1/);
+});
+
+test("lateinfer probe marks ready on HTTP success and not-ready on ECONNREFUSED", async () => {
+  const original = globalThis.fetch;
+  const provider = new LateInferProvider("late-infer", {
+    type: "lateinfer",
+    baseUrl: "http://127.0.0.1:8010/v1",
+    model: "x",
+  });
+  try {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: [{ id: "Qwen/Qwen2.5-0.5B-Instruct" }] }), { status: 200 })) as typeof fetch;
+    const ok = await provider.probe();
+    assert.equal(ok.ready, true);
+    assert.equal(ok.writesLocalFiles, false);
+    assert.equal(ok.needsKey, false);
+    assert.match(ok.reason ?? "", /late-infer running|8010/i);
+
+    globalThis.fetch = (async () => {
+      const error = new Error("fetch failed");
+      (error as Error & { cause: { code: string } }).cause = { code: "ECONNREFUSED" };
+      throw error;
+    }) as typeof fetch;
+    const down = await provider.probe();
+    assert.equal(down.ready, false);
+    assert.match(down.reason ?? "", /Late infer not running at http:\/\/127\.0\.0\.1:8010\/v1/i);
+    assert.doesNotMatch(down.reason ?? "", /Cloud AI|CURSOR_API_KEY|8000\/v1/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("createProvider lateinfer talks OpenAI /v1 on :8010, not vLLM :8000", async () => {
+  const original = globalThis.fetch;
+  let posted = "";
+  try {
+    globalThis.fetch = (async (url) => {
+      posted = String(url);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as typeof fetch;
+    const provider = createProvider("late-infer", {
+      type: "lateinfer",
+      baseUrl: "http://127.0.0.1:8010/v1",
+      model: "Qwen/Qwen2.5-0.5B-Instruct",
+      probe: false,
+    });
+    assert.equal(provider.type, "lateinfer");
+    const result = await provider.run({ prompt: "hi" });
+    assert.equal(result.status, "finished");
+    assert.match(posted, /127\.0\.0\.1:8010\/v1\/chat\/completions/);
+    assert.doesNotMatch(posted, /:8000\//);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test("vllm type parses and allows multiple endpoints", () => {

@@ -45,7 +45,8 @@ export function resolveCursorLocalCwd(requested?: string): string {
     const abs = resolve(raw);
     if (existsSync(join(abs, ".git"))) return abs;
   }
-  return resolve(requested?.trim() || process.cwd());
+  // Prefer process.cwd() over a non-git requested path (never a random tmp/home).
+  return resolve(process.cwd());
 }
 
 export function gitOriginHttpsUrl(cwd: string): string | undefined {

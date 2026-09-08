@@ -14,6 +14,8 @@ import {
 } from "./late-wrap.js";
 import { extractFilesystemPaths, expandUserPath, extractRoutableMessage, isLateDeviceWrap, routeChat, speakerLabel } from "./router.js";
 import { ChatStore } from "./store.js";
+import { startLateInfer, stopLocalServer } from "../local-servers/spawn.js";
+import { probeLateInfer } from "../local-servers/status.js";
 import {
     earlyFlushGraceMs,
     isCursorSpeaker,
@@ -178,38 +180,19 @@ export class ChatService {
     action: ChatSuggestedAction["action"];
     payload?: Record<string, unknown>;
   }): Promise<ChatThread | { ok: true; detail: unknown }> {
-    if (input.action === "start_vllm") {
-      const snap = this.orchestrator.localModels.snapshot();
-      const requested = typeof input.payload?.modelId === "string" ? input.payload.modelId : undefined;
-      const model =
-        snap.models.find((m) => m.id === requested) ??
-        snap.recommended.find((m) => m.downloaded && m.fits && m.newest) ??
-        snap.recommended.find((m) => m.downloaded && m.fits) ??
-        snap.recommended.find((m) => m.fits && m.newest && !m.cpuFeasible) ??
-        snap.recommended.find((m) => m.fits) ??
-        snap.models.find((m) => m.downloaded);
-      if (!model) {
-        throw new Error("No catalog model is available to start. Open Settings → Local models.");
-      }
-      if (!model.downloaded) {
-        const job = this.orchestrator.localModels.download({ modelId: model.id });
-        const thread = this.note(
-          input.threadId,
-          `Starting download of ${model.name} (${model.id}). Start vLLM after it finishes.`,
-          {
-            suggestedAction: { label: "Start recommended local model", action: "start_vllm", payload: { modelId: model.id } },
-          },
-        );
-        return thread ?? { ok: true, detail: job };
-      }
-      const started = this.orchestrator.localModels.startVllmAsync({ modelId: model.id });
+    if (input.action === "start_late_infer") {
+      const model = typeof input.payload?.model === "string" ? input.payload.model : undefined;
+      const started = await startLateInfer({ model });
       const thread = this.note(
         input.threadId,
-        started.status === "starting"
-          ? `Starting local vLLM (${model.name}) on 127.0.0.1. Intel Docker often takes several minutes — stay on Settings → Local models. Chat Auto will use it when it is ready.`
-          : `Local vLLM is running (${model.name} on 127.0.0.1:${started.vllm.port ?? ""}). Resend your question to use it.`,
+        started.ready
+          ? `Late infer is running on ${started.host}. Resend your question to use it.`
+          : `${started.reason}. Stay on Settings → Local models. Chat Auto will use it when it is ready.`,
       );
       return thread ?? { ok: true, detail: started };
+    }
+    if (input.action === "start_vllm") {
+      return this.runAction({ threadId: input.threadId, action: "start_late_infer", payload: input.payload });
     }
     if (input.action === "download_model") {
       const modelId = typeof input.payload?.modelId === "string" ? input.payload.modelId : "";
@@ -376,18 +359,9 @@ export class ChatService {
           .join("; ") || "none fit";
         content =
           `Hardware: ${acc}\nBackend: ${hw.primaryBackend} · ${hw.deviceCount ?? 0} device(s) · ${hw.totalVramMiB ?? hw.vramMiB} MiB total · RAM ${hw.ramMiB} MiB\n` +
-          `vLLM: ${snap.vllm.running ? `running ${snap.vllm.modelId} on 127.0.0.1:${snap.vllm.port}` : "stopped"}\n` +
+          `Late infer: default local brain on 127.0.0.1:8010.\n` +
           `Recommended: ${rec}`;
-        if (!snap.vllm.running && snap.recommended.find((m) => m.fits && m.newest)) {
-          const start = snap.recommended.find((m) => m.fits && m.newest && !m.cpuFeasible) ?? snap.recommended.find((m) => m.fits);
-          if (start) {
-            suggestedAction = {
-              label: "Start recommended local model",
-              action: "start_vllm",
-              payload: { modelId: start.id },
-            };
-          }
-        }
+        suggestedAction = { label: "Start Late infer on your computer", action: "start_late_infer" };
       } else if (kind === "vllm_status") {
         const status = this.orchestrator.localModels.vllmStatus();
         const rows = status.instances ?? [];
@@ -402,10 +376,22 @@ export class ChatService {
             ? `vLLM running pid ${status.pid} · 127.0.0.1:${status.port} · ${status.modelId}`
             : `vLLM stopped.${status.installHint ? ` ${status.installHint}` : ""}`;
         if (!status.running && !rows.some((row) => row.healthy || row.running)) {
-          suggestedAction = { label: "Start recommended local model", action: "start_vllm" };
+          suggestedAction = { label: "Start Late infer on your computer", action: "start_late_infer" };
         }
+      } else if (kind === "late_infer_status") {
+        const status = await probeLateInfer();
+        content = status.ready
+          ? `late-infer running at ${status.origin} · ${status.models.join(", ") || "no model id yet"}`
+          : status.reason;
+        if (!status.ready) suggestedAction = { label: "Start Late infer on your computer", action: "start_late_infer" };
+      } else if (kind === "start_late_infer") {
+        await this.runAction({ threadId, action: "start_late_infer" });
+        return;
+      } else if (kind === "stop_late_infer") {
+        const stopped = stopLocalServer("lateinfer");
+        content = stopped.reason;
       } else if (kind === "start_vllm") {
-        await this.runAction({ threadId, action: "start_vllm" });
+        await this.runAction({ threadId, action: "start_late_infer" });
         return;
       } else if (kind === "stop_vllm") {
         const status = this.orchestrator.localModels.stopVllm();
@@ -418,7 +404,7 @@ export class ChatService {
       }
     } catch (error) {
       content = error instanceof Error ? error.message : String(error);
-      suggestedAction = { label: "Start recommended local model", action: "start_vllm" };
+      suggestedAction = { label: "Start Late infer on your computer", action: "start_late_infer" };
     }
     if (!this.stillOpen(threadId)) return;
     this.store.append(threadId, {
@@ -1380,8 +1366,8 @@ function skippedBackendIds(thread: ChatThread): string[] {
 function suggestedForRunError(error?: string, decision?: RouteDecision): ChatSuggestedAction | undefined {
   if (decision?.suggestedAction) return decision.suggestedAction;
   if (!error) return undefined;
-  if (/vllm not running|vllm not reachable|not running at/i.test(error)) {
-    return { label: "Start recommended local model", action: "start_vllm" };
+  if (/late[- ]?infer not running|vllm not running|vllm not reachable|not running at/i.test(error)) {
+    return { label: "Start Late infer on your computer", action: "start_late_infer" };
   }
   if (/CURSOR_API_KEY|Cursor not configured/i.test(error)) {
     return { label: "Open backends", action: "open_settings", payload: { page: "backends" } };

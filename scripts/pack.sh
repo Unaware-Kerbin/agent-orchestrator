@@ -247,43 +247,46 @@ archive_one() {
   )
 }
 
-engine_stage_dir() {
+# Packed product is late-infer only (`npm run infer:build`). Hub weights stay out of the archive.
+# Do not fetch or stage Ollama / llama-server.
+
+find_late_infer_bin() {
   local os="$1"
-  local arch="$2"
-  case "$os-$arch" in
-    win-x64) printf '%s' "$ROOT/release/runtime-win" ;;
-    mac-arm64) printf '%s' "$ROOT/release/runtime-mac-arm64" ;;
-    mac-x64) printf '%s' "$ROOT/release/runtime-mac-x64" ;;
-    *) printf '%s' "$ROOT/release/runtime-${os}-${arch}" ;;
-  esac
+  if [[ "$os" == win ]]; then
+    if [[ -f "$ROOT/bin/late-infer.exe" ]]; then printf '%s' "$ROOT/bin/late-infer.exe"; return 0; fi
+    if [[ -f "$ROOT/runtime/bin/late-infer.exe" ]]; then printf '%s' "$ROOT/runtime/bin/late-infer.exe"; return 0; fi
+  else
+    if [[ -f "$ROOT/bin/late-infer" ]]; then printf '%s' "$ROOT/bin/late-infer"; return 0; fi
+    if [[ -f "$ROOT/runtime/bin/late-infer" ]]; then printf '%s' "$ROOT/runtime/bin/late-infer"; return 0; fi
+  fi
+  return 1
 }
 
-install_engines() {
+install_late_infer() {
   local dest="$1"
   local os="$2"
   local arch="$3"
-  local engine_stage
-  engine_stage="$(engine_stage_dir "$os" "$arch")"
-  mkdir -p "$engine_stage/bin" "$engine_stage/lib"
-  local need_fetch=1
-  if [[ "$os" == win && -f /tmp/jian-yang-win-inference/bin/ollama.exe && -f /tmp/jian-yang-win-inference/bin/llama-server.exe ]]; then
-    echo "agent-orchestrator: copy /tmp/jian-yang-win-inference -> $engine_stage"
-    cp -a /tmp/jian-yang-win-inference/. "$engine_stage/"
-    need_fetch=0
-  elif [[ "$os" == win && -f "$engine_stage/bin/ollama.exe" && -f "$engine_stage/bin/llama-server.exe" ]]; then
-    need_fetch=0
-  elif [[ "$os" != win && -f "$engine_stage/bin/ollama" && -f "$engine_stage/bin/llama-server" ]]; then
-    need_fetch=0
+  mkdir -p "$dest/bin"
+  local src=""
+  src="$(find_late_infer_bin "$os" || true)"
+  if [[ -z "$src" && "$os" == "$host_os" && "$arch" == "$host_arch" ]]; then
+    echo "agent-orchestrator: late-infer missing; npm run infer:build on your computer"
+    bash "$ROOT/scripts/build-late-infer.sh"
+    src="$(find_late_infer_bin "$os" || true)"
   fi
-  if [[ "$need_fetch" == 1 ]]; then
-    echo "agent-orchestrator: Ollama + llama-server ($os-$arch) -> $engine_stage"
-    INFERENCE_TARGET="$os-$arch" bash "$ROOT/scripts/fetch-inference-bins.sh" "$engine_stage" "$os-$arch"
+  if [[ -z "$src" ]]; then
+    echo "agent-orchestrator: late-infer missing for packed $os-$arch. On your computer run npm run infer:build, then pack again on this OS. Hub weights are not packed. Bind stays 127.0.0.1:8010." >&2
+    exit 1
   fi
-  mkdir -p "$dest/bin" "$dest/lib"
-  cp -a "$engine_stage/bin/." "$dest/bin/"
-  if [[ -d "$engine_stage/lib" ]]; then
-    cp -a "$engine_stage/lib/." "$dest/lib/"
+  local name="late-infer"
+  if [[ "$os" == win ]]; then
+    name="late-infer.exe"
   fi
+  cp -a "$src" "$dest/bin/$name"
+  if [[ "$os" != win ]]; then
+    chmod +x "$dest/bin/$name"
+  fi
+  echo "agent-orchestrator: packed late-infer -> $dest/bin/$name"
 }
 
 pack_one() {
@@ -334,12 +337,12 @@ pack_one() {
 
   echo "agent-orchestrator: Node ${NODE_VER} runtime ($os-$arch)"
   if ! fetch_node "$stage/runtime" "$os" "$arch"; then
-    echo "agent-orchestrator: Node ${NODE_VER} for $os-$arch missing; shipping ollama + llama-server only" >&2
+    echo "agent-orchestrator: Node ${NODE_VER} for $os-$arch missing; packing without a bundled Node runtime" >&2
     mkdir -p "$stage/runtime"
     printf '%s\n' "Node ${NODE_VER} for $os-$arch was not bundled. Install Node 22 and run dist/gui.js, or re-pack on that OS." > "$stage/runtime/NODE-GAP.txt"
   fi
 
-  install_engines "$stage/runtime" "$os" "$arch"
+  install_late_infer "$stage/runtime" "$os" "$arch"
 
   write_launchers "$stage" "$os"
   archive_one "$name" "$os"

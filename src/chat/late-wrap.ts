@@ -18,13 +18,15 @@ Example playbook: {"tool":"propose_staged_artifact","format":"ansible","intent":
 Example show: {"tool":"propose_command","session_id":"<uuid from id=>","command":"show vlan","reason":"need vlan table","intent":"investigate"}
 Allowed tools: propose_command, propose_api_get, propose_staged_artifact, list_open_sessions, read_scrollback, query_pcap, ask_user.`;
 
-/** Local vLLM / Ollama / llama.cpp may see the Late wrap. Gemini, Cursor, and other cloud speakers must not. */
+/** Late infer / vLLM / Ollama / llama.cpp may see the Late wrap. Gemini, Cursor, and other cloud speakers must not. */
 export function speakerSeesUntrustedOutput(backendId?: string): boolean {
   const id = (backendId ?? "").trim().toLowerCase();
   if (!id) return false;
   if (isCursorSpeaker(id) || id.includes("cloud")) return false;
   if (/(^|-)(gemini|anthropic|openai|openrouter|groq)(-|$)/.test(id)) return false;
   return (
+    id.includes("late-infer") ||
+    id.includes("lateinfer") ||
     id.includes("vllm") ||
     id.includes("ollama") ||
     id.includes("llamacpp") ||

@@ -1,5 +1,6 @@
 import type {
   AgentProvider,
+  LateInferBackendConfig,
   LlamaCppBackendConfig,
   OpenAIBackendConfig,
   OllamaBackendConfig,
@@ -20,6 +21,7 @@ import {
 import {
   backendNeedsKey,
   envNamesForBackend,
+  isGrokBackend,
   isLocalOpenAiUrl,
   isUnreachableError,
   localUnreachableReason,
@@ -39,7 +41,8 @@ export type OpenAiCompatConfig =
   | OpenAIBackendConfig
   | VllmBackendConfig
   | OllamaBackendConfig
-  | LlamaCppBackendConfig;
+  | LlamaCppBackendConfig
+  | LateInferBackendConfig;
 
 async function readOpenAiStream(response: Response, onDelta: (delta: string) => void): Promise<string> {
   const reader = response.body?.getReader();
@@ -110,9 +113,12 @@ export async function runOpenAiChat(
   messages.push({ role: "user", content: request.prompt?.trim() ? request.prompt : "(empty operator turn)" });
   const gemini = config.type === "openai" && isGeminiOpenAiConfig(id, config);
   const model = chatModelFor(id, config, request.model, gemini ? options.liveGeminiIds : undefined);
-  const stream = typeof request.onDelta === "function";
+  const wantsDelta = typeof request.onDelta === "function";
+  // late-infer rejects stream=true (HTTP 400). Still deliver onDelta once from the JSON body.
+  const stream = wantsDelta && config.type !== "lateinfer";
   const body: Record<string, unknown> = { model, messages };
   if (stream) body.stream = true;
+  if (config.type === "lateinfer") body.stream = false;
   const timeoutMs = request.timeoutMs ?? 30_000;
   const deadline = started + timeoutMs;
   const payloadJson = JSON.stringify(body);
@@ -169,7 +175,7 @@ export async function runOpenAiChat(
     }
     const payload: unknown = await response.json().catch(() => ({ error: response.statusText }));
     const text = extractHttpText(payload);
-    if (stream && text) request.onDelta?.(text);
+    if (wantsDelta && text) request.onDelta?.(text);
     return {
       status: "finished",
       text,
@@ -222,9 +228,10 @@ export class OpenAIProvider implements AgentProvider {
 
   run(request: ProviderRunRequest): Promise<ProviderRunResult> {
     const localish = isLocalOpenAiUrl(this.config.baseUrl) || this.config.apiKey === "ollama";
+    const grok = isGrokBackend(this.id, this.config);
     return runOpenAiChat(this.id, this.config, request, {
-      label: "OpenAI-compatible",
-      defaultBaseUrl: "https://api.openai.com/v1",
+      label: grok ? "Grok" : "OpenAI-compatible",
+      defaultBaseUrl: grok ? "https://api.x.ai/v1" : "https://api.openai.com/v1",
       optionalKey: localish,
       liveGeminiIds: this.geminiList?.ids,
     });
@@ -238,11 +245,12 @@ export class OpenAIProvider implements AgentProvider {
   private healthFromList(liveIds?: string[]): ProviderHealth {
     const secretNames = envNamesForBackend(this.id, this.config);
     const gemini = isGeminiOpenAiConfig(this.id, this.config);
+    const grok = isGrokBackend(this.id, this.config);
     const sentModel = gemini ? resolveGeminiChatModel(this.config.model, undefined, liveIds) : this.config.model;
     const extra = {
       secretNames,
       needsKey: backendNeedsKey(this.id, this.config),
-      baseUrl: this.config.baseUrl ?? "https://api.openai.com/v1",
+      baseUrl: this.config.baseUrl ?? (grok ? "https://api.x.ai/v1" : "https://api.openai.com/v1"),
       model: sentModel,
       modelChoices: gemini ? geminiModelChoices(liveIds) : undefined,
     };

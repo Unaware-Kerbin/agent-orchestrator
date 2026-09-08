@@ -16,3 +16,22 @@ __pycache__/
 .venv/
 release/**
 !release/README.md
+# late-infer from npm run infer:build (Candle binary + stamp; Hub weights stay under .orchestrator/)
+/bin/late-infer
+/bin/late-infer.exe
+/bin/late-infer.stamp
+/runtime/bin/late-infer
+/runtime/bin/late-infer.exe
+/runtime/bin/.late-infer-built-for
+/target/
+
+# Entire local runtime tree (portable bins/libs; never commit)
+/runtime/
+
+# Local launch wrappers next to late-infer (pack/install artifacts)
+/bin/agent-orchestrator
+/bin/agent-orchestrator-gui
+/bin/agent-orchestrator-mcp
+/bin/agent-orchestrator.exe
+/bin/agent-orchestrator-gui.exe
+/bin/agent-orchestrator-mcp.exe

@@ -1,4 +1,12 @@
-export type RuntimeKind = "cursor" | "openai" | "anthropic" | "http" | "vllm" | "ollama" | "llamacpp";
+export type RuntimeKind =
+  | "cursor"
+  | "openai"
+  | "anthropic"
+  | "http"
+  | "vllm"
+  | "ollama"
+  | "llamacpp"
+  | "lateinfer";
 export type CursorRuntime = "local" | "cloud";
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 export type ConversationMode = "plan" | "agent";
@@ -65,6 +73,17 @@ export interface LlamaCppBackendConfig {
   probeTimeoutMs?: number;
 }
 
+/** Late-owned OpenAI /v1 on loopback :8010 (same custom backend as Late). */
+export interface LateInferBackendConfig {
+  type: "lateinfer";
+  baseUrl?: string;
+  model: string;
+  apiKeyEnv?: string;
+  apiKey?: string;
+  probe?: boolean;
+  probeTimeoutMs?: number;
+}
+
 export type BackendConfig = (
   | CursorBackendConfig
   | OpenAIBackendConfig
@@ -73,6 +92,7 @@ export type BackendConfig = (
   | VllmBackendConfig
   | OllamaBackendConfig
   | LlamaCppBackendConfig
+  | LateInferBackendConfig
 ) & { nickname?: string };
 
 export interface SpecialistConfig {

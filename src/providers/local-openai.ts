@@ -1,27 +1,29 @@
 import type {
   AgentProvider,
+  LateInferBackendConfig,
   LlamaCppBackendConfig,
   OllamaBackendConfig,
   ProviderHealth,
   ProviderRunRequest,
   ProviderRunResult,
 } from "../types.js";
-import { probeLlamaCpp, probeOllama } from "../local-servers/status.js";
-import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "../local-servers/status.js";
+import { probeLateInfer, probeLlamaCpp, probeOllama } from "../local-servers/status.js";
+import { DEFAULT_LATE_INFER_BASE, DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "../local-servers/status.js";
 import { normalizeLoopbackOpenAiUrl } from "../local-servers/loopback.js";
 import { envNamesForBackend, LOCAL_OPENAI_DUMMY_KEY } from "./keys.js";
 import { runOpenAiChat } from "./openai.js";
 import { readyHealth } from "./util.js";
 
-export type LocalOpenAiBackendConfig = OllamaBackendConfig | LlamaCppBackendConfig;
+export type LocalOpenAiBackendConfig = OllamaBackendConfig | LlamaCppBackendConfig | LateInferBackendConfig;
 
 function defaultsFor(config: LocalOpenAiBackendConfig): { label: string; defaultBase: string } {
+  if (config.type === "lateinfer") return { label: "Late infer", defaultBase: DEFAULT_LATE_INFER_BASE };
   if (config.type === "ollama") return { label: "Ollama", defaultBase: DEFAULT_OLLAMA_BASE };
   return { label: "llama.cpp", defaultBase: DEFAULT_LLAMACPP_BASE };
 }
 
 export class LocalOpenAiCompatProvider implements AgentProvider {
-  readonly type: "ollama" | "llamacpp";
+  readonly type: "ollama" | "llamacpp" | "lateinfer";
   readonly capabilities = ["text", "follow_up"];
   private lastProbe: { at: number; health: ProviderHealth } | undefined;
 
@@ -36,7 +38,13 @@ export class LocalOpenAiCompatProvider implements AgentProvider {
     if (this.lastProbe && Date.now() - this.lastProbe.at < 15_000) {
       return this.lastProbe.health;
     }
-    return this.configHealth();
+    const snapshot = this.configHealth();
+    if (this.config.probe === false || this.type !== "lateinfer") return snapshot;
+    return {
+      ...snapshot,
+      ready: false,
+      reason: `Configured at ${snapshot.baseUrl ?? defaultsFor(this.config).defaultBase} (will probe; API key optional)`,
+    };
   }
 
   async probe(): Promise<ProviderHealth> {
@@ -49,7 +57,13 @@ export class LocalOpenAiCompatProvider implements AgentProvider {
     const timeoutMs = this.config.probeTimeoutMs ?? 800;
     const apiKey = this.config.apiKey?.trim() || LOCAL_OPENAI_DUMMY_KEY;
     const status =
-      this.config.type === "ollama"
+      this.config.type === "lateinfer"
+        ? await probeLateInfer({
+            baseUrl: this.config.baseUrl ?? defaultBase,
+            timeoutMs,
+            apiKey,
+          })
+        : this.config.type === "ollama"
         ? await probeOllama({
             baseUrl: this.config.baseUrl ?? defaultBase,
             timeoutMs,
@@ -131,6 +145,12 @@ export class OllamaProvider extends LocalOpenAiCompatProvider {
 
 export class LlamaCppProvider extends LocalOpenAiCompatProvider {
   constructor(id: string, config: LlamaCppBackendConfig) {
+    super(id, config);
+  }
+}
+
+export class LateInferProvider extends LocalOpenAiCompatProvider {
+  constructor(id: string, config: LateInferBackendConfig) {
     super(id, config);
   }
 }

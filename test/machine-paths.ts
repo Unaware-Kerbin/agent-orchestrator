@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-const SKIP_DIR = new Set(["node_modules", ".git", ".orchestrator", "dist", "coverage"]);
+const SKIP_DIR = new Set(["node_modules", ".git", ".orchestrator", "dist", "coverage", "target"]);
 
 /** This clone's home directory. Never paste it into shipped files or tests as a literal. */
 export function machineHome(): string {

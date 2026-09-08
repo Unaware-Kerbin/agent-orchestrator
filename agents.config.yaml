@@ -11,14 +11,12 @@ workspace:
   cwd: ${WORKSPACE_CWD}
 
 backends:
-  vllm-gemma-4-e2b-it:
-    type: vllm
-    baseUrl: "http://127.0.0.1:8002/v1"
-    model: "google/gemma-4-E2B-it"
-  vllm-qwen25-05b-instruct:
-    type: vllm
-    baseUrl: "http://127.0.0.1:8001/v1"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
+  late-infer:
+    type: lateinfer
+    baseUrl: "http://127.0.0.1:8010/v1"
+    model: "Harvard-DCML/ADAPT-Qwen3-2.3B-Instruct"
+  # Per-model vLLM backends (vllm-<slug>) are created by start_vllm / GUI Start with Docker.
+  # Ports are assigned dynamically in 8000–8099 and written back here — do not hardcode.
   cursor-local:
     type: cursor
     runtime: local
@@ -53,6 +51,13 @@ backends:
     # One current model id (not a list, not models/…). GUI lists live ids when the key works.
     model: gemini-3.6-flash
     apiKeyEnv: GEMINI_API_KEY
+
+  grok:
+    type: openai
+    baseUrl: https://api.x.ai/v1
+    # Current xAI chat/code model (OpenAI-compatible). Disabled until XAI_API_KEY / GROK_API_KEY is set.
+    model: grok-4.6
+    apiKeyEnv: XAI_API_KEY
 
   ollama:
     type: ollama
@@ -89,13 +94,9 @@ backends:
   #     Authorization: Bearer ${CUSTOM_AGENT_TOKEN}
 
 specialists:
-  vllm-gemma-4-e2b-it:
-    description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
-    backend: vllm-gemma-4-e2b-it
-    fallback: cursor-local
-  vllm-qwen25-05b-instruct:
-    description: Local vLLM OpenAI-compatible model (text only; file writes stay on Cursor)
-    backend: vllm-qwen25-05b-instruct
+  late-infer-chat:
+    description: Late infer on your computer (OpenAI-compatible, loopback 127.0.0.1:8010; file writes stay on Cursor)
+    backend: late-infer
     fallback: cursor-local
   planner:
     description: Breaks a goal into a sequenced implementation plan
@@ -122,6 +123,11 @@ specialists:
   gemini-planner:
     description: Alternate planner that prefers Gemini when a Google API key is set
     backend: gemini
+    fallback: cursor-local
+
+  grok-chat:
+    description: xAI Grok OpenAI-compatible model (text only; file writes stay on Cursor)
+    backend: grok
     fallback: cursor-local
 
   vllm-chat:
@@ -161,14 +167,14 @@ workflows:
       - specialist: reviewer
 
   local-and-cloud:
-    description: Run the same prompt on local vLLM and a Cursor cloud agent in parallel. Orchestrator collects both. vLLM stays on 127.0.0.1; the cloud agent never calls it.
+    description: Run the same prompt on Late infer (local) and a Cursor cloud agent in parallel. Orchestrator collects both. Late infer stays on 127.0.0.1; the cloud agent never calls it.
     mode: parallel
     steps:
-      - specialist: vllm-chat
+      - specialist: late-infer-chat
       - specialist: cloud-builder
 
   cloud-with-local-draft:
-    description: Local vLLM drafts first; a Cursor cloud agent then reviews/implements using that draft as text context. Cloud still uses the Cursor runtime, not localhost.
+    description: Late infer drafts first; a Cursor cloud agent then reviews/implements using that draft as text context. Cloud still uses the Cursor runtime, not localhost.
     steps:
-      - specialist: vllm-chat
+      - specialist: late-infer-chat
       - specialist: cloud-builder

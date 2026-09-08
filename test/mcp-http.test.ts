@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer } from "node:net";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import {
   canonicalMcpUrl,
   createOrchestratorMcpHandler,
@@ -15,6 +15,11 @@ import { isMcpLivenessGet } from "../src/mcp/paths.js";
 import { loopbackHostOk, loopbackOriginOk } from "../src/temp-analyze-http.js";
 import { startGuiServer } from "../src/gui/http.js";
 import { loadMcpAuthConfig, McpAuth } from "../src/mcp/auth/index.js";
+import { resetHubCatalogForTests } from "../src/local-servers/hub-catalog.js";
+
+afterEach(() => {
+  resetHubCatalogForTests();
+});
 
 async function freeLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -61,7 +66,15 @@ function mockOrch() {
 
 const PROTOCOL = "2025-03-26";
 
-function parseTools(ctype: string, text: string): { name?: string }[] {
+type ListedTool = {
+  name?: string;
+  description?: string;
+  inputSchema?: {
+    properties?: Record<string, unknown>;
+  };
+};
+
+function parseTools(ctype: string, text: string): ListedTool[] {
   if (ctype.includes("text/event-stream")) {
     const data = text
       .split("\n")
@@ -70,7 +83,7 @@ function parseTools(ctype: string, text: string): { name?: string }[] {
       .filter(Boolean);
     for (const row of data) {
       try {
-        const msg = JSON.parse(row) as { result?: { tools?: { name?: string }[] } };
+        const msg = JSON.parse(row) as { result?: { tools?: ListedTool[] } };
         if (msg.result?.tools) return msg.result.tools;
       } catch {
         /* skip */
@@ -78,8 +91,37 @@ function parseTools(ctype: string, text: string): { name?: string }[] {
     }
     return [];
   }
-  const body = JSON.parse(text) as { result?: { tools?: { name?: string }[] } };
+  const body = JSON.parse(text) as { result?: { tools?: ListedTool[] } };
   return body.result?.tools ?? [];
+}
+
+function parseToolCallJson(ctype: string, text: string): unknown {
+  const extract = (msg: { result?: { content?: { type?: string; text?: string }[] } }) => {
+    const block = msg.result?.content?.find((c) => c.type === "text") ?? msg.result?.content?.[0];
+    if (!block?.text) return undefined;
+    try {
+      return JSON.parse(block.text);
+    } catch {
+      return undefined;
+    }
+  };
+  if (ctype.includes("text/event-stream")) {
+    const data = text
+      .split("\n")
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trim())
+      .filter(Boolean);
+    for (const row of data) {
+      try {
+        const parsed = extract(JSON.parse(row) as { result?: { content?: { type?: string; text?: string }[] } });
+        if (parsed !== undefined) return parsed;
+      } catch {
+        /* skip */
+      }
+    }
+    return undefined;
+  }
+  return extract(JSON.parse(text) as { result?: { content?: { type?: string; text?: string }[] } });
 }
 
 function getLoopbackWithHost(
@@ -167,10 +209,140 @@ test("standalone Streamable HTTP: initialize + tools/list on /mcp and /MCP witho
       assert.ok(tools.some((t) => t.name === "list_agents"), JSON.stringify(names));
       assert.ok(names.includes("chat_send"), JSON.stringify(names));
       assert.ok(names.includes("list_allowed_dirs"), JSON.stringify(names));
+      assert.ok(names.includes("start_late_infer"), JSON.stringify(names));
+      assert.ok(names.includes("stop_late_infer"), JSON.stringify(names));
+      assert.ok(names.includes("late_infer_status"), JSON.stringify(names));
+      assert.ok(names.includes("pull_late_infer"), JSON.stringify(names));
+      assert.ok(names.includes("delete_late_infer"), JSON.stringify(names));
+      assert.ok(names.includes("list_hub_models"), JSON.stringify(names));
+      const listHub = tools.find((t) => t.name === "list_hub_models");
+      assert.match(listHub?.description ?? "", /estimated VRAM at max usage/);
+      assert.match(listHub?.description ?? "", /your computer/);
+      const listHubProperties = listHub?.inputSchema?.properties ?? {};
+      assert.deepEqual(Object.keys(listHubProperties), ["q"]);
+      assert.equal("cwd" in listHubProperties, false);
+      assert.equal("allowlist" in listHubProperties, false);
+      assert.equal("path" in listHubProperties, false);
+      const pullLateInfer = tools.find((t) => t.name === "pull_late_infer");
+      assert.match(pullLateInfer?.description ?? "", /Approve/);
+      const deleteLateInfer = tools.find((t) => t.name === "delete_late_infer");
+      assert.match(deleteLateInfer?.description ?? "", /Approve/);
+      const deleteProperties = deleteLateInfer?.inputSchema?.properties ?? {};
+      assert.deepEqual(Object.keys(deleteProperties).sort(), ["confirm", "model"]);
+      assert.equal("cwd" in deleteProperties, false);
+      assert.equal("allowlist" in deleteProperties, false);
+      assert.equal("path" in deleteProperties, false);
+      assert.equal("dest" in deleteProperties, false);
+      const pullProperties = pullLateInfer?.inputSchema?.properties ?? {};
+      assert.deepEqual(Object.keys(pullProperties), ["model"]);
+      assert.equal("cwd" in pullProperties, false);
+      assert.equal("allowlist" in pullProperties, false);
+      assert.equal("write_dir" in pullProperties, false);
+      assert.equal("dest" in pullProperties, false);
+      const startLateInfer = tools.find((t) => t.name === "start_late_infer");
+      assert.match(startLateInfer?.description ?? "", /Approve/);
+      const startProperties = startLateInfer?.inputSchema?.properties ?? {};
+      assert.deepEqual(Object.keys(startProperties).sort(), ["model", "use_all_gpus"]);
+      assert.equal("cwd" in startProperties, false);
+      assert.equal("allowlist" in startProperties, false);
+      assert.equal("write_dir" in startProperties, false);
+      assert.ok(names.includes("add_allowed_dir"), JSON.stringify(names));
+      // Local engines (vLLM / Ollama / llama.cpp) are intentional MCP tools — Approve-gated starts.
+      assert.ok(names.includes("start_vllm"), JSON.stringify(names));
+      assert.ok(names.includes("start_ollama"), JSON.stringify(names));
+      assert.ok(names.includes("start_llamacpp"), JSON.stringify(names));
+      assert.ok(names.includes("ollama_status"), JSON.stringify(names));
+      assert.ok(names.includes("vllm_status"), JSON.stringify(names));
+      assert.ok(names.includes("llamacpp_status"), JSON.stringify(names));
+      assert.ok(names.includes("stop_vllm"), JSON.stringify(names));
+      assert.ok(names.includes("stop_ollama"), JSON.stringify(names));
+      assert.ok(names.includes("stop_llamacpp"), JSON.stringify(names));
+      assert.match(tools.find((t) => t.name === "start_ollama")?.description ?? "", /Approve/);
+      assert.match(tools.find((t) => t.name === "start_llamacpp")?.description ?? "", /Approve/);
+      assert.match(tools.find((t) => t.name === "start_vllm")?.description ?? "", /127\.0\.0\.1/);
       const called = await mcpRpc(mcp, 3, "tools/call", { name: "list_agents", arguments: {} });
       assert.equal(called.res.status, 200, `${path} tools/call list_agents: ${called.text}`);
       assert.match(called.text, /backends|specialists/);
+      const invalidPull = await mcpRpc(mcp, 4, "tools/call", {
+        name: "pull_late_infer",
+        arguments: { model: "tmp/model/extra" },
+      });
+      assert.equal(invalidPull.res.status, 200, `${path} tools/call pull_late_infer: ${invalidPull.text}`);
+      assert.match(invalidPull.text, /Hugging Face Hub org\/model id/);
     }
+  } finally {
+    await handler.close();
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+test("list_hub_models payload includes vramMaxLabel; extra pull/start stay Approve-gated", async () => {
+  resetHubCatalogForTests({
+    fetchFn: (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof fetch,
+  });
+  const { orchestrator, chat } = mockOrch();
+  const handler = createOrchestratorMcpHandler(orchestrator as never, chat as never);
+  const port = await freeLoopbackPort();
+  const server = createHttpServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+    if (!isStandaloneMcpPath(url.pathname)) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    await pipeMcpHttpRequest(handler, req, res, url);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve());
+  });
+  try {
+    const mcp = `http://127.0.0.1:${port}/mcp`;
+    await handshakeMcp(mcp);
+    const listed = await mcpRpc(mcp, 2, "tools/list");
+    assert.equal(listed.res.status, 200, listed.text);
+    const tools = parseTools(listed.ctype, listed.text);
+    const names = tools.map((t) => t.name);
+    const listHub = tools.find((t) => t.name === "list_hub_models");
+    assert.match(listHub?.description ?? "", /estimated VRAM at max usage/);
+    assert.deepEqual(Object.keys(listHub?.inputSchema?.properties ?? {}), ["q"]);
+    assert.ok(names.includes("pull_late_infer"), JSON.stringify(names));
+    assert.ok(names.includes("delete_late_infer"), JSON.stringify(names));
+    assert.ok(names.includes("start_late_infer"), JSON.stringify(names));
+    assert.ok(names.includes("start_vllm"), JSON.stringify(names));
+    assert.ok(names.includes("start_ollama"), JSON.stringify(names));
+    assert.ok(names.includes("start_llamacpp"), JSON.stringify(names));
+    assert.match(tools.find((t) => t.name === "pull_late_infer")?.description ?? "", /Approve/);
+    assert.match(tools.find((t) => t.name === "delete_late_infer")?.description ?? "", /Approve/);
+    assert.match(tools.find((t) => t.name === "start_late_infer")?.description ?? "", /Approve/);
+
+    const called = await mcpRpc(mcp, 3, "tools/call", { name: "list_hub_models", arguments: {} });
+    assert.equal(called.res.status, 200, called.text);
+    const payload = parseToolCallJson(called.ctype, called.text) as {
+      models?: { id?: string; vramMaxLabel?: string; vramMaxMiB?: number }[];
+    };
+    const models = payload?.models ?? [];
+    assert.ok(models.length > 0, called.text.slice(0, 500));
+    const labeled = models.filter((m) => typeof m.vramMaxLabel === "string" && m.vramMaxLabel.length > 0);
+    assert.ok(labeled.length > 0, JSON.stringify(models.slice(0, 3)));
+    const qwen = models.find((m) => m.id === "Qwen/Qwen2.5-0.5B-Instruct");
+    assert.equal(qwen?.vramMaxLabel, "~1.5 GB VRAM max");
+    assert.equal(qwen?.vramMaxMiB, 1_500);
+
+    const gemma = await mcpRpc(mcp, 4, "tools/call", {
+      name: "list_hub_models",
+      arguments: { q: "gemma" },
+    });
+    assert.equal(gemma.res.status, 200, gemma.text);
+    const gemmaPayload = parseToolCallJson(gemma.ctype, gemma.text) as {
+      models?: { id?: string; family?: string; vramMaxLabel?: string }[];
+    };
+    const gemmaModels = gemmaPayload?.models ?? [];
+    assert.ok(gemmaModels.length >= 1, gemma.text.slice(0, 500));
+    assert.ok(gemmaModels.every((m) => /gemma/i.test(m.id ?? "") || m.family === "Gemma"));
+    assert.ok(gemmaModels.some((m) => typeof m.vramMaxLabel === "string" && m.vramMaxLabel.length > 0));
   } finally {
     await handler.close();
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));

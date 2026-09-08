@@ -319,10 +319,33 @@ function containerModelPathFor(modelsDir: string, modelPath: string): string {
  * Their CLI rejects `--device xpu` and wants the model as a positional arg
  * (`vllm serve <model> …`), matching Local GPU Terminal Emulator compose.
  */
-/** Intel 0.21 Gemma 4 recipe (`--mamba-ssm-cache-dtype float16`). Safe no-op for other families. */
+/**
+ * Intel llm-scaler 0.21+ Gemma 4 serve extras.
+ * All Gemma 4: `--mamba-ssm-cache-dtype float16`.
+ * Unified / dense / MoE (12B, 31B, 26B-A4B): online FP8 + text-only MM limits.
+ * Without limit-mm=0, profile_run hits vision_embedder LN mismatch
+ * (weight [6912] vs normalized_shape [768]). E2B/E4B stay mamba-only (fp16 OK).
+ */
 export function gemma4VllmExtraArgs(servedModelName: string, modelPath: string): string[] {
-  if (!/gemma-4/i.test(`${servedModelName} ${modelPath}`)) return [];
-  return ["--mamba-ssm-cache-dtype", "float16"];
+  const blob = `${servedModelName} ${modelPath}`;
+  if (!/gemma-4/i.test(blob)) return [];
+  const args = ["--mamba-ssm-cache-dtype", "float16"];
+  // Encoder-free Unified 12B and Intel-verified 31B / 26B-A4B (not E2B/E4B).
+  if (/gemma-4-(12B|31B|26B)/i.test(blob)) {
+    args.push(
+      "--quantization",
+      "fp8",
+      "--block-size",
+      "64",
+      "--max-model-len",
+      "8192",
+      "--max-num-batched-tokens",
+      "8192",
+      "--limit-mm-per-prompt",
+      '{"image":0,"video":0,"audio":0}',
+    );
+  }
+  return args;
 }
 
 export function buildIntelVllmArgs(input: {

@@ -55,6 +55,23 @@ test("auto picks the primary RFC1918 IPv4; empty bind stays loopback", () => {
     undefined,
   );
   assert.equal(noDefault, "192.168.2.139");
+  const dockerDefault = primaryPrivateIpv4(
+    {
+      docker0: [{ address: "172.17.0.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.0.0", cidr: null }],
+      virbr0: [{ address: "192.168.122.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+      eno2: [{ address: "192.168.2.139", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+    },
+    "docker0",
+  );
+  assert.equal(dockerDefault, "192.168.2.139");
+  const onlyDocker = primaryPrivateIpv4(
+    {
+      docker0: [{ address: "172.17.0.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.0.0", cidr: null }],
+      virbr0: [{ address: "192.168.122.1", family: "IPv4", internal: false, mac: "", netmask: "255.255.255.0", cidr: null }],
+    },
+    "docker0",
+  );
+  assert.equal(onlyDocker, undefined);
   assert.equal(bindMcpListenHost(undefined), "127.0.0.1");
   assert.equal(bindMcpListenHost(""), "127.0.0.1");
   const lan = primaryPrivateIpv4();
@@ -112,6 +129,7 @@ test("MCP URL uses the bound listen host", () => {
 test("Host and Origin allow the bound private IP; evil.com is rejected", () => {
   assert.equal(listenHostHeaderOk("192.168.2.139:8790", 8790, "192.168.2.139"), true);
   assert.equal(listenHostHeaderOk("127.0.0.1:8790", 8790, "192.168.2.139"), true);
+  assert.equal(listenHostHeaderOk("192.168.3.116:8790", 8790, "192.168.2.139"), false);
   assert.equal(listenHostHeaderOk("evil.com:8790", 8790, "192.168.2.139"), false);
   assert.equal(listenHostHeaderOk("0.0.0.0:8790", 8790, "192.168.2.139"), false);
   assert.equal(listenOriginOk(undefined, "192.168.2.139"), true);

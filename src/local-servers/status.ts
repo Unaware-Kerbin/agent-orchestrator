@@ -1,15 +1,22 @@
 import { parseModelId } from "../identity.js";
 import { LOCAL_OPENAI_DUMMY_KEY } from "../providers/keys.js";
 import { isUnreachableError } from "../providers/keys.js";
-import { findEngineBin } from "./bins.js";
+import { classifyLateInferDevice } from "./gpu-pick.js";
+import { findEngineBin, findLateInferBin } from "./bins.js";
 import { which } from "../platform.js";
-import { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE, loopbackOrigin, normalizeLoopbackOpenAiUrl } from "./loopback.js";
+import {
+  DEFAULT_LATE_INFER_BASE,
+  DEFAULT_LLAMACPP_BASE,
+  DEFAULT_OLLAMA_BASE,
+  loopbackOrigin,
+  normalizeLoopbackOpenAiUrl,
+} from "./loopback.js";
 
-export { DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./loopback.js";
+export { DEFAULT_LATE_INFER_BASE, DEFAULT_LLAMACPP_BASE, DEFAULT_OLLAMA_BASE } from "./loopback.js";
 
 export type FetchLike = typeof fetch;
 
-export type LocalServerKind = "ollama" | "llamacpp";
+export type LocalServerKind = "lateinfer" | "ollama" | "llamacpp";
 
 export interface LocalServerStatus {
   kind: LocalServerKind;
@@ -18,7 +25,14 @@ export interface LocalServerStatus {
   baseUrl: string;
   origin: string;
   models: string[];
+  /** Serving model id when known (health or first models[] entry). */
+  model?: string;
   reason: string;
+  device?: string;
+  deviceKind?: string;
+  accel?: string;
+  weightsInHostRam?: boolean;
+  gpuRunning?: boolean;
 }
 
 export interface LlamaServerBinary {
@@ -31,6 +45,12 @@ export function llamaServerOnPath(whichFn: (cmd: string) => string | undefined =
 
 export function ollamaOnPath(whichFn: (cmd: string) => string | undefined = which): string | undefined {
   return findEngineBin("ollama", whichFn);
+}
+
+export function lateInferOnPath(
+  whichFn: (cmd: string) => string | undefined = which,
+): string | undefined {
+  return findLateInferBin(whichFn);
 }
 
 function acceptedModelId(raw: string): string | undefined {
@@ -101,7 +121,8 @@ function downStatus(
   timeoutMs: number,
 ): LocalServerStatus {
   const timedOut = error instanceof Error && /timeout|aborted/i.test(error.message);
-  const label = kind === "ollama" ? "Ollama" : "llama.cpp";
+  const label =
+    kind === "lateinfer" ? "Late infer" : kind === "ollama" ? "Ollama" : "llama.cpp";
   const reason = timedOut
     ? `${label} not reachable at ${baseUrl} (timeout)`
     : isUnreachableError(error)
@@ -236,5 +257,131 @@ export async function probeLlamaCpp(options: {
     } catch {
       return downStatus("llamacpp", baseUrl, origin, error, timeoutMs);
     }
+  }
+}
+
+function isLateInferHealth(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const rec = payload as { ok?: unknown; name?: unknown };
+  return rec.ok === true && rec.name === "late-infer";
+}
+
+export function parseLateInferHealth(payload: unknown): {
+  device: string;
+  deviceKind: string;
+  accel: string;
+  weightsInHostRam: boolean;
+  gpuRunning: boolean;
+} {
+  const rec = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+  const device = typeof rec.device === "string" ? rec.device : typeof rec.device_label === "string" ? rec.device_label : "";
+  const fromHealthKind =
+    typeof rec.device_kind === "string"
+      ? rec.device_kind
+      : typeof rec.deviceKind === "string"
+        ? rec.deviceKind
+        : "";
+  const classified = classifyLateInferDevice(fromHealthKind || device);
+  const flag =
+    rec.weights_in_host_ram === true ||
+    rec.weightsInHostRam === true ||
+    rec.weights_in_host_ram === "true";
+  const weightsInHostRam = flag || classified.weightsInHostRam;
+  const deviceKind = (fromHealthKind as string) || classified.deviceKind;
+  const gpuRunning = !weightsInHostRam && (classified.gpuRunning || deviceKind === "intel-xpu" || deviceKind === "cuda" || deviceKind === "hip");
+  return {
+    device,
+    deviceKind,
+    accel: typeof rec.accel === "string" ? rec.accel : classified.accel,
+    weightsInHostRam,
+    gpuRunning,
+  };
+}
+
+export async function probeLateInfer(options: {
+  baseUrl?: string;
+  fetchFn?: FetchLike;
+  timeoutMs?: number;
+  apiKey?: string;
+} = {}): Promise<LocalServerStatus> {
+  const label = "Late infer";
+  const baseUrl = normalizeLoopbackOpenAiUrl(options.baseUrl?.trim() || DEFAULT_LATE_INFER_BASE, label);
+  const origin = loopbackOrigin(baseUrl, label);
+  const fetchFn = options.fetchFn ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 800;
+  const apiKey = options.apiKey?.trim() || LOCAL_OPENAI_DUMMY_KEY;
+  try {
+    const health = await fetchFn(`${origin}/health`, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const payload: unknown = await health.json().catch(() => undefined);
+      if (health.ok && isLateInferHealth(payload)) {
+        const modelsProbe = await getJson(`${baseUrl}/models`, fetchFn, timeoutMs, apiKey).catch(() => undefined);
+        const models = modelsProbe ? openaiModelIds(modelsProbe.payload) : [];
+        const modelFromHealth =
+          payload && typeof payload === "object" && typeof (payload as { model?: unknown }).model === "string"
+            ? acceptedModelId((payload as { model: string }).model)
+            : undefined;
+        if (modelFromHealth && !models.includes(modelFromHealth)) models.push(modelFromHealth);
+        const meta = parseLateInferHealth(payload);
+        const gpuBit = meta.gpuRunning
+          ? "GPU running"
+          : meta.weightsInHostRam
+            ? "weights in host RAM, not idle GPU VRAM"
+            : meta.device
+              ? `device ${meta.device}`
+              : "health ok";
+        return {
+          kind: "lateinfer",
+          running: true,
+          ready: true,
+          baseUrl,
+          origin,
+          models,
+          model: modelFromHealth ?? models[0],
+          device: meta.device,
+          deviceKind: meta.deviceKind,
+          accel: meta.accel,
+          weightsInHostRam: meta.weightsInHostRam,
+          gpuRunning: meta.gpuRunning,
+          reason:
+            models.length > 0
+              ? `late-infer running at ${origin} (${models.join(", ")}) · ${gpuBit}`
+              : `late-infer running at ${origin} · ${gpuBit}`,
+        };
+      }
+  } catch (error) {
+    if (isUnreachableError(error)) {
+      return downStatus("lateinfer", baseUrl, origin, error, timeoutMs);
+    }
+  }
+  try {
+    const modelsProbe = await getJson(`${baseUrl}/models`, fetchFn, timeoutMs, apiKey);
+    if (!isOpenAiModelsList(modelsProbe.payload)) {
+      return {
+        kind: "lateinfer",
+        running: false,
+        ready: false,
+        baseUrl,
+        origin,
+        models: [],
+        reason: `late-infer not running at ${baseUrl} (/v1/models is not an OpenAI models JSON list)`,
+      };
+    }
+    const models = openaiModelIds(modelsProbe.payload);
+    return {
+      kind: "lateinfer",
+      running: true,
+      ready: modelsProbe.ok,
+      baseUrl,
+      origin,
+      models,
+      model: models[0],
+      reason: `late-infer reachable at ${baseUrl} (HTTP ${modelsProbe.status})`,
+    };
+  } catch (error) {
+    return downStatus("lateinfer", baseUrl, origin, error, timeoutMs);
   }
 }

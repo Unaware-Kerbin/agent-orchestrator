@@ -6,6 +6,11 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { EventEmitter } from "node:events";
 import { detectHardware, type LaunchBackend } from "../hardware.js";
+import {
+  engineGpuSpawnPlan,
+  mergeGpuPlanEnv,
+  vllmCudaOnIntelBlockedReason,
+} from "../local-servers/gpu-pick.js";
 import { GPU_MEMORY_UTILIZATION, type FitKind } from "../local-models/fit.js";
 import { isUnreachableError } from "../providers/keys.js";
 import { readConfigYaml, writeConfigYaml } from "../config.js";
@@ -266,7 +271,17 @@ export function vllmLaunchEnv(
   deviceCount: number,
   extra: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...extra };
+  const useAll = deviceCount > 1;
+  const gpu = engineGpuSpawnPlan({ useAllGpus: useAll });
+  const blocked = vllmCudaOnIntelBlockedReason(backend, gpu.plan);
+  if (blocked) {
+    throw new Error(blocked);
+  }
+  if (gpu.blockedReason && backend !== "cpu") {
+    throw new Error(gpu.blockedReason);
+  }
+  let env = mergeGpuPlanEnv(extra, gpu.plan);
+  Object.assign(env, gpu.env);
   const mask = visibleDeviceMask(deviceCount);
   if (deviceCount > 1) {
     env.VLLM_WORKER_MULTIPROC_METHOD = env.VLLM_WORKER_MULTIPROC_METHOD ?? "spawn";
@@ -276,14 +291,18 @@ export function vllmLaunchEnv(
     env.VLLM_WORKER_MULTIPROC_METHOD = env.VLLM_WORKER_MULTIPROC_METHOD ?? "spawn";
     env.ZE_FLAT_DEVICE_HIERARCHY = env.ZE_FLAT_DEVICE_HIERARCHY ?? "FLAT";
     env.ONEAPI_DEVICE_SELECTOR = env.ONEAPI_DEVICE_SELECTOR ?? "level_zero:gpu";
-    // Do not inject ZE_AFFINITY_MASK. With an iGPU present, 0,1 can select the
-    // integrated GPU plus one discrete card. Docker and host both rely on FLAT
-    // hierarchy + all /dev/dri nodes so discrete XPUs enumerate as 0,1.
+    // Idle-first ZE_AFFINITY_MASK comes from engineGpuSpawnPlan (discrete index;
+    // iGPU is not a Level Zero slot). Multi-GPU TP uses all discrete XPUs — clear affinity.
+    if (deviceCount > 1) {
+      delete env.ZE_AFFINITY_MASK;
+      env.ONEAPI_DEVICE_SELECTOR = "level_zero:gpu";
+    }
   } else if (backend === "cuda") {
-    env.CUDA_VISIBLE_DEVICES = env.CUDA_VISIBLE_DEVICES ?? mask;
+    env.CUDA_VISIBLE_DEVICES = deviceCount > 1 ? mask : (env.CUDA_VISIBLE_DEVICES ?? mask);
   } else if (backend === "rocm") {
-    env.HIP_VISIBLE_DEVICES = env.HIP_VISIBLE_DEVICES ?? mask;
-    env.ROCR_VISIBLE_DEVICES = env.ROCR_VISIBLE_DEVICES ?? mask;
+    const hip = deviceCount > 1 ? mask : (env.HIP_VISIBLE_DEVICES ?? mask);
+    env.HIP_VISIBLE_DEVICES = hip;
+    env.ROCR_VISIBLE_DEVICES = deviceCount > 1 ? mask : (env.ROCR_VISIBLE_DEVICES ?? mask);
   }
   return env;
 }
@@ -304,12 +323,15 @@ export function classifyVllmLog(text: string): string | undefined {
   if (/ModuleNotFoundError: No module named 'vllm'|No module named vllm/i.test(text)) {
     return VLLM_INSTALL_HINT;
   }
+  if (/weight of shape \[6912\].*normalized_shape = \[768\]|normalized_shape = \[768\].*6912/i.test(text)) {
+    return "Gemma 4 Unified (12B) MM profile failed during vLLM profile_run. This stack serves it text-only: --quantization fp8 --limit-mm-per-prompt image/video/audio=0 (baked into start for 12B/31B/26B). Prefer google/gemma-4-E2B-it for a lighter Gemma 4 path.";
+  }
   if (
     /unknown architecture|not a valid model|is not supported|ModelRegistry|architecture .* not (found|supported)|does not support this model/i.test(
       text,
     )
   ) {
-    return "This vLLM image rejected the model architecture. intel/llm-scaler-vllm:0.21.0-b1+ supports Gemma 4 12B/31B/26B-A4B (`Gemma4ForConditionalGeneration`, --trust-remote-code). E2B/E4B are the same family but not on Intel’s verified list.";
+    return "This vLLM image rejected the model architecture. intel/llm-scaler-vllm:0.21.0-b1+ supports Gemma 4 12B/31B/26B-A4B with online FP8 + text-only MM limits. Prefer google/gemma-4-E2B-it when 12B fails or VRAM is tight.";
   }
   return undefined;
 }
@@ -989,6 +1011,10 @@ export class VllmManager {
     const tensorParallel = resolveTensorParallel(input.tensorParallel, deviceCount);
     if (backend === "cpu") {
       throw new Error(VLLM_CPU_INSTALL_HINT);
+    }
+    const cudaBlocked = vllmCudaOnIntelBlockedReason(backend);
+    if (cudaBlocked) {
+      throw new Error(cudaBlocked);
     }
     if (backend === "intel-xpu" && input.quantization) {
       throw new Error(

@@ -4,7 +4,7 @@ import { AnthropicProvider } from "./anthropic.js";
 import { CursorProvider } from "./cursor.js";
 import { HttpProvider } from "./http.js";
 import { OpenAIProvider } from "./openai.js";
-import { LlamaCppProvider, OllamaProvider } from "./local-openai.js";
+import { LateInferProvider, LlamaCppProvider, OllamaProvider } from "./local-openai.js";
 import { VllmProvider } from "./vllm.js";
 
 export function createProvider(id: string, config: BackendConfig, allowlist?: WriteAllowlist): AgentProvider {
@@ -19,6 +19,8 @@ export function createProvider(id: string, config: BackendConfig, allowlist?: Wr
       return new HttpProvider(id, config);
     case "vllm":
       return new VllmProvider(id, config);
+    case "lateinfer":
+      return new LateInferProvider(id, config);
     case "ollama":
       return new OllamaProvider(id, config);
     case "llamacpp":

@@ -121,11 +121,11 @@ export function primaryPrivateIpv4(
     if (!addrs) continue;
     for (const a of addrs) {
       if (a.internal || !isIpv4Family(a.family)) continue;
+      if (SKIP_IFACE.test(name)) continue;
       const address = stripHost(a.address);
       if (!isRfc1918(address)) continue;
       let score = 10;
       if (defaultIface && name === defaultIface) score += 100;
-      if (SKIP_IFACE.test(name)) score -= 50;
       const oct = address.split(".").map(Number);
       if ((oct[0] ?? 0) === 172 && (oct[1] ?? 0) >= 17 && (oct[1] ?? 0) <= 19) score -= 20;
       if (address.startsWith("192.168.122.")) score -= 20;

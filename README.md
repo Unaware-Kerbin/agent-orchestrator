@@ -27,9 +27,19 @@ Chat (GUI or MCP)
 
 ## Watch it
 
-![Watch how Agent Orchestrator works](docs/assets/orchestrator-demo.webp)
+Real clips recorded against the live GUI on this computer (no fake media). Session tokens and API keys stay off-screen.
 
-This clip is **Debate** on **your computer**: local Gemma, Cursor local, and Cursor cloud each get a turn. Gemini returned 429 and was skipped. You read the replies. Writes still wait for **Approve**.
+| Clip | What you see |
+|---|---|
+| [![Debate demo](docs/assets/orchestrator-demo.webp)](docs/assets/orchestrator-demo.mp4) | **Debate** on your computer: local Gemma, Cursor local, and Cursor cloud each get a turn. Gemini returned 429 and was skipped. Writes still wait for **Approve**. |
+| [![GUI overview](docs/assets/gui-overview.webp)](docs/assets/gui-overview.mp4) | **GUI overview** — Chat rail, Settings pages, loopback bind. |
+| [![Copy MCP URL](docs/assets/copy-mcp-url.webp)](docs/assets/copy-mcp-url.mp4) | **Copy MCP URL** — copies `http://127.0.0.1:<gui-port>/mcp` (Streamable HTTP). The HTML root is **not** MCP. |
+| [![Local models Start/Stop](docs/assets/local-models-start-stop.webp)](docs/assets/local-models-start-stop.mp4) | **Local models** — Start / Stop for late-infer, Ollama, llama.cpp, and vLLM (Docker when present). |
+| [![late-infer](docs/assets/late-infer.webp)](docs/assets/late-infer.mp4) | **late-infer** — Hub catalog, compile/OpenVINO path, serve on `127.0.0.1:8010`. |
+
+<video src="docs/assets/orchestrator-demo.mp4" controls muted playsinline width="720" poster="docs/assets/orchestrator-demo.webp"></video>
+
+Older stills under `docs/images/` (extract → Start Ollama → vLLM Docker → Late `/mcp`) remain accurate diagrams for the archive flow.
 
 ## What’s in the archive
 
@@ -94,6 +104,11 @@ Put API keys in `.env` or in the GUI **Backends** page — never in `agents.conf
 # GUI (loopback, or one private IP — see Late on another computer)
 npm run gui
 ```
+
+The first `npm run gui` builds the engine on your computer.
+It uses `late-infer` via `scripts/ensure-late-infer.js` or `npm run infer:build`.
+later launches skip that build when the stamp matches this app version; an app version bump rebuilds.
+MCP start (`npm start` / `npm run mcp:http`) does not build or spawn `late-infer`; only the GUI path does.
 
 Open the token URL from stderr (`http://127.0.0.1:<gui-port>?token=…` on loopback, or the private IP you typed). The session token is stored at `.orchestrator/gui.secret` (gitignored). The GUI also serves Streamable HTTP at **`/mcp` on that same port** (no GUI token — Late never sends it). Copy that exact URL from stderr or GUI Settings → **Copy MCP URL** — it is the host and port this process bound, not always 8787. On listen it writes `.orchestrator/mcp.gui.url` (and last-writer `mcp.url`) plus `~/.config/agent-orchestrator/` (or `$XDG_CONFIG_HOME`) so a client like Late can find a non-default port. Dedicated `npm run mcp:http` writes `mcp.http.url` separately so it does not hide the GUI URL.
 
@@ -227,21 +242,72 @@ Default: this workspace (`WORKSPACE_CWD` / `workspace.cwd`). Add more via Settin
 
 ![Grant a folder on this computer](docs/assets/write-allowlist.webp)
 
-## Local models (vendor-agnostic)
+## Inference engines (this tree)
 
-`list_hardware` probes **whatever accelerators are present** (NVIDIA CUDA, AMD ROCm, Intel XPU, or CPU if none). Recommendations use **measured VRAM**, not a single vendor. Missing NVIDIA is not treated as “CPU only” when another GPU exists.
+Local inference is **local-first**: engines bind loopback only (127.0.0.1 — never 0.0.0.0). Auto prefers control tools for hardware/download/start, debate when two or more local servers are ready, else a single agent. Writes and extra MCP starts wait for **Approve**.
 
 ![Search the local models catalog](docs/assets/local-models.webp)
 
-Search the catalog by name (this clip types `gemma`). Recommended rows say whether a snapshot fits **this computer**.
+[Local models Start/Stop demo](docs/assets/local-models-start-stop.mp4) · [late-infer demo](docs/assets/late-infer.mp4)
 
-A catalog model **fits** a single GPU when estimated weights plus ~20% KV-cache headroom are ≤ that GPU’s VRAM. `start_vllm` uses **every GPU on this computer** by default (`vllm serve --tensor-parallel-size N`). Pass `use_all_gpus=false` to stay on one card. A larger model can still *fit* via tensor parallel when weight shards fit in combined VRAM. Remaining memory on each card is used for the KV cache (`--gpu-memory-utilization 0.9`). The catalog is **not** tied to one vendor: it includes Qwen 2.5/3/3.5/3.8, Gemma 2 and Gemma 4 Instruct, Llama 3.1/3.3/4 Scout, Mistral 7B and Small 3.2, Phi-4, OLMo 2/3, IBM Granite 3.3/4.2, and DeepSeek-R1 Qwen distills. **Recommendations** list every catalog snapshot (no top-8 cap) with fit flags for this computer (fits / needs tensor parallel / too big). Newest Hub id is marked when a family has several names (Gemma 4 over Gemma 2/3, Qwen3.8 over Qwen2.5). Older generations stay downloadable. FP16 rows work on CUDA, ROCm, and Intel XPU; AWQ/GPTQ rows are CUDA/ROCm only. Official Gemma 2 ([Gemma Terms of Use](https://ai.google.dev/gemma/terms)) and Llama (Llama Community License / Llama 4 Community License) Hugging Face repos are **gated**. Gemma 4 Instruct is **ungated Apache-2.0**. Community Llama AWQ snapshots in the catalog are ungated on Hugging Face but still under the Llama Community License. You can still download any other `org/name` snapshot that vLLM can load.
+### What ships vs what stays on disk
+
+| Piece | Where it lives | Notes |
+|---|---|---|
+| Portable archive | Releases zip/tarball to runtime/bin (Ollama, llama-server, Node, packed late-infer) | Weights are not in the archive. |
+| Source late-infer | GUI path ensure-late-infer.js / infer:build to bin/late-infer | Candle/OpenVINO binary; Hub weights under .orchestrator/ |
+| Model weights / IR | .orchestrator/models (+ gguf), LATE_COMPILED_DIR OpenVINO IR | Gitignored; stay on write allowlist |
+| Secrets | .orchestrator/gui.secret and secrets.env | Never commit. |
+
+### Ports (loopback)
+
+| Engine | Default OpenAI-compat base | Start / Stop |
+|---|---|---|
+| late-infer | http://127.0.0.1:8010/v1 | GUI Local models; MCP start_late_infer / stop_late_infer |
+| Ollama | http://127.0.0.1:11434/v1 | GUI Start Ollama / Stop only (no start_ollama MCP tool) |
+| llama.cpp | http://127.0.0.1:8080/v1 | GUI Start with Hub GGUF or absolute .gguf |
+| vLLM | free port in 8000-8099 on 127.0.0.1 | GUI Start with Docker or host wheel; MCP start_vllm / stop_vllm |
+
+### Stop actually kills
+
+**Stop** is not a UI soft-flag. stopLocalServer (and vLLM process-tree stop) sends SIGTERM, waits a short grace, then SIGKILLs any matching engine still listening on that loopback port — including orphans after a GUI restart (pidfile / cmdline / comm checks). Stopping late-infer clears :8010; Ollama :11434; llama-server :8080; vLLM the instance port.
+
+### late-infer (OpenVINO / Candle)
+
+- Built from the sibling Late crate (LATE_INFER_CRATE / LATE_CHECKOUT / Local_AI_Terminal_Emulator) into bin/ and runtime/bin. MCP-only processes do not build or spawn it.
+- Compile path: late-infer --compile-only --model HubId. On Intel, Start needs OpenVINO IR on disk (.../compiled/slug/openvino/openvino_model.xml). Missing IR means Start refused. NVIDIA uses Candle/MLC when eligible; AMD HIP serve is fail-closed.
+- Hub catalog (hub-catalog.ts + hub-serve.ts) lists snapshots the idle GPU can compile/serve. Gemma3/4 visual-only Optimum types are not OpenVINO CausalLM text-generation-with-past.
+- Default Hub id when unset: Qwen/Qwen2.5-0.5B-Instruct.
+
+### Ollama
+
+Packed binary preferred (runtime/bin), else PATH. Loopback only. Pull weights yourself, then Register Ollama backend. YAML type ollama; dummy apiKey ollama is not a secret.
+
+### llama.cpp / GGUF Hub catalog
+
+Packed llama-server (Vulkan Linux/Windows, Metal Apple silicon). GGUF Hub catalog (hub-gguf-catalog.ts) uses Hugging Face REST (filter=gguf) — not HTML scrape — with quant preference Q4_K_M. Downloads land in .orchestrator/models/gguf. YAML type llamacpp.
+
+### vLLM
+
+Host CUDA/ROCm wheel when present; else Docker. Intel XPU images are a Linux path. Stop one instance; Remove from mix drops YAML; Delete weights is a separate confirm.
+
+### Approve-gated tools
+
+Chat/MCP Approve gates writes (apply_patch, allowlisted paths) and extra starts such as start_vllm / dispatch. Late Approve sidecar applies when Late is the client.
+
+## Local models (vendor-agnostic)
+
+list_hardware probes whatever accelerators are present (NVIDIA CUDA, AMD ROCm, Intel XPU, or CPU if none). Recommendations use measured VRAM, not a single vendor. Missing NVIDIA is not treated as CPU only when another GPU exists.
+
+Search the catalog by name (this clip types gemma). Recommended rows say whether a snapshot fits this computer.
+
+A catalog model **fits** a single GPU when estimated weights plus ~20% KV-cache headroom are ≤ that GPU’s VRAM. `start_vllm` uses **every GPU on this computer** by default (`vllm serve --tensor-parallel-size N`). Pass `use_all_gpus=false` to stay on one card. A larger model can still *fit* via tensor parallel when weight shards fit in combined VRAM. Remaining memory on each card is used for the KV cache (`--gpu-memory-utilization 0.9`). The catalog is **not** tied to one vendor: it includes Qwen 2.5/3/3.5/3.8, Gemma 4 Instruct (prefer E2B; 12B on Intel XPU uses online FP8 text-only), Llama 3.1/3.3/4 Scout, Mistral 7B and Small 3.2, Phi-4, OLMo 2/3, IBM Granite 3.3/4.2, and DeepSeek-R1 Qwen distills. **Recommendations** list every catalog snapshot (no top-8 cap) with fit flags for this computer (fits / needs tensor parallel / too big). Newest Hub id is marked when a family has several names (Gemma 4 over Gemma 3, Qwen3.8 over Qwen2.5). Gemma 2 is skipped as old; Gemma 3 stays downloadable when gated terms are accepted. FP16 rows work on CUDA, ROCm, and Intel XPU; AWQ/GPTQ rows are CUDA/ROCm only. Official Gemma 3 ([Gemma Terms of Use](https://ai.google.dev/gemma/terms)) and Llama (Llama Community License / Llama 4 Community License) Hugging Face repos are **gated**. Gemma 4 Instruct is **ungated Apache-2.0** (E2B recommended; 12B/31B/26B-A4B on Intel llm-scaler 0.21+ use online FP8 + text-only MM limits). Community Llama AWQ snapshots in the catalog are ungated on Hugging Face but still under the Llama Community License. You can still download any other `org/name` snapshot that vLLM can load.
 
 Download snapshots into `.orchestrator/models` (gitignored, must stay on the allowlist).
 
 **Gated Hugging Face models** (Gemma, Llama, Mistral, and similar Hub gates):
 
-1. While logged into your Hugging Face account, open the model card and **accept the license / access terms** (Gemma 2: Gemma Terms of Use; Llama 4: Llama 4 Community License).
+1. While logged into your Hugging Face account, open the model card and **accept the license / access terms** (Gemma 3: Gemma Terms of Use; Llama 4: Llama 4 Community License).
 2. Create a **read** access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). Paste it in the GUI: **Settings → Local models → Hugging Face token** (stored as `HF_TOKEN` in gitignored `.orchestrator/secrets.env`). `HUGGING_FACE_HUB_TOKEN` in env or that same secrets file is also honored. Do not put the token in `agents.config.yaml` or git.
 3. The GUI never returns the raw token (status is configured / not configured). Clear or paste a new token to rotate. POSIX file mode is `0600`; on Windows use NTFS ACLs if the machine is shared.
 
@@ -254,7 +320,7 @@ The download helper uses that stored token. If it is missing, a 401 from a gated
 - **XPU** — vendor Docker images if they are already local; otherwise a host XPU build
 - **CPU** — not used as a serve path
 
-The API is published on `127.0.0.1` only (ports 8000–8099). Start returns immediately (`202`); wait on the Local models page until `/v1/models` is healthy. The running server is registered as a backend automatically (dummy loopback token if the client requires Bearer — you do not copy a key from the container).
+The API is published on `127.0.0.1` only. `start_vllm` / GUI **Start with Docker** picks a free port in **8000–8099** and writes that `baseUrl` into `agents.config.yaml` (do not hardcode 8001/8003/8004). Start returns immediately (`202`); wait on the Local models page until `/v1/models` is healthy. The running server is registered as a backend automatically (dummy loopback token if the client requires Bearer — you do not copy a key from the container). Late infer stays on **127.0.0.1:8010**.
 
 You can run **several models at once**. Each catalog id gets its own container, port, and backend (`vllm-<catalog-slug>`). **Stop** one instance; **Remove from mix** also drops that backend from YAML; **Delete weights** is a separate confirm.
 
@@ -451,7 +517,7 @@ Late: paste the printed `/mcp` URL in Late Settings. Leave Cursor `mcpServers` e
 
 ## What is not in git
 
-`.env`, `.orchestrator/` (GUI token, secrets, chats, logos, allowlist, model weights, vLLM state), `gui.secret` / `secrets.env` if copied to the repo root, `node_modules/`, and logs. See `.gitignore`.
+`.env`, `.orchestrator/` (GUI token, secrets, chats, logos, allowlist, model weights, vLLM state), `gui.secret` / `secrets.env` if copied to the repo root, `node_modules/`, `runtime/` (portable bins/libs), local `bin/late-infer*` and `bin/agent-orchestrator*` wrappers, `target/`, and logs. See `.gitignore`.
 
 ## Changes
 

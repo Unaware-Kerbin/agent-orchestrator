@@ -10,6 +10,7 @@ import { loadSecretsIntoEnv, resolveHfToken } from "../secrets.js";
 import { stateDir } from "../state.js";
 import type { CatalogModel } from "./catalog.js";
 import { findCatalogModel } from "./catalog.js";
+import { hubGatedDeniedMessage } from "./hf-gated.js";
 import { assertModelDest, defaultModelsDir, ensureModelsDir } from "./paths.js";
 
 export type DownloadStatus = "queued" | "running" | "done" | "error";
@@ -118,10 +119,7 @@ export function hfDownloadChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJ
 
 export function gatedRepoHint(gated: boolean): string {
   if (!gated) return "";
-  if (hfTokenPresent()) {
-    return " Token is set but Hugging Face still denied access. Accept the model license on the model card while logged into the same Hugging Face account, then retry. Do not commit the token.";
-  }
-  return " Repo is gated. Accept the license on the Hugging Face model card while logged in, then paste a read token in Settings → Local models (or set HF_TOKEN / HUGGING_FACE_HUB_TOKEN). Create a token at https://huggingface.co/settings/tokens. Do not commit the token.";
+  return ` ${hubGatedDeniedMessage(hfTokenPresent())}`;
 }
 
 function helperScript(): string {
@@ -329,10 +327,12 @@ export class DownloadManager {
   }
 
   private fail(job: DownloadJob, error: string): void {
+    const gated = /401|403|gated|cannot access|access restricted|denied access/i.test(error);
     this.patch(job.id, {
       status: "error",
       error,
       message: error,
+      percent: gated ? 0 : this.jobs[job.id]?.percent ?? job.percent,
       finishedAt: Date.now(),
     });
   }

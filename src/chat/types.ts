@@ -8,7 +8,7 @@ export type ThinkingPhase = "waiting" | "streaming" | "debating";
 
 export interface ChatSuggestedAction {
   label: string;
-  action: "start_vllm" | "download_model" | "open_settings" | "reload_env" | "add_allowed_dir";
+  action: "start_late_infer" | "start_vllm" | "download_model" | "open_settings" | "reload_env" | "add_allowed_dir";
   payload?: Record<string, unknown>;
 }
 
@@ -154,7 +154,16 @@ export interface RouteSpeaker {
   logoUrl?: string;
 }
 
-export type ControlKind = "hardware" | "models" | "start_vllm" | "stop_vllm" | "vllm_status" | "allowlist";
+export type ControlKind =
+  | "hardware"
+  | "models"
+  | "start_late_infer"
+  | "stop_late_infer"
+  | "late_infer_status"
+  | "start_vllm"
+  | "stop_vllm"
+  | "vllm_status"
+  | "allowlist";
 
 export interface RouteDecision {
   kind: "control" | "single" | "debate" | "error";

@@ -284,7 +284,7 @@ export const LOCAL_MODEL_CATALOG: CatalogModel[] = [
     sizeClass: "medium",
     cpuFeasible: false,
     gated: false,
-    notes: `${GEMMA4_NOTE} Encoder-free unified 12B; typically needs ~24GB+ or two GPUs.`,
+    notes: `${GEMMA4_NOTE} Encoder-free unified 12B; Intel XPU needs online FP8 + text-only MM limits (auto). Prefer gemma-4-E2B-it for a lighter path; typically needs ~24GB+ or two GPUs.`,
   },
   {
     id: "gemma-4-26b-a4b-it",

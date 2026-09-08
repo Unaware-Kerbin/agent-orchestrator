@@ -35,11 +35,18 @@ def dir_nbytes(path: str) -> int:
     return total
 
 
-def snapshot_kwargs(repo: str, dest: str, revision: str | None = None) -> dict[str, Any]:
+def snapshot_kwargs(
+    repo: str,
+    dest: str,
+    revision: str | None = None,
+    allow_patterns: list[str] | None = None,
+) -> dict[str, Any]:
     """Arguments for huggingface_hub.snapshot_download. Never includes tqdm_class."""
     kwargs: dict[str, Any] = {"repo_id": repo, "local_dir": dest}
     if revision:
         kwargs["revision"] = revision
+    if allow_patterns:
+        kwargs["allow_patterns"] = allow_patterns
     return kwargs
 
 
@@ -85,6 +92,22 @@ def _watch_progress(dest: str, total: int, stop: threading.Event) -> None:
             )
 
 
+def download_file(repo: str, filename: str, dest: str, revision: str | None = None) -> str:
+    """Download one Hub file into dest (keeps basename)."""
+    dest = os.path.abspath(dest)
+    os.makedirs(dest, exist_ok=True)
+    _disable_hf_progress_bars()
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        repo_id=repo,
+        filename=filename,
+        local_dir=dest,
+        revision=revision,
+    )
+    return path
+
+
 def download_snapshot(
     repo: str,
     dest: str,
@@ -93,10 +116,17 @@ def download_snapshot(
     snapshot_download: Callable[..., str] | None = None,
     estimate_bytes: Callable[[str, str | None], int] | None = None,
     watch: bool = True,
+    allow_patterns: list[str] | None = None,
+    file: str | None = None,
 ) -> str:
     dest = os.path.abspath(dest)
     os.makedirs(dest, exist_ok=True)
-    kwargs = snapshot_kwargs(repo, dest, revision)
+    if file:
+        path = download_file(repo, file, dest, revision)
+        emit({"event": "progress", "downloaded": dir_nbytes(dest), "total": dir_nbytes(dest) or 1, "percent": 99})
+        return path
+
+    kwargs = snapshot_kwargs(repo, dest, revision, allow_patterns=allow_patterns)
     if "tqdm_class" in kwargs:
         raise RuntimeError("tqdm_class must not be passed to snapshot_download")
 
@@ -165,6 +195,13 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--dest", required=True)
     parser.add_argument("--revision", default=None)
+    parser.add_argument("--file", default=None, help="Download a single file (e.g. model.Q4_K_M.gguf)")
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Allow pattern for snapshot_download (repeatable), e.g. *.gguf",
+    )
     args = parser.parse_args()
 
     try:
@@ -179,7 +216,13 @@ def main() -> int:
         return 2
 
     try:
-        path = download_snapshot(args.repo, args.dest, args.revision)
+        path = download_snapshot(
+            args.repo,
+            args.dest,
+            args.revision,
+            allow_patterns=args.include,
+            file=args.file,
+        )
         emit({"event": "done", "path": path, "percent": 100})
         return 0
     except Exception as exc:  # noqa: BLE001 — surface HF/auth errors to the orchestrator

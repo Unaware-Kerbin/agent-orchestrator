@@ -65,6 +65,18 @@ export function parseModelId(raw: unknown): string {
   return trimmed;
 }
 
+/** Exactly `org/name` — no `:tag`, no leading slash, so a pull can never be aimed at a path. */
+const HUB_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function parseHubModelId(raw: unknown): string {
+  if (typeof raw !== "string" || !HUB_MODEL_ID_RE.test(raw.trim())) {
+    throw new Error(
+      "model must be a Hugging Face Hub org/model id such as Qwen/Qwen2.5-0.5B-Instruct, not a filesystem path",
+    );
+  }
+  return parseModelId(raw);
+}
+
 export function logosDir(): string {
   const dir = join(stateDir(), "logos");
   ensureSecureDir(dir);
