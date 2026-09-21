@@ -7,6 +7,18 @@ Dates are America/New_York.
 
 This is a window on **your computer**. Bind defaults to loopback (`127.0.0.1`); you may set one private IP. Packed archives include Node 22 and `late-infer`. Ollama / llama-server / vLLM remain optional local engines; vLLM Start still needs Docker.
 
+## [0.1.7] - 2026-09-21
+
+New GitHub tag [v0.1.7](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.7) so this build is trackable. Tag [v0.1.6](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.6) stays frozen — future installers are new tags; do not rewrite old tags.
+
+### Fixed
+
+- **Compile phase compare.** Local models treated a finished compile as `done` after the phase was renamed to `ready`, which broke packed `tsc` installer builds (`754f52d`).
+
+### Added
+
+- **Weekly npm Dependabot.** Grouped minor/patch and security PRs so GHSA lockfile alerts get opened instead of sitting in the advisory list (`ad6184a`, [#3](https://github.com/Unaware-Kerbin/agent-orchestrator/pull/3)).
+
 ## [0.1.6] - 2026-09-08
 
 New GitHub tag [v0.1.6](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.6) so this build is trackable. Tag [v0.1.5](https://github.com/Unaware-Kerbin/agent-orchestrator/releases/tag/v0.1.5) stays frozen — future installers are new tags; do not rewrite old tags.
@@ -93,6 +105,7 @@ Portable GUI + `/mcp` archives with apply-patch and a Debate README clip.
 
 First portable GUI + Streamable HTTP `/mcp` archives (Linux, macOS, Windows). Loopback only. Extract, then `./bin/agent-orchestrator-gui` (Windows: `bin\agent-orchestrator-gui.cmd`). Copy the printed `/mcp` URL for Late.
 
+[0.1.7]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Unaware-Kerbin/agent-orchestrator/compare/v0.1.3...v0.1.4
