@@ -1,0 +1,21 @@
+# Dependabot v2: weekly npm updates, grouped so this repo is not flooded with PRs.
+# Security PRs are grouped separately and are not counted against open-pull-requests-limit.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
