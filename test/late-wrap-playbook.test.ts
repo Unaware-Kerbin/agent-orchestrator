@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { WriteAllowlist, canonicalizeDirectory } from "../src/allowlist.js";
-import { aosCxVlanPlaybookYaml, LATE_JSON_SYSTEM, latePlaybookPatchFiles } from "../src/chat/late-wrap.js";
+import { aosCxVlanCliStagedBody, aosCxVlanPlaybookYaml, LATE_JSON_SYSTEM, latePlaybookPatchFiles } from "../src/chat/late-wrap.js";
 import { ChatService } from "../src/chat/service.js";
 import type { DispatchInput } from "../src/orchestrator.js";
 import type { Orchestrator } from "../src/orchestrator.js";
@@ -98,6 +98,15 @@ test("ansible template for VLAN 2000 is real AOS-CX, not a placeholder", () => {
   assert.equal(files[0]?.path, "playbooks/vlan-2000.yml");
   assert.match(files[0]?.content ?? "", /vlan 2000/);
   assert.match(files[0]?.content ?? "", /name VLAN2000/);
+});
+
+test("AOS-CX CLI staging body for VLAN 2500 is not Cisco IOS", () => {
+  const body = aosCxVlanCliStagedBody("configure VLAN 2500", "2500");
+  assert.equal(body, "vlan 2500\nname VLAN2500\n");
+  assert.doesNotMatch(body, /configure terminal/i);
+  assert.doesNotMatch(body, /\bend\b/i);
+  assert.match(LATE_JSON_SYSTEM, /Example AOS-CX CLI staging/);
+  assert.match(LATE_JSON_SYSTEM, /no configure terminal or end/);
 });
 
 test("Late wrap cli playbook vlan 2000 after show vlan prefers propose_staged_artifact JSON", async () => {
