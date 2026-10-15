@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { WriteAllowlist, canonicalizeDirectory } from "../src/allowlist.js";
-import { aosCxVlanPlaybookYaml, LATE_JSON_SYSTEM, latePlaybookPatchFiles } from "../src/chat/late-wrap.js";
+import { aosCxVlanPlaybookYaml, aosCxVlanStagingCli, LATE_JSON_SYSTEM, latePlaybookPatchFiles } from "../src/chat/late-wrap.js";
 import { ChatService } from "../src/chat/service.js";
 import type { DispatchInput } from "../src/orchestrator.js";
 import type { Orchestrator } from "../src/orchestrator.js";
@@ -86,6 +86,14 @@ function finished(input: DispatchInput, text: string): OrchestratedRun {
     history: [],
   };
 }
+
+test("AOS-CX CLI staging draft includes configure mode", () => {
+  const cli = aosCxVlanStagingCli("2500");
+  assert.match(cli, /^configure terminal/);
+  assert.match(cli, /vlan 2500/);
+  assert.match(cli, / name VLAN2500/);
+  assert.match(cli, /exit$/);
+});
 
 test("ansible template for VLAN 2000 is real AOS-CX, not a placeholder", () => {
   const yaml = aosCxVlanPlaybookYaml("configure a vlan of 2000", "2000");
