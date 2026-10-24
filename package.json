@@ -27,10 +27,10 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@cursor/sdk": "^1.0.29",
+    "@cursor/sdk": "^1.0.38",
     "@modelcontextprotocol/server": "^2.3.1",
     "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
@@ -38,6 +38,6 @@
     "typescript": "^7.0.2"
   },
   "overrides": {
-    "undici": "6.28.1"
+    "undici": "6.29.1"
   }
 }
