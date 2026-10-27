@@ -187,12 +187,22 @@ test("buildVllmArgv uses XPU flags, loopback host, and tensor parallel", () => {
   assert.equal(built.args[built.args.indexOf("--gpu-memory-utilization") + 1], "0.9");
   assert.equal(built.args.includes("--quantization"), false);
   assert.ok(built.args.includes("--trust-remote-code"));
-  const env = vllmLaunchEnv("intel-xpu", 2, {});
-  assert.equal(env.ZE_FLAT_DEVICE_HIERARCHY, "FLAT");
-  assert.equal(env.ZE_AFFINITY_MASK, undefined);
-  assert.equal(env.VLLM_WORKER_MULTIPROC_METHOD, "spawn");
-  assert.equal(env.ONEAPI_DEVICE_SELECTOR, "level_zero:gpu");
-  assert.equal(vllmLaunchEnv("intel-xpu", 2, { ZE_AFFINITY_MASK: "1,2" }).ZE_AFFINITY_MASK, undefined); // multi-GPU TP clears affinity
+  // Fail closed when this computer has no discrete GPU. The env assertions still
+  // run when a card is visible; they are not skipped on a GPU box.
+  const noDiscreteGpu = /No discrete GPU on your computer/;
+  let env: ReturnType<typeof vllmLaunchEnv> | undefined;
+  try {
+    env = vllmLaunchEnv("intel-xpu", 2, {});
+  } catch (err) {
+    assert.match(err instanceof Error ? err.message : String(err), noDiscreteGpu);
+  }
+  if (env) {
+    assert.equal(env.ZE_FLAT_DEVICE_HIERARCHY, "FLAT");
+    assert.equal(env.ZE_AFFINITY_MASK, undefined);
+    assert.equal(env.VLLM_WORKER_MULTIPROC_METHOD, "spawn");
+    assert.equal(env.ONEAPI_DEVICE_SELECTOR, "level_zero:gpu");
+    assert.equal(vllmLaunchEnv("intel-xpu", 2, { ZE_AFFINITY_MASK: "1,2" }).ZE_AFFINITY_MASK, undefined); // multi-GPU TP clears affinity
+  }
   // CUDA/ROCm mask checks: on Intel Arc, cuda backend is fail-closed by idle-GPU pick.
   try {
     assert.equal(vllmLaunchEnv("cuda", 1, {}).CUDA_VISIBLE_DEVICES, "0");
@@ -202,7 +212,7 @@ test("buildVllmArgv uses XPU flags, loopback host, and tensor parallel", () => {
     assert.equal(vllmLaunchEnv("rocm", 2, {}).HIP_VISIBLE_DEVICES, "0,1");
     assert.equal(vllmLaunchEnv("rocm", 2, {}).ROCR_VISIBLE_DEVICES, "0,1");
   } catch (err) {
-    assert.match(err instanceof Error ? err.message : String(err), /CUDA-only|Intel Arc|cannot use the Intel/);
+    assert.match(err instanceof Error ? err.message : String(err), /CUDA-only|Intel Arc|cannot use the Intel|No discrete GPU on your computer/);
   }
   assert.equal(resolveTensorParallel(2, 2), 2);
   assert.equal(resolveTensorParallel(4, 2), 2);

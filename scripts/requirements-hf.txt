@@ -1,5 +1,15 @@
 # JsonTqdm.get_lock crashes come from passing a duck-typed tqdm class into
 # huggingface_hub.snapshot_download, not from these pins. Keep hub/tqdm on a
 # known-good range anyway; the helper never sets tqdm_class.
+# Stay on huggingface_hub 0.x. Floors are the first release that clears each
+# advisory; a fresh resolve already picks these or newer.
+# filelock 4.2.1 is the first release past GHSA-v4x8-3wr5-3wq8 (3.20.4–4.2.0).
 huggingface_hub>=0.24.0,<1
-tqdm>=4.66.0,<5
+tqdm>=4.66.3,<5
+requests>=2.33.0
+urllib3>=2.8.0
+idna>=3.15
+PyYAML>=5.4
+filelock>=4.2.1
+fsspec>=2026.6.0
+certifi>=2026.10.19
