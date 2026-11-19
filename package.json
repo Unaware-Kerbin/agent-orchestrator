@@ -27,10 +27,10 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@cursor/sdk": "^1.0.38",
-    "@modelcontextprotocol/server": "^2.3.1",
+    "@cursor/sdk": "^1.4.2",
+    "@modelcontextprotocol/server": "^2.4.0",
     "yaml": "^2.9.0",
-    "zod": "^4.6.6"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
